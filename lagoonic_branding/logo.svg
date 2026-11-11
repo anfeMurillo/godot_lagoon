@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 640">
+  <!-- Lagoonic Engine: logotipo horizontal (marca + nombre).              -->
+  <!-- Fichero NUEVO: no sustituye a misc/logo/*.svg de Godot.            -->
+  <!-- La marca reutiliza las formas de icon.svg de esta misma carpeta.   -->
+  <g transform="translate(24,52) scale(0.525)">
+    <g fill="none" stroke="#009ce0" stroke-width="42" stroke-linecap="round">
+      <path d="M84 712 Q220 772 356 730"/>
+      <path d="M668 730 Q804 772 940 712"/>
+      <path d="M300 842 Q512 912 724 842"/>
+    </g>
+    <ellipse cx="512" cy="472" rx="410" ry="220" fill="#085c30"/>
+    <ellipse cx="512" cy="440" rx="410" ry="220" fill="#006430"/>
+    <ellipse cx="512" cy="440" rx="410" ry="220" fill="none" stroke="#a0d030" stroke-width="26"/>
+    <ellipse cx="512" cy="440" rx="330" ry="168" fill="#60a830"/>
+    <g stroke="#b0d860" stroke-width="16" stroke-linecap="round">
+      <path d="M512 600 L512 306"/>
+      <path d="M512 556 L262 386"/>
+      <path d="M512 556 L762 386"/>
+      <path d="M512 586 L348 500"/>
+      <path d="M512 586 L676 500"/>
+    </g>
+    <path d="M494 600 L530 600 L512 662 Z" fill="#a0d030"/>
+  </g>
+  <text x="620" y="330" font-family="Verdana, Arial, sans-serif" font-size="148" font-weight="bold" fill="#eaf4ee" letter-spacing="8">LAGOONIC</text>
+  <text x="626" y="432" font-family="Verdana, Arial, sans-serif" font-size="62" fill="#009ce0" letter-spacing="16">ENGINE</text>
+</svg>

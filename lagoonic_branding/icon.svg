@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Lagoonic Engine: marca propia del fork (hoja de laguna sobre agua). -->
+  <!-- Fichero NUEVO: no sustituye a misc/logo/*.svg de Godot.            -->
+  <!-- Paleta extraida de assets/branding/logo.png:                       -->
+  <!--   verde profundo #006430, verde hoja #60a830, ribete #a0d030,       -->
+  <!--   vena clara #b0d860, sombra #085c30, agua #009ce0.                 -->
+  <g fill="none" stroke="#009ce0" stroke-width="42" stroke-linecap="round">
+    <path d="M84 712 Q220 772 356 730"/>
+    <path d="M668 730 Q804 772 940 712"/>
+    <path d="M300 842 Q512 912 724 842"/>
+  </g>
+  <ellipse cx="512" cy="472" rx="410" ry="220" fill="#085c30"/>
+  <ellipse cx="512" cy="440" rx="410" ry="220" fill="#006430"/>
+  <ellipse cx="512" cy="440" rx="410" ry="220" fill="none" stroke="#a0d030" stroke-width="26"/>
+  <ellipse cx="512" cy="440" rx="330" ry="168" fill="#60a830"/>
+  <g stroke="#b0d860" stroke-width="16" stroke-linecap="round">
+    <path d="M512 600 L512 306"/>
+    <path d="M512 556 L262 386"/>
+    <path d="M512 556 L762 386"/>
+    <path d="M512 586 L348 500"/>
+    <path d="M512 586 L676 500"/>
+  </g>
+  <path d="M494 600 L530 600 L512 662 Z" fill="#a0d030"/>
+</svg>

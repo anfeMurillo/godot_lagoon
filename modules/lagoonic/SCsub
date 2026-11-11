@@ -1,0 +1,19 @@
+#!/usr/bin/env python
+from misc.utility.scons_hints import *
+
+Import("env")
+Import("env_modules")
+
+env_lagoonic = env_modules.Clone()
+
+# register_types.cpp is inert without TOOLS_ENABLED (see the guards there),
+# so it is always compiled. The bridge itself lives in editor/ and is only
+# built for editor targets, following the modules/gridmap pattern.
+env_lagoonic.add_source_files(env.modules_sources, "*.cpp")
+if env.editor_build:
+    env_lagoonic.add_source_files(env.modules_sources, "editor/*.cpp")
+
+# runtime/ lo poblaran los agentes 3-7. Glob() devuelve lista vacia si la
+# carpeta aun no existe, asi que este bloque nunca rompe el build.
+if Glob("runtime/*.cpp"):
+    env_lagoonic.add_source_files(env.modules_sources, "runtime/*.cpp")
