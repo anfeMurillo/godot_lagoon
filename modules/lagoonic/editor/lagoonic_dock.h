@@ -84,6 +84,7 @@ private:
 	Timer *poll_timer = nullptr;
 	LagoonicAgentDock *agent_dock = nullptr;
 	Ref<LagoonicRuntimeHost> runtime_host;
+	bool crew_applied = false; // Equipo de Configuracion ya pasado al host.
 
 	int activity_lines = 0;
 	static constexpr int ACTIVITY_MAX_LINES = 500;

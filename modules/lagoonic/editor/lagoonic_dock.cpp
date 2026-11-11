@@ -31,6 +31,7 @@
 #include "lagoonic_dock.h"
 
 #include "lagoonic_agent_dock.h"
+#include "lagoonic_agent_settings.h"
 #include "lagoonic_vibe_theme.h"
 
 #include "core/config/engine.h"
@@ -232,8 +233,18 @@ void LagoonicDock::_on_agent_event(const StringName &p_event, const Variant &p_a
 	if (p_event == SNAME("send_requested")) {
 		const String session = (chat != nullptr) ? chat->get_current_session() : String();
 		const int mode = (chat != nullptr) ? chat->get_mode() : 0;
-		const String model = (chat != nullptr) ? chat->get_current_model() : String();
-		if (runtime_host->ensure_server(cwd, model, Dictionary()) == OK) {
+		String model = (chat != nullptr) ? chat->get_current_model() : String();
+		if (model.is_empty()) {
+			model = LagoonicAgentSettings::get_model(); // Configuracion > Agentes.
+		}
+		if (runtime_host->ensure_server(cwd, model, LagoonicAgentSettings::secret_env()) == OK) {
+			if (!crew_applied) {
+				// Configuracion > Equipo: necesita la carpeta del proyecto, que
+				// el host conoce tras ensure_server().
+				const String boss = (chat != nullptr) ? chat->get_boss_agent() : LagoonicAgentSettings::get_boss();
+				runtime_host->set_crew(boss, LagoonicAgentSettings::crew_workers());
+				crew_applied = true;
+			}
 			runtime_host->send_prompt(session, String(p_a), mode, model);
 		}
 	} else if (p_event == SNAME("abort_requested")) {
@@ -255,6 +266,18 @@ void LagoonicDock::_on_agent_event(const StringName &p_event, const Variant &p_a
 		runtime_host->set_crew_worker(String(p_a), bool(p_b));
 	} else if (p_event == SNAME("poll_tick")) {
 		runtime_host->poll_connection();
+	} else if (p_event == SNAME("provider_key_save_requested")) {
+		// Mismo almacen que Configuracion > Agentes.
+		const bool ok = LagoonicAgentSettings::set_provider_key(String(p_a), String(p_b)) == OK;
+		if (agent_dock != nullptr) {
+			agent_dock->set_provider_has_key(String(p_a), LagoonicAgentSettings::has_provider_key(String(p_a)));
+		}
+		log_activity(ok ? String::utf8("Clave guardada.") : String::utf8("No se pudo guardar la clave."));
+	} else if (p_event == SNAME("provider_key_remove_requested")) {
+		LagoonicAgentSettings::remove_provider_key(String(p_a));
+		if (agent_dock != nullptr) {
+			agent_dock->set_provider_has_key(String(p_a), false);
+		}
 	} else if (p_event == SNAME("undo_file_requested") || p_event == SNAME("undo_task_requested")) {
 		log_activity(String::utf8("Deshacer aún no soportado por el runtime (solo revert por mensaje)."));
 	} else {
@@ -424,6 +447,17 @@ LagoonicDock::LagoonicDock() {
 		agent_dock->get_chat_view()->set_native_look(true);
 	}
 	agent_dock->set_event_handler(callable_mp(this, &LagoonicDock::_on_agent_event));
+	LagoonicAgentSettings::apply_to_chat(agent_dock->get_chat_view());
+	for (int i = 0; i < LagoonicAgentSettings::PROVIDER_COUNT; i++) {
+		const LagoonicAgentSettings::Provider &p = LagoonicAgentSettings::PROVIDERS[i];
+		agent_dock->set_provider_has_key(p.id, LagoonicAgentSettings::has_provider_key(p.id));
+		if (p.is_url) {
+			const String url = LagoonicAgentSettings::get_provider_url(p.id);
+			if (!url.is_empty()) {
+				agent_dock->set_ollama_url(url);
+			}
+		}
+	}
 	_ensure_runtime_host();
 
 	// Sondeo periodico del puente (solo actualiza UI si el dock es visible).

@@ -31,6 +31,7 @@
 #include "lagoonic_vibe_workspace.h"
 
 #include "lagoonic_agent_dock.h"
+#include "lagoonic_agent_settings.h"
 #include "lagoonic_vibe_theme.h"
 #include "lagoonic_water_caustics.h"
 #include "lagoonic_lily_veil.h"
@@ -504,8 +505,18 @@ void LagoonicVibeWorkspace::_on_agent_event(const StringName &p_event, const Var
 	if (p_event == SNAME("send_requested")) {
 		const String session = (chat != nullptr) ? chat->get_current_session() : String();
 		const int mode = (chat != nullptr) ? chat->get_mode() : 0;
-		const String model = (chat != nullptr) ? chat->get_current_model() : String();
-		if (runtime_host->ensure_server(cwd, model, Dictionary()) == OK) {
+		String model = (chat != nullptr) ? chat->get_current_model() : String();
+		if (model.is_empty()) {
+			model = LagoonicAgentSettings::get_model(); // Configuracion > Agentes.
+		}
+		if (runtime_host->ensure_server(cwd, model, LagoonicAgentSettings::secret_env()) == OK) {
+			if (!crew_applied) {
+				// Configuracion > Equipo: necesita la carpeta del proyecto, que
+				// el host conoce tras ensure_server().
+				const String boss = (chat != nullptr) ? chat->get_boss_agent() : LagoonicAgentSettings::get_boss();
+				runtime_host->set_crew(boss, LagoonicAgentSettings::crew_workers());
+				crew_applied = true;
+			}
 			runtime_host->send_prompt(session, String(p_a), mode, model);
 		} else if (chat != nullptr) {
 			chat->set_busy(false);
@@ -749,6 +760,7 @@ LagoonicVibeWorkspace::LagoonicVibeWorkspace() {
 	agent_dock->set_v_size_flags(Control::SIZE_EXPAND_FILL);
 	center_column->add_child(agent_dock);
 	agent_dock->set_event_handler(callable_mp(this, &LagoonicVibeWorkspace::_on_agent_event));
+	LagoonicAgentSettings::apply_to_chat(agent_dock->get_chat_view());
 
 	Control *right_spacer = memnew(Control);
 	right_spacer->set_h_size_flags(Control::SIZE_EXPAND_FILL);

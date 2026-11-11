@@ -96,6 +96,7 @@ private:
 
 	LagoonicAgentDock *agent_dock = nullptr;
 	Ref<LagoonicRuntimeHost> runtime_host;
+	bool crew_applied = false; // Equipo de Configuracion ya pasado al host.
 
 	PanelContainer *return_pill_container = nullptr;
 	Button *return_pill_button = nullptr;
