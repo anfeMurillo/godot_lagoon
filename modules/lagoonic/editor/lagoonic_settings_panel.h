@@ -32,7 +32,7 @@ class LagoonicSettingsPanel : public Control {
 	enum Section {
 		SECTION_THEMES,
 		SECTION_AGENTS,
-		SECTION_OPENCODE,
+		SECTION_PROVIDERS,
 		SECTION_CREW,
 		SECTION_EDITOR,
 		SECTION_LANGUAGE,
@@ -93,7 +93,9 @@ class LagoonicSettingsPanel : public Control {
 	Vector<bool> boss_ready;
 	OptionButton *mode_option = nullptr;
 	Label *mode_hint = nullptr;
-	LineEdit *model_edit = nullptr;
+	OptionButton *model_option = nullptr; // Modelos que ofrece OpenCode.
+	Array catalog_models;
+	String catalog_default;
 	Vector<ProviderRow> provider_rows;
 
 	// Equipo.
@@ -122,7 +124,7 @@ class LagoonicSettingsPanel : public Control {
 	void _build();
 	VBoxContainer *_build_themes();
 	VBoxContainer *_build_agents();
-	VBoxContainer *_build_opencode();
+	VBoxContainer *_build_providers();
 	VBoxContainer *_build_crew();
 	VBoxContainer *_build_editor();
 	VBoxContainer *_build_language();
@@ -155,8 +157,8 @@ class LagoonicSettingsPanel : public Control {
 	void _on_boss_selected(int p_index);
 	void _on_boss_copy();
 	void _on_mode_selected(int p_index);
-	void _save_model();
-	void _on_model_submitted(const String &p_text) { _save_model(); }
+	void _fill_models(const Array &p_models, const String &p_default_ref);
+	void _on_model_selected(int p_index);
 	void _on_provider_save(int p_index);
 	void _on_provider_submitted(const String &p_text, int p_index) { _on_provider_save(p_index); }
 	void _on_provider_remove(int p_index);

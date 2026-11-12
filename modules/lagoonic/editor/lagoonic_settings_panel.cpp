@@ -5,6 +5,7 @@
 #include "lagoonic_settings_panel.h"
 
 #include "lagoonic_agent_settings.h"
+#include "lagoonic_model_catalog.h"
 #include "lagoonic_swatch_picker.h"
 #include "lagoonic_vibe_theme.h"
 
@@ -240,7 +241,7 @@ void LagoonicSettingsPanel::_build() {
 	body->add_child(nav);
 	Ref<ButtonGroup> group;
 	group.instantiate();
-	const char *nav_names[SECTION_COUNT] = { "Temas", "Agentes", "OpenCode", "Equipo", "Editor", "Idioma" };
+	const char *nav_names[SECTION_COUNT] = { "Temas", "Agentes", "Proveedores", "Equipo", "Editor", "Idioma" };
 	for (int i = 0; i < SECTION_COUNT; i++) {
 		Button *b = memnew(Button);
 		b->set_text(String::utf8(nav_names[i]));
@@ -270,7 +271,7 @@ void LagoonicSettingsPanel::_build() {
 
 	sections[SECTION_THEMES] = _build_themes();
 	sections[SECTION_AGENTS] = _build_agents();
-	sections[SECTION_OPENCODE] = _build_opencode();
+	sections[SECTION_PROVIDERS] = _build_providers();
 	sections[SECTION_CREW] = _build_crew();
 	sections[SECTION_EDITOR] = _build_editor();
 	sections[SECTION_LANGUAGE] = _build_language();
@@ -286,7 +287,7 @@ void LagoonicSettingsPanel::_show_section(int p_section) {
 		sections[i]->set_visible(i == p_section);
 		nav_buttons[i]->set_pressed_no_signal(i == p_section);
 	}
-	if (p_section == SECTION_AGENTS || p_section == SECTION_OPENCODE) {
+	if (p_section == SECTION_AGENTS || p_section == SECTION_PROVIDERS) {
 		_refresh_agents();
 	} else if (p_section == SECTION_CREW) {
 		_refresh_crew();
@@ -784,22 +785,28 @@ VBoxContainer *LagoonicSettingsPanel::_build_agents() {
 	return content;
 }
 
-VBoxContainer *LagoonicSettingsPanel::_build_opencode() {
+VBoxContainer *LagoonicSettingsPanel::_build_providers() {
 	VBoxContainer *content = _section_box();
-	content->add_child(_muted(String::utf8("Ajustes del OpenCode interno de Lagoonic: el motor que responde cuando el agente principal es OpenCode. Claude Code, Codex y los demás usan su propia cuenta y no necesitan nada de esto.")));
+	content->add_child(_muted(String::utf8("Elige el modelo de IA y conecta tu cuenta si tienes una. Solo se usa cuando el agente principal es OpenCode; Claude Code, Codex y los demás usan su propia cuenta.")));
 
-	HBoxContainer *model_row = _setting_row(content, TTRC("Modelo"), String::utf8("Opcional. Déjalo vacío para usar el recomendado."));
-	model_edit = _right(model_row, memnew(LineEdit), 250);
-	model_edit->set_placeholder(TTRC("proveedor/modelo"));
-	model_edit->connect(SNAME("text_submitted"), callable_mp(this, &LagoonicSettingsPanel::_on_model_submitted));
-	model_edit->connect(SNAME("focus_exited"), callable_mp(this, &LagoonicSettingsPanel::_save_model));
+	HBoxContainer *model_row = _setting_row(content, TTRC("Modelo"), String::utf8("La lista la ofrece el propio servicio."));
+	model_option = _right(model_row, memnew(OptionButton), 250);
+	model_option->set_fit_to_longest_item(false);
+	model_option->connect(SNAME("item_selected"), callable_mp(this, &LagoonicSettingsPanel::_on_model_selected));
+	_fill_models(Array(), String());
+	String default_ref;
+	const Array cached = LagoonicModelCatalog::cached(default_ref);
+	if (!cached.is_empty()) {
+		_fill_models(cached, default_ref);
+	}
+	LagoonicModelCatalog::refresh(callable_mp(this, &LagoonicSettingsPanel::_fill_models));
 
 	content->add_child(memnew(HSeparator));
 
 	Label *keys_title = memnew(Label);
 	keys_title->set_text(TTRC("Claves de proveedores"));
 	content->add_child(keys_title);
-	content->add_child(_muted(String::utf8("Solo si usas tu propia cuenta. Se guardan cifradas en este equipo y solo las recibe OpenCode.")));
+	content->add_child(_muted(String::utf8("Solo si usas tu propia cuenta. Se guardan cifradas en este equipo.")));
 
 	for (int i = 0; i < LagoonicAgentSettings::PROVIDER_COUNT; i++) {
 		const LagoonicAgentSettings::Provider &p = LagoonicAgentSettings::PROVIDERS[i];
@@ -856,9 +863,7 @@ void LagoonicSettingsPanel::_refresh_agents() {
 
 	mode_option->select(mode_option->get_item_index(LagoonicAgentSettings::get_mode()));
 	_update_mode_hint();
-	if (!model_edit->has_focus()) {
-		model_edit->set_text(LagoonicAgentSettings::get_model());
-	}
+	_fill_models(catalog_models, catalog_default);
 	for (int i = 0; i < provider_rows.size(); i++) {
 		_refresh_provider_row(i);
 	}
@@ -912,9 +917,58 @@ void LagoonicSettingsPanel::_on_mode_selected(int p_index) {
 	_update_mode_hint();
 }
 
-void LagoonicSettingsPanel::_save_model() {
-	if (model_edit->get_text().strip_edges() != LagoonicAgentSettings::get_model()) {
-		LagoonicAgentSettings::set_model(model_edit->get_text());
+void LagoonicSettingsPanel::_fill_models(const Array &p_models, const String &p_default_ref) {
+	catalog_models = p_models;
+	catalog_default = p_default_ref;
+	if (model_option == nullptr) {
+		return;
+	}
+	const String chosen = LagoonicAgentSettings::get_model();
+	model_option->clear();
+	if (p_models.is_empty()) {
+		model_option->add_item(String::utf8("Cargando modelos…"));
+		model_option->set_item_metadata(0, String());
+		model_option->set_disabled(true);
+		return;
+	}
+	model_option->set_disabled(false);
+	String default_name;
+	for (int i = 0; i < p_models.size(); i++) {
+		const Dictionary m = p_models[i];
+		if (String(m.get("ref", "")) == p_default_ref) {
+			default_name = m.get("name", "");
+		}
+	}
+	model_option->add_item(default_name.is_empty() ? String(TTRC("Modelo recomendado")) : vformat(String::utf8("Recomendado · %s"), default_name));
+	model_option->set_item_metadata(0, String());
+	String last_provider;
+	for (int i = 0; i < p_models.size(); i++) {
+		const Dictionary m = p_models[i];
+		const String ref = m.get("ref", "");
+		if (ref.is_empty()) {
+			continue;
+		}
+		const String provider = m.get("provider_name", m.get("provider", ""));
+		if (provider != last_provider) {
+			model_option->add_separator(provider);
+			last_provider = provider;
+		}
+		model_option->add_item(String(m.get("name", ref)));
+		const int idx = model_option->get_item_count() - 1;
+		model_option->set_item_metadata(idx, ref);
+		model_option->set_item_tooltip(idx, ref);
+		if (ref == chosen) {
+			model_option->select(idx);
+		}
+	}
+	if (chosen.is_empty()) {
+		model_option->select(0);
+	}
+}
+
+void LagoonicSettingsPanel::_on_model_selected(int p_index) {
+	if (model_option != nullptr && p_index >= 0 && !model_option->is_item_separator(p_index)) {
+		LagoonicAgentSettings::set_model(String(model_option->get_item_metadata(p_index)));
 	}
 }
 
@@ -1279,9 +1333,6 @@ void LagoonicSettingsPanel::open() {
 void LagoonicSettingsPanel::close() {
 	if (editor_layer != nullptr && editor_layer->is_visible()) {
 		_close_color_editor();
-	}
-	if (model_edit != nullptr && model_edit->has_focus()) {
-		_save_model();
 	}
 	hide();
 }
