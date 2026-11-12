@@ -311,6 +311,122 @@ static void _bento_reset_offsets(SplitContainer *p_split) {
 	p_split->set_split_offsets(offsets);
 }
 
+static SplitContainer *_as_row(Node *p_node) {
+	SplitContainer *s = Object::cast_to<SplitContainer>(p_node);
+	return (s != nullptr && !s->is_vertical()) ? s : nullptr;
+}
+
+// Las tarjetas de una columna en orden, las de cada fila incluidas.
+static void _column_cards(const SplitContainer *p_col, Vector<LagoonicBento *> &r_cards) {
+	for (int i = 0; i < p_col->get_child_count(false); i++) {
+		Node *n = p_col->get_child(i, false);
+		if (LagoonicBento *b = Object::cast_to<LagoonicBento>(n)) {
+			r_cards.push_back(b);
+		} else if (SplitContainer *row = _as_row(n)) {
+			for (int j = 0; j < row->get_child_count(false); j++) {
+				if (LagoonicBento *rb = Object::cast_to<LagoonicBento>(row->get_child(j, false))) {
+					r_cards.push_back(rb);
+				}
+			}
+		}
+	}
+}
+
+SplitContainer *LagoonicBentoBoard::_make_row(SplitContainer *p_column, int p_index) {
+	SplitContainer *row = memnew(SplitContainer);
+	row->set_vertical(false);
+	row->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	row->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+	row->add_theme_constant_override(SNAME("separation"), int(12 * EDSCALE));
+	row->add_theme_constant_override(SNAME("minimum_grab_thickness"), int(12 * EDSCALE));
+	p_column->add_child(row);
+	p_column->move_child(row, CLAMP(p_index, 0, p_column->get_child_count(false) - 1));
+	return row;
+}
+
+Control *LagoonicBentoBoard::_slot_of(const LagoonicBento *p_bento) const {
+	Node *p = p_bento->get_parent();
+	return _as_row(p) != nullptr ? Object::cast_to<Control>(p) : const_cast<LagoonicBento *>(p_bento);
+}
+
+int LagoonicBentoBoard::_visible_cards_in(const Control *p_slot) const {
+	int n = 0;
+	if (const SplitContainer *row = _as_row(const_cast<Control *>(p_slot))) {
+		for (int i = 0; i < row->get_child_count(false); i++) {
+			const LagoonicBento *b = Object::cast_to<LagoonicBento>(row->get_child(i, false));
+			if (b != nullptr && b->is_visible()) {
+				n++;
+			}
+		}
+	} else if (p_slot->is_visible()) {
+		n = 1;
+	}
+	return n;
+}
+
+// Alto minimo con el que una tarjeta sigue siendo util.
+static constexpr float BENTO_MIN_CARD_HEIGHT = 170.0f;
+
+int LagoonicBentoBoard::_max_rows() const {
+	const float sep = 12.0f * EDSCALE;
+	return MAX(1, int((get_size().y + sep) / (BENTO_MIN_CARD_HEIGHT * EDSCALE + sep)));
+}
+
+// Filas de una columna (una fila partida en dos cuenta una). La silueta y,
+// si se pide, la tarjeta que se arrastra no cuentan.
+int LagoonicBentoBoard::_row_count(const SplitContainer *p_column, bool p_ignore_dragged) const {
+	int n = 0;
+	for (int i = 0; i < p_column->get_child_count(false); i++) {
+		const Node *c = p_column->get_child(i, false);
+		if (c == placeholder || (p_ignore_dragged && drag_card != nullptr && c == drag_card)) {
+			continue;
+		}
+		n++;
+	}
+	return n;
+}
+
+bool LagoonicBentoBoard::_column_has_room(const SplitContainer *p_column, bool p_ignore_dragged) const {
+	return _row_count(p_column, p_ignore_dragged) < _max_rows();
+}
+
+SplitContainer *LagoonicBentoBoard::_split_row(LagoonicBento *p_target) {
+	Node *parent = p_target->get_parent();
+	if (SplitContainer *row = _as_row(parent)) {
+		return row;
+	}
+	SplitContainer *col = Object::cast_to<SplitContainer>(parent);
+	const int idx = p_target->get_index(false);
+	const float ratio = p_target->get_stretch_ratio();
+	col->remove_child(p_target);
+	SplitContainer *row = _make_row(col, idx);
+	row->set_stretch_ratio(ratio); // La fila ocupa el alto que tenia la tarjeta.
+	p_target->set_stretch_ratio(1.0f);
+	row->add_child(p_target);
+	return row;
+}
+
+// Una fila con una sola tarjeta (o ninguna) deja de ser fila.
+void LagoonicBentoBoard::_unwrap_rows() {
+	for (SplitContainer *col : columns) {
+		for (int i = col->get_child_count(false) - 1; i >= 0; i--) {
+			SplitContainer *row = _as_row(col->get_child(i, false));
+			if (row == nullptr || row->get_child_count(false) >= 2) {
+				continue;
+			}
+			if (row->get_child_count(false) == 1) {
+				Control *only = Object::cast_to<Control>(row->get_child(0, false));
+				row->remove_child(only);
+				only->set_stretch_ratio(row->get_stretch_ratio());
+				col->add_child(only);
+				col->move_child(only, i);
+			}
+			col->remove_child(row);
+			memdelete(row);
+		}
+	}
+}
+
 SplitContainer *LagoonicBentoBoard::_new_column(int p_index) {
 	SplitContainer *col = memnew(SplitContainer);
 	col->set_vertical(true);
@@ -329,8 +445,12 @@ SplitContainer *LagoonicBentoBoard::_column_of(const LagoonicBento *p_bento) con
 	if (p_bento == nullptr) {
 		return nullptr;
 	}
+	Node *p = p_bento->get_parent();
+	if (_as_row(p) != nullptr) {
+		p = p->get_parent();
+	}
 	for (SplitContainer *col : columns) {
-		if (p_bento->get_parent() == col) {
+		if (p == col) {
 			return col;
 		}
 	}
@@ -339,9 +459,10 @@ SplitContainer *LagoonicBentoBoard::_column_of(const LagoonicBento *p_bento) con
 
 LagoonicBento *LagoonicBentoBoard::_find(const String &p_id) const {
 	for (SplitContainer *col : columns) {
-		for (int i = 0; i < col->get_child_count(false); i++) {
-			LagoonicBento *b = Object::cast_to<LagoonicBento>(col->get_child(i, false));
-			if (b != nullptr && b->get_bento_id() == p_id) {
+		Vector<LagoonicBento *> cards;
+		_column_cards(col, cards);
+		for (LagoonicBento *b : cards) {
+			if (b->get_bento_id() == p_id) {
 				return b;
 			}
 		}
@@ -350,6 +471,7 @@ LagoonicBento *LagoonicBentoBoard::_find(const String &p_id) const {
 }
 
 void LagoonicBentoBoard::_prune_columns() {
+	_unwrap_rows();
 	for (int i = columns.size() - 1; i >= 0; i--) {
 		if (columns[i]->get_child_count(false) == 0) {
 			SplitContainer *col = columns[i];
@@ -394,7 +516,7 @@ void LagoonicBentoBoard::add_side(LagoonicBento *p_bento) {
 	SplitContainer *target = nullptr;
 	SplitContainer *chat_col = _column_of(main_bento);
 	for (int i = columns.size() - 1; i >= 0 && target == nullptr; i--) {
-		if (columns[i] != chat_col) {
+		if (columns[i] != chat_col && _column_has_room(columns[i], false)) {
 			target = columns[i];
 		}
 	}
@@ -430,9 +552,10 @@ LagoonicBento *LagoonicBentoBoard::get_side(const String &p_id) const {
 PackedStringArray LagoonicBentoBoard::get_side_ids() const {
 	PackedStringArray ids;
 	for (SplitContainer *col : columns) {
-		for (int i = 0; i < col->get_child_count(false); i++) {
-			LagoonicBento *b = Object::cast_to<LagoonicBento>(col->get_child(i, false));
-			if (b != nullptr && b != main_bento) {
+		Vector<LagoonicBento *> cards;
+		_column_cards(col, cards);
+		for (LagoonicBento *b : cards) {
+			if (b != main_bento) {
 				ids.push_back(b->get_bento_id());
 			}
 		}
@@ -450,7 +573,9 @@ void LagoonicBentoBoard::move_side_first(const String &p_id) {
 		if (col == chat_col) {
 			continue;
 		}
-		LagoonicBento *first = Object::cast_to<LagoonicBento>(col->get_child(0, false));
+		Vector<LagoonicBento *> cards;
+		_column_cards(col, cards);
+		LagoonicBento *first = cards.is_empty() ? nullptr : cards[0];
 		if (first != nullptr && first != b) {
 			move_card(p_id, first->get_bento_id(), DROP_BEFORE);
 		}
@@ -465,15 +590,28 @@ void LagoonicBentoBoard::move_card(const String &p_id, const String &p_target, D
 		return;
 	}
 	SplitContainer *tcol = _column_of(t);
-	if (p_region == DROP_LEFT || p_region == DROP_RIGHT) {
+	if (p_region == DROP_SPLIT_LEFT || p_region == DROP_SPLIT_RIGHT) {
+		// Lado a lado dentro de la fila del destino.
+		if (_visible_cards_in(_slot_of(t)) >= 2) {
+			return; // Una fila solo se parte en dos.
+		}
+		b->get_parent()->remove_child(b);
+		SplitContainer *row = _split_row(t);
+		row->add_child(b);
+		row->move_child(b, p_region == DROP_SPLIT_LEFT ? 0 : 1);
+		_bento_reset_offsets(row);
+	} else if (p_region == DROP_LEFT || p_region == DROP_RIGHT) {
 		// Una columna nueva al lado de la del destino.
 		const int ci = columns.find(tcol);
 		SplitContainer *col = _new_column(p_region == DROP_LEFT ? ci : ci + 1);
 		b->get_parent()->remove_child(b);
 		col->add_child(b);
 	} else {
+		if (b->get_parent() != tcol && !_column_has_room(tcol, false)) {
+			return; // Otra fila no cabria en pantalla.
+		}
 		b->get_parent()->remove_child(b);
-		const int idx = t->get_index(false) + (p_region == DROP_AFTER ? 1 : 0);
+		const int idx = _slot_of(t)->get_index(false) + (p_region == DROP_AFTER ? 1 : 0);
 		tcol->add_child(b);
 		tcol->move_child(b, CLAMP(idx, 0, tcol->get_child_count(false) - 1));
 		_bento_reset_offsets(tcol);
@@ -492,10 +630,16 @@ void LagoonicBentoBoard::set_expanded(const String &p_id) {
 	for (SplitContainer *col : columns) {
 		col->set_visible(!on || col == _column_of(target));
 		for (int i = 0; i < col->get_child_count(false); i++) {
-			if (LagoonicBento *b = Object::cast_to<LagoonicBento>(col->get_child(i, false))) {
-				b->set_visible(!on || b == target);
-				b->set_expanded_look(b == target);
+			Node *slot = col->get_child(i, false);
+			if (SplitContainer *row = _as_row(slot)) {
+				row->set_visible(!on || (target != nullptr && target->get_parent() == row));
 			}
+		}
+		Vector<LagoonicBento *> cards;
+		_column_cards(col, cards);
+		for (LagoonicBento *b : cards) {
+			b->set_visible(!on || b == target);
+			b->set_expanded_look(b == target);
 		}
 	}
 }
@@ -506,16 +650,17 @@ void LagoonicBentoBoard::fit_card_height(const String &p_id, float p_height) {
 	if (card == nullptr || col == nullptr || drag_active) {
 		return;
 	}
+	Control *slot = _slot_of(card);
 	int others = 0;
 	for (int i = 0; i < col->get_child_count(false); i++) {
 		Control *c = Object::cast_to<Control>(col->get_child(i, false));
-		if (c != nullptr && c != card && c->is_visible()) {
+		if (c != nullptr && c != slot && c->is_visible()) {
 			c->set_stretch_ratio(1.0f);
 			others++;
 		}
 	}
 	if (others == 0) {
-		card->set_stretch_ratio(1.0f);
+		slot->set_stretch_ratio(1.0f);
 		return;
 	}
 	const float sep = col->get_theme_constant(SNAME("separation")) * others;
@@ -523,7 +668,7 @@ void LagoonicBentoBoard::fit_card_height(const String &p_id, float p_height) {
 	const float h = CLAMP(p_height, total * 0.3f, total * 0.75f);
 	// Con los divisores en su sitio por defecto, cada tarjeta mide segun su
 	// proporcion: la del juego h, las demas se reparten lo que queda.
-	card->set_stretch_ratio(h / (total - h) * others);
+	slot->set_stretch_ratio(h / (total - h) * others);
 	_bento_reset_offsets(col);
 }
 
@@ -536,10 +681,24 @@ Dictionary LagoonicBentoBoard::get_layout() const {
 	Array cols;
 	Array col_offsets;
 	for (SplitContainer *col : columns) {
-		PackedStringArray ids;
+		// Cada elemento: el id de una tarjeta, o [id, id] si la fila esta partida.
+		Array ids;
 		for (int i = 0; i < col->get_child_count(false); i++) {
-			if (LagoonicBento *b = Object::cast_to<LagoonicBento>(col->get_child(i, false))) {
+			Node *slot = col->get_child(i, false);
+			if (LagoonicBento *b = Object::cast_to<LagoonicBento>(slot)) {
 				ids.push_back(b->get_bento_id());
+			} else if (SplitContainer *row = _as_row(slot)) {
+				Array pair;
+				for (int j = 0; j < row->get_child_count(false); j++) {
+					if (LagoonicBento *rb = Object::cast_to<LagoonicBento>(row->get_child(j, false))) {
+						pair.push_back(rb->get_bento_id());
+					}
+				}
+				if (pair.size() == 1) {
+					ids.push_back(pair[0]);
+				} else if (!pair.is_empty()) {
+					ids.push_back(pair);
+				}
 			}
 		}
 		if (ids.is_empty()) {
@@ -564,29 +723,53 @@ void LagoonicBentoBoard::set_layout(const Dictionary &p_layout) {
 	HashMap<String, LagoonicBento *> cards;
 	Vector<String> order;
 	for (SplitContainer *col : columns) {
+		Vector<LagoonicBento *> found;
+		_column_cards(col, found);
+		for (LagoonicBento *b : found) {
+			b->get_parent()->remove_child(b);
+			cards[b->get_bento_id()] = b;
+			order.push_back(b->get_bento_id());
+		}
 		while (col->get_child_count(false) > 0) {
-			LagoonicBento *b = Object::cast_to<LagoonicBento>(col->get_child(0, false));
-			col->remove_child(col->get_child(0, false));
-			if (b != nullptr) {
-				cards[b->get_bento_id()] = b;
-				order.push_back(b->get_bento_id());
+			Node *n = col->get_child(0, false);
+			col->remove_child(n);
+			if (_as_row(n) != nullptr) {
+				memdelete(n); // Fila ya vacia.
 			}
 		}
 	}
 	_prune_columns();
 	for (int c = 0; c < wanted.size(); c++) {
-		const PackedStringArray ids = wanted[c];
+		const Array ids = wanted[c]; // El formato antiguo (una lista de ids) se lee igual.
 		SplitContainer *col = nullptr;
-		for (const String &id : ids) {
-			LagoonicBento **b = cards.getptr(id);
-			if (b == nullptr) {
+		for (int k = 0; k < ids.size(); k++) {
+			Vector<LagoonicBento *> group;
+			if (ids[k].get_type() == Variant::STRING) {
+				if (LagoonicBento **b = cards.getptr(String(ids[k]))) {
+					group.push_back(*b);
+				}
+			} else {
+				const Array pair = ids[k];
+				for (int j = 0; j < pair.size() && group.size() < 2; j++) {
+					if (LagoonicBento **b = cards.getptr(String(pair[j]))) {
+						group.push_back(*b);
+					}
+				}
+			}
+			if (group.is_empty()) {
 				continue;
 			}
 			if (col == nullptr) {
 				col = _new_column(columns.size());
 			}
-			col->add_child(*b);
-			cards.erase(id);
+			Node *parent = col;
+			if (group.size() == 2) {
+				parent = _make_row(col, col->get_child_count(false));
+			}
+			for (LagoonicBento *b : group) {
+				parent->add_child(b);
+				cards.erase(b->get_bento_id());
+			}
 		}
 	}
 	// Lo que no estaba guardado: el chat al principio, el resto al final.
@@ -621,6 +804,11 @@ void LagoonicBentoBoard::set_layout(const Dictionary &p_layout) {
 void LagoonicBentoBoard::_show_all_columns() {
 	for (SplitContainer *col : columns) {
 		col->set_visible(true);
+		for (int i = 0; i < col->get_child_count(false); i++) {
+			if (SplitContainer *row = _as_row(col->get_child(i, false))) {
+				row->set_visible(true);
+			}
+		}
 	}
 }
 
@@ -640,7 +828,11 @@ void LagoonicBentoBoard::_begin_drag(const String &p_id) {
 	placeholder_label->set_text(card->get_title().is_empty() ? String("Chat") : card->get_title());
 	// La tarjeta se aparta; si su columna se queda sin nada visible, tambien.
 	SplitContainer *col = _column_of(card);
+	Control *slot = _slot_of(card);
 	card->set_visible(false);
+	if (slot != card && _visible_cards_in(slot) == 0) {
+		slot->set_visible(false); // La fila se queda sin nada que mostrar.
+	}
 	bool others = false;
 	for (int i = 0; i < col->get_child_count(false); i++) {
 		Control *c = Object::cast_to<Control>(col->get_child(i, false));
@@ -656,6 +848,9 @@ void LagoonicBentoBoard::_detach_placeholder() {
 		SplitContainer *col = Object::cast_to<SplitContainer>(placeholder->get_parent());
 		col->remove_child(placeholder);
 		_bento_reset_offsets(col);
+		if (_as_row(col) != nullptr && col->get_child_count(false) < 2) {
+			_unwrap_rows(); // La fila que se partio solo para la silueta vuelve a ser una tarjeta.
+		}
 	}
 	if (placeholder_column != nullptr) {
 		columns.erase(placeholder_column);
@@ -678,13 +873,18 @@ void LagoonicBentoBoard::_place_placeholder(const String &p_target, DropRegion p
 	drop_target = p_target;
 	drop_region = p_region;
 	SplitContainer *tcol = _column_of(t);
-	if (p_region == DROP_LEFT || p_region == DROP_RIGHT) {
+	if (p_region == DROP_SPLIT_LEFT || p_region == DROP_SPLIT_RIGHT) {
+		SplitContainer *row = _split_row(t);
+		row->add_child(placeholder);
+		row->move_child(placeholder, p_region == DROP_SPLIT_LEFT ? 0 : row->get_child_count(false) - 1);
+		_bento_reset_offsets(row);
+	} else if (p_region == DROP_LEFT || p_region == DROP_RIGHT) {
 		const int ci = columns.find(tcol);
 		placeholder_column = _new_column(p_region == DROP_LEFT ? ci : ci + 1);
 		placeholder_column->add_child(placeholder);
 		_bento_reset_offsets(this);
 	} else {
-		const int idx = t->get_index(false) + (p_region == DROP_AFTER ? 1 : 0);
+		const int idx = _slot_of(t)->get_index(false) + (p_region == DROP_AFTER ? 1 : 0);
 		tcol->add_child(placeholder);
 		tcol->move_child(placeholder, CLAMP(idx, 0, tcol->get_child_count(false) - 1));
 		_bento_reset_offsets(tcol);
@@ -700,13 +900,42 @@ bool LagoonicBentoBoard::preview_drag(const String &p_id, const Vector2 &p_globa
 	if (placeholder->get_parent() != nullptr && placeholder->get_global_rect().has_point(p_global_point)) {
 		return true;
 	}
+	// Los bordes del tablero (y lo que hay mas alla): una columna nueva.
+	{
+		const Rect2 board_rect = get_global_rect();
+		const float edge = 36.0f * EDSCALE;
+		const bool at_left = p_global_point.x < board_rect.position.x + edge;
+		const bool at_right = p_global_point.x > board_rect.position.x + board_rect.size.x - edge;
+		if (at_left || at_right) {
+			SplitContainer *edge_col = nullptr;
+			for (SplitContainer *col : columns) {
+				if (col->is_visible()) {
+					edge_col = col;
+					if (at_left) {
+						break; // La primera visible; para la derecha, la ultima.
+					}
+				}
+			}
+			Vector<LagoonicBento *> edge_cards;
+			if (edge_col != nullptr) {
+				_column_cards(edge_col, edge_cards);
+			}
+			for (LagoonicBento *b : edge_cards) {
+				if (b->is_visible() && b != drag_card) {
+					_place_placeholder(b->get_bento_id(), at_left ? DROP_LEFT : DROP_RIGHT);
+					return true;
+				}
+			}
+		}
+	}
 	for (SplitContainer *col : columns) {
 		if (!col->is_visible()) {
 			continue;
 		}
-		for (int i = 0; i < col->get_child_count(false); i++) {
-			LagoonicBento *b = Object::cast_to<LagoonicBento>(col->get_child(i, false));
-			if (b == nullptr || !b->is_visible() || b == drag_card) {
+		Vector<LagoonicBento *> cards;
+		_column_cards(col, cards);
+		for (LagoonicBento *b : cards) {
+			if (!b->is_visible() || b == drag_card) {
 				continue;
 			}
 			const Rect2 r = b->get_global_rect();
@@ -716,10 +945,21 @@ bool LagoonicBentoBoard::preview_drag(const String &p_id, const Vector2 &p_globa
 			const float rx = (p_global_point.x - r.position.x) / MAX(r.size.x, 1.0f);
 			const float ry = (p_global_point.y - r.position.y) / MAX(r.size.y, 1.0f);
 			DropRegion region = ry < 0.5f ? DROP_BEFORE : DROP_AFTER;
-			if (rx < 0.2f) {
-				region = DROP_LEFT;
-			} else if (rx > 0.8f) {
-				region = DROP_RIGHT;
+			// Los laterales de una tarjeta parten su fila en dos (si aun no
+			// esta partida).
+			const bool row_open = _visible_cards_in(_slot_of(b)) < 2;
+			if (row_open && rx < 0.25f) {
+				region = DROP_SPLIT_LEFT;
+			} else if (row_open && rx > 0.75f) {
+				region = DROP_SPLIT_RIGHT;
+			}
+			if ((region == DROP_BEFORE || region == DROP_AFTER) && !_column_has_room(col, true)) {
+				// Sin sitio: otra fila haria salirse a las tarjetas de la
+				// pantalla. No se puede soltar aqui.
+				_detach_placeholder();
+				drop_target = String();
+				drop_region = DROP_NONE;
+				return false;
 			}
 			_place_placeholder(b->get_bento_id(), region);
 			return true;
@@ -760,6 +1000,7 @@ void LagoonicBentoBoard::commit_drag() {
 	col->add_child(card);
 	col->move_child(card, CLAMP(idx, 0, col->get_child_count(false) - 1));
 	card->set_visible(true);
+	_bento_reset_offsets(col);
 	_end_drag();
 	_changed();
 }
@@ -794,8 +1035,11 @@ void LagoonicBentoBoard::_notification(int p_what) {
 		case NOTIFICATION_DRAG_BEGIN: {
 			const Variant d = get_viewport() != nullptr ? get_viewport()->gui_get_drag_data() : Variant();
 			if (d.get_type() == Variant::DICTIONARY && String(Dictionary(d).get("type", "")) == "lagoonic_bento" && is_visible_in_tree()) {
-				drop_overlay->set_global_position(get_global_position());
-				drop_overlay->set_size(get_size());
+				// Algo mas ancha que el tablero: soltar contra el borde de la
+				// pantalla, donde ya no hay nada, tambien cuenta.
+				const float reach = 48.0f * EDSCALE;
+				drop_overlay->set_global_position(get_global_position() - Vector2(reach, 0));
+				drop_overlay->set_size(get_size() + Vector2(reach * 2, 0));
 				drop_overlay->set_visible(true);
 				// Apartar la tarjeta despues del evento que empezo el arrastre.
 				callable_mp(this, &LagoonicBentoBoard::_begin_drag).call_deferred(String(Dictionary(d).get("id", "")));
@@ -821,14 +1065,16 @@ void LagoonicBentoBoard::_bind_methods() {
 	BIND_ENUM_CONSTANT(DROP_AFTER);
 	BIND_ENUM_CONSTANT(DROP_LEFT);
 	BIND_ENUM_CONSTANT(DROP_RIGHT);
+	BIND_ENUM_CONSTANT(DROP_SPLIT_LEFT);
+	BIND_ENUM_CONSTANT(DROP_SPLIT_RIGHT);
 }
 
 void LagoonicBentoBoard::apply_palette() {
 	for (SplitContainer *col : columns) {
-		for (int i = 0; i < col->get_child_count(false); i++) {
-			if (LagoonicBento *b = Object::cast_to<LagoonicBento>(col->get_child(i, false))) {
-				b->apply_palette();
-			}
+		Vector<LagoonicBento *> cards;
+		_column_cards(col, cards);
+		for (LagoonicBento *b : cards) {
+			b->apply_palette();
 		}
 	}
 }

@@ -122,6 +122,8 @@ public:
 		DROP_AFTER,
 		DROP_LEFT,
 		DROP_RIGHT,
+		DROP_SPLIT_LEFT, // Dentro de la fila del destino: lado a lado.
+		DROP_SPLIT_RIGHT,
 	};
 
 private:
@@ -143,6 +145,18 @@ private:
 	DropRegion drop_region = DROP_NONE;
 
 	SplitContainer *_new_column(int p_index);
+	// Una fila de una columna puede partirse en dos: un SplitContainer
+	// horizontal con dos tarjetas dentro de la columna.
+	SplitContainer *_split_row(LagoonicBento *p_target); // Fila con el destino (la crea si hace falta).
+	SplitContainer *_make_row(SplitContainer *p_column, int p_index);
+	void _unwrap_rows();
+	Control *_slot_of(const LagoonicBento *p_bento) const; // Hijo directo de la columna.
+	// Regla de espacio: cuantas filas caben en una columna sin que las
+	// tarjetas se salgan de la pantalla (cada una necesita su alto minimo).
+	int _max_rows() const;
+	int _row_count(const SplitContainer *p_column, bool p_ignore_dragged) const;
+	bool _column_has_room(const SplitContainer *p_column, bool p_ignore_dragged) const;
+	int _visible_cards_in(const Control *p_slot) const;
 	SplitContainer *_column_of(const LagoonicBento *p_bento) const;
 	LagoonicBento *_find(const String &p_id) const; // El chat incluido.
 	void _prune_columns();
@@ -186,7 +200,7 @@ public:
 	// el 75 % de la columna), repartiendo el resto entre las demas.
 	void fit_card_height(const String &p_id, float p_height);
 	String get_expanded() const { return expanded_id; }
-	// Orden y tamanos: {columns: [[ids]], board: [offsets], cols: [[offsets]]}.
+	// Orden y tamanos: {columns: [[id | [id, id]]], board: [offsets], cols: [[offsets]]}.
 	Dictionary get_layout() const;
 	void set_layout(const Dictionary &p_layout);
 	void apply_palette();
