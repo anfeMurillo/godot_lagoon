@@ -146,7 +146,9 @@ private:
 	VBoxContainer *welcome_box = nullptr;
 	Label *busy_label = nullptr;
 	HBoxContainer *header_row = nullptr;
-	Label *welcome_sub = nullptr;
+	TextureRect *welcome_logo = nullptr; // Silueta del agente activo.
+	String welcome_logo_agent;
+	void _update_welcome_logo();
 	Control *suggestions_box = nullptr;
 	bool minimal = false;
 	bool native_look = false;

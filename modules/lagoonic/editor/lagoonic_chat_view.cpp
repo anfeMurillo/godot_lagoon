@@ -30,6 +30,7 @@
 
 #include "lagoonic_chat_view.h"
 
+#include "lagoonic_agent_logos.h"
 #include "lagoonic_markdown_view.h"
 #include "lagoonic_model_viewer.h"
 #include "lagoonic_vibe_theme.h"
@@ -838,7 +839,7 @@ void LagoonicChatView::_on_input_focus(bool p_focused) {
 
 void LagoonicChatView::set_minimal(bool p_minimal) {
 	minimal = p_minimal;
-	for (Control *c : { (Control *)header_row, (Control *)welcome_sub, suggestions_box, (Control *)attach_button }) {
+	for (Control *c : { (Control *)header_row, suggestions_box, (Control *)attach_button }) {
 		if (c != nullptr) {
 			c->set_visible(!minimal);
 		}
@@ -1054,6 +1055,7 @@ void LagoonicChatView::_on_boss_selected(int p_index) {
 	const String agent_id = boss_option->get_item_text(p_index);
 	_fire(SNAME("boss_changed"), agent_id);
 	crew_view->set_boss_name(agent_id);
+	_update_welcome_logo();
 }
 
 void LagoonicChatView::_on_model_selected(int p_index) {
@@ -1598,6 +1600,7 @@ void LagoonicChatView::set_boss_agent(const String &p_agent_id) {
 		if (String(boss_option->get_item_text(i)) == p_agent_id) {
 			boss_option->select(i);
 			crew_view->set_boss_name(p_agent_id);
+			_update_welcome_logo();
 			return;
 		}
 	}
@@ -2384,8 +2387,35 @@ void LagoonicChatView::clear_messages() {
 	clear_error();
 }
 
+void LagoonicChatView::_update_welcome_logo() {
+	if (welcome_logo == nullptr) {
+		return;
+	}
+	const String agent = get_boss_agent();
+	const char *svg = LagoonicAgentLogos::svg_for(agent);
+	if (svg == nullptr) {
+		welcome_logo->set_texture(Ref<Texture2D>());
+		welcome_logo_agent = String();
+		return;
+	}
+	if (welcome_logo_agent != agent || welcome_logo->get_texture().is_null()) {
+		// Se pinta en blanco y se tiñe con el color del tema (self_modulate),
+		// asi un cambio de tema no obliga a rasterizar de nuevo.
+		Ref<Image> img;
+		img.instantiate();
+		if (img->load_svg_from_string(String(svg), 16.0f) == OK) {
+			welcome_logo->set_texture(ImageTexture::create_from_image(img));
+			welcome_logo_agent = agent;
+		}
+	}
+	Color tint = get_theme_color(SNAME("font_color"), SNAME("Label"));
+	tint.a = 0.12f;
+	welcome_logo->set_self_modulate(tint);
+}
+
 void LagoonicChatView::refresh_icons() {
 	_apply_native_styles();
+	_update_welcome_logo();
 	if (stop_button != nullptr) {
 		stop_button->set_button_icon(get_editor_theme_icon(SNAME("Stop")));
 	}
@@ -2712,19 +2742,13 @@ LagoonicChatView::LagoonicChatView() {
 	welcome_box->add_theme_constant_override(SNAME("separation"), 10);
 	messages_box->add_child(welcome_box);
 
-	Label *welcome_title = memnew(Label);
-	welcome_title->set_text(String::utf8("¿Qué hacemos hoy con tu juego?"));
-	welcome_title->set_theme_type_variation(LagoonicVibeTheme::TITLE_LABEL);
-	welcome_title->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
-	welcome_title->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
-	welcome_box->add_child(welcome_title);
-
-	welcome_sub = memnew(Label);
-	welcome_sub->set_text(String::utf8("Cuéntaselo a Lagoonic con tus palabras. Él escribe el código y tú lo pruebas con Jugar."));
-	welcome_sub->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
-	welcome_sub->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
-	welcome_sub->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
-	welcome_box->add_child(welcome_sub);
+	welcome_logo = memnew(TextureRect);
+	welcome_logo->set_expand_mode(TextureRect::EXPAND_IGNORE_SIZE);
+	welcome_logo->set_stretch_mode(TextureRect::STRETCH_KEEP_ASPECT_CENTERED);
+	welcome_logo->set_custom_minimum_size(Size2(132, 132) * EDSCALE);
+	welcome_logo->set_h_size_flags(Control::SIZE_SHRINK_CENTER);
+	welcome_logo->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
+	welcome_box->add_child(welcome_logo);
 
 	HFlowContainer *suggestions = memnew(HFlowContainer);
 	suggestions->set_alignment(FlowContainer::ALIGNMENT_CENTER);
