@@ -41,6 +41,7 @@
 #include "scene/gui/button.h"
 #include "scene/gui/label.h"
 #include "scene/gui/margin_container.h"
+#include "scene/gui/scroll_container.h"
 #include "scene/gui/texture_rect.h"
 #include "scene/resources/style_box_flat.h"
 #include "scene/gui/panel_container.h"
@@ -230,7 +231,8 @@ LagoonicBento::LagoonicBento() {
 	set_clip_children_mode(CanvasItem::CLIP_CHILDREN_AND_DRAW);
 	set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	set_v_size_flags(Control::SIZE_EXPAND_FILL);
-	set_custom_minimum_size(Size2(220, 140) * EDSCALE);
+	// Alto minimo: con muchas filas el tablero se desplaza en vez de aplastarlas.
+	set_custom_minimum_size(Size2(260, 170) * EDSCALE);
 
 	VBoxContainer *vb = memnew(VBoxContainer);
 	vb->add_theme_constant_override(SNAME("separation"), 0);
@@ -364,30 +366,42 @@ int LagoonicBentoBoard::_visible_cards_in(const Control *p_slot) const {
 	return n;
 }
 
-// Alto minimo con el que una tarjeta sigue siendo util.
-static constexpr float BENTO_MIN_CARD_HEIGHT = 170.0f;
-
-int LagoonicBentoBoard::_max_rows() const {
-	const float sep = 12.0f * EDSCALE;
-	return MAX(1, int((get_size().y + sep) / (BENTO_MIN_CARD_HEIGHT * EDSCALE + sep)));
-}
-
-// Filas de una columna (una fila partida en dos cuenta una). La silueta y,
-// si se pide, la tarjeta que se arrastra no cuentan.
-int LagoonicBentoBoard::_row_count(const SplitContainer *p_column, bool p_ignore_dragged) const {
-	int n = 0;
-	for (int i = 0; i < p_column->get_child_count(false); i++) {
-		const Node *c = p_column->get_child(i, false);
-		if (c == placeholder || (p_ignore_dragged && drag_card != nullptr && c == drag_card)) {
-			continue;
+ScrollContainer *LagoonicBentoBoard::_scroll() const {
+	for (Node *n = get_parent(); n != nullptr; n = n->get_parent()) {
+		if (ScrollContainer *sc = Object::cast_to<ScrollContainer>(n)) {
+			return sc;
 		}
-		n++;
 	}
-	return n;
+	return nullptr;
 }
 
-bool LagoonicBentoBoard::_column_has_room(const SplitContainer *p_column, bool p_ignore_dragged) const {
-	return _row_count(p_column, p_ignore_dragged) < _max_rows();
+Rect2 LagoonicBentoBoard::_view_rect() const {
+	const ScrollContainer *sc = _scroll();
+	return sc != nullptr ? sc->get_global_rect() : get_global_rect();
+}
+
+// Arrastrando cerca del borde de la zona visible, el tablero se desplaza.
+void LagoonicBentoBoard::_autoscroll(const Vector2 &p_global_point) {
+	ScrollContainer *sc = _scroll();
+	if (sc == nullptr) {
+		return;
+	}
+	const Rect2 view = sc->get_global_rect();
+	const float margin = 48.0f * EDSCALE;
+	const int step = int(28.0f * EDSCALE);
+	if (p_global_point.y < view.position.y + margin) {
+		sc->set_v_scroll(sc->get_v_scroll() - step);
+	} else if (p_global_point.y > view.position.y + view.size.y - margin) {
+		sc->set_v_scroll(sc->get_v_scroll() + step);
+	}
+	HScrollBar *hb = sc->get_h_scroll_bar();
+	if (hb != nullptr && hb->is_visible()) {
+		if (p_global_point.x < view.position.x + margin) {
+			sc->set_h_scroll(sc->get_h_scroll() - step);
+		} else if (p_global_point.x > view.position.x + view.size.x - margin) {
+			sc->set_h_scroll(sc->get_h_scroll() + step);
+		}
+	}
 }
 
 SplitContainer *LagoonicBentoBoard::_split_row(LagoonicBento *p_target) {
@@ -505,7 +519,7 @@ void LagoonicBentoBoard::set_main(LagoonicBento *p_bento) {
 	}
 	main_bento->set_expandable(false);
 	// El chat nunca se queda tan estrecho que no se pueda leer.
-	main_bento->set_custom_minimum_size(Size2(380, 140) * EDSCALE);
+	main_bento->set_custom_minimum_size(Size2(380, 170) * EDSCALE);
 	SplitContainer *col = columns.is_empty() ? _new_column(0) : columns[0];
 	col->add_child(main_bento);
 	col->move_child(main_bento, 0);
@@ -516,7 +530,7 @@ void LagoonicBentoBoard::add_side(LagoonicBento *p_bento) {
 	SplitContainer *target = nullptr;
 	SplitContainer *chat_col = _column_of(main_bento);
 	for (int i = columns.size() - 1; i >= 0 && target == nullptr; i--) {
-		if (columns[i] != chat_col && _column_has_room(columns[i], false)) {
+		if (columns[i] != chat_col) {
 			target = columns[i];
 		}
 	}
@@ -607,9 +621,6 @@ void LagoonicBentoBoard::move_card(const String &p_id, const String &p_target, D
 		b->get_parent()->remove_child(b);
 		col->add_child(b);
 	} else {
-		if (b->get_parent() != tcol && !_column_has_room(tcol, false)) {
-			return; // Otra fila no cabria en pantalla.
-		}
 		b->get_parent()->remove_child(b);
 		const int idx = _slot_of(t)->get_index(false) + (p_region == DROP_AFTER ? 1 : 0);
 		tcol->add_child(b);
@@ -896,6 +907,7 @@ bool LagoonicBentoBoard::preview_drag(const String &p_id, const Vector2 &p_globa
 	if (!drag_active || p_id != drag_id) {
 		return false;
 	}
+	_autoscroll(p_global_point);
 	// Encima de la propia silueta: se queda donde esta (evita que salte).
 	if (placeholder->get_parent() != nullptr && placeholder->get_global_rect().has_point(p_global_point)) {
 		return true;
@@ -952,14 +964,6 @@ bool LagoonicBentoBoard::preview_drag(const String &p_id, const Vector2 &p_globa
 				region = DROP_SPLIT_LEFT;
 			} else if (row_open && rx > 0.75f) {
 				region = DROP_SPLIT_RIGHT;
-			}
-			if ((region == DROP_BEFORE || region == DROP_AFTER) && !_column_has_room(col, true)) {
-				// Sin sitio: otra fila haria salirse a las tarjetas de la
-				// pantalla. No se puede soltar aqui.
-				_detach_placeholder();
-				drop_target = String();
-				drop_region = DROP_NONE;
-				return false;
 			}
 			_place_placeholder(b->get_bento_id(), region);
 			return true;
@@ -1038,8 +1042,9 @@ void LagoonicBentoBoard::_notification(int p_what) {
 				// Algo mas ancha que el tablero: soltar contra el borde de la
 				// pantalla, donde ya no hay nada, tambien cuenta.
 				const float reach = 48.0f * EDSCALE;
-				drop_overlay->set_global_position(get_global_position() - Vector2(reach, 0));
-				drop_overlay->set_size(get_size() + Vector2(reach * 2, 0));
+				const Rect2 view = _view_rect();
+				drop_overlay->set_global_position(view.position - Vector2(reach, 0));
+				drop_overlay->set_size(view.size + Vector2(reach * 2, 0));
 				drop_overlay->set_visible(true);
 				// Apartar la tarjeta despues del evento que empezo el arrastre.
 				callable_mp(this, &LagoonicBentoBoard::_begin_drag).call_deferred(String(Dictionary(d).get("id", "")));

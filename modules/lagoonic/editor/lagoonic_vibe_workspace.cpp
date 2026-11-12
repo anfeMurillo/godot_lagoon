@@ -1416,8 +1416,16 @@ LagoonicVibeWorkspace::LagoonicVibeWorkspace() {
 	body_margin->add_theme_constant_override(SNAME("margin_bottom"), int(12 * EDSCALE));
 	root_vb->add_child(body_margin);
 
+	// Con muchas columnas o filas el tablero no se aprieta ni se sale de la
+	// pantalla: se desplaza en horizontal y en vertical.
+	ScrollContainer *board_scroll = memnew(ScrollContainer);
+	board_scroll->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	board_scroll->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+	board_scroll->set_horizontal_scroll_mode(ScrollContainer::SCROLL_MODE_AUTO);
+	board_scroll->set_vertical_scroll_mode(ScrollContainer::SCROLL_MODE_AUTO);
+	body_margin->add_child(board_scroll);
 	bento_board = memnew(LagoonicBentoBoard);
-	body_margin->add_child(bento_board);
+	board_scroll->add_child(bento_board);
 
 	// Tarjeta principal: el chat, con el agua de Lagoonic en su cabecera.
 	chat_bento = memnew(LagoonicBento);

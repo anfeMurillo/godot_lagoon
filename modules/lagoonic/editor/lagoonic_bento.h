@@ -151,11 +151,11 @@ private:
 	SplitContainer *_make_row(SplitContainer *p_column, int p_index);
 	void _unwrap_rows();
 	Control *_slot_of(const LagoonicBento *p_bento) const; // Hijo directo de la columna.
-	// Regla de espacio: cuantas filas caben en una columna sin que las
-	// tarjetas se salgan de la pantalla (cada una necesita su alto minimo).
-	int _max_rows() const;
-	int _row_count(const SplitContainer *p_column, bool p_ignore_dragged) const;
-	bool _column_has_room(const SplitContainer *p_column, bool p_ignore_dragged) const;
+	// El tablero vive dentro de un ScrollContainer: zona visible, y desplazar
+	// si el cursor arrastra una tarjeta cerca de su borde.
+	class ScrollContainer *_scroll() const;
+	Rect2 _view_rect() const;
+	void _autoscroll(const Vector2 &p_global_point);
 	int _visible_cards_in(const Control *p_slot) const;
 	SplitContainer *_column_of(const LagoonicBento *p_bento) const;
 	LagoonicBento *_find(const String &p_id) const; // El chat incluido.
