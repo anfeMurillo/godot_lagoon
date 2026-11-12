@@ -170,6 +170,41 @@ Vector<Dictionary> LagoonicCrewOrchestrator::crew_list_workers() const {
 	return out;
 }
 
+Array LagoonicCrewOrchestrator::snapshot() const {
+	MutexLock lock(mutex);
+	Array out;
+	for (const LagoonicCrewTask &t : crew_round_tasks) {
+		Dictionary d;
+		d["number"] = t.number;
+		d["title"] = t.title;
+		d["worker_name"] = t.worker_name;
+		d["worker_id"] = t.worker_id;
+		d["status"] = t.status;
+		d["report"] = t.report;
+		d["started_msec"] = t.started_msec;
+		d["finished_msec"] = t.finished_msec;
+		out.push_back(d);
+	}
+	return out;
+}
+
+String LagoonicCrewOrchestrator::get_boss_id() const {
+	MutexLock lock(mutex);
+	return boss_id;
+}
+
+void LagoonicCrewOrchestrator::_mirror_task(const LagoonicCrewTask &p_task) {
+	for (int k = 0; k < crew_round_tasks.size(); k++) {
+		if (crew_round_tasks[k].number == p_task.number) {
+			crew_round_tasks.write[k].status = p_task.status;
+			crew_round_tasks.write[k].report = p_task.report;
+			crew_round_tasks.write[k].started_msec = p_task.started_msec;
+			crew_round_tasks.write[k].finished_msec = p_task.finished_msec;
+			return;
+		}
+	}
+}
+
 String LagoonicCrewOrchestrator::crew_start_worker(const String &p_title, const String &p_spec, const String &p_worker, String &r_error) {
 	// Same path as queue_task; refusals surface as r_error so the server can
 	// answer them as a text payload with isError (never as -32603).
@@ -362,9 +397,12 @@ void LagoonicCrewOrchestrator::_run_crew(const String &p_boss_session_id) {
 				MutexLock lock(mutex);
 				if (crew_cancelled || !fatal_error.is_empty()) {
 					round.write[i].status = "cancelled";
+					_mirror_task(round[i]);
 					continue;
 				}
 				round.write[i].status = "running";
+				round.write[i].started_msec = Time::get_singleton()->get_ticks_msec();
+				_mirror_task(round[i]);
 			}
 			if (r != nullptr) {
 				r->crew_emit_chat(p_boss_session_id, "**" + round[i].worker_name + String::utf8("** · tarea #") + String::num_int64(round[i].number) + ": " + round[i].title);
@@ -387,8 +425,10 @@ void LagoonicCrewOrchestrator::_run_crew(const String &p_boss_session_id) {
 			}
 			{
 				MutexLock lock(mutex);
+				round.write[i].finished_msec = Time::get_singleton()->get_ticks_msec();
 				if (crew_cancelled || !fatal_error.is_empty()) {
 					round.write[i].status = "cancelled";
+					_mirror_task(round[i]);
 					continue;
 				}
 				round.write[i].status = ok ? "succeeded" : "failed";
@@ -396,18 +436,13 @@ void LagoonicCrewOrchestrator::_run_crew(const String &p_boss_session_id) {
 				round.write[i].report = report.is_empty() ? "(no report)" : report.substr(0, MAX_CREW_REPORT);
 				results.push_back(round[i]);
 				// Mirror the round status back into the visible round list.
-				for (int k = 0; k < crew_round_tasks.size(); k++) {
-					if (crew_round_tasks[k].number == round[i].number) {
-						crew_round_tasks.write[k].status = round[i].status;
-						crew_round_tasks.write[k].report = round[i].report;
-						break;
-					}
-				}
+				_mirror_task(round[i]);
 			}
 			if (!_sleep_gap()) {
 				MutexLock lock(mutex);
 				for (int j = i + 1; j < round.size(); j++) {
 					round.write[j].status = "cancelled";
+					_mirror_task(round[j]);
 				}
 				break;
 			}

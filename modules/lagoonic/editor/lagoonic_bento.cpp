@@ -210,6 +210,38 @@ void LagoonicBentoBoard::_update_side_visibility() {
 	side_column->set_visible(side_column->get_child_count() > 0);
 }
 
+Dictionary LagoonicBentoBoard::_read_layout() const {
+	Dictionary d;
+	d["main"] = get_split_offset();
+	// La columna avisa cuantos separadores tiene de verdad ahora mismo.
+	Array side;
+	const PackedInt32Array offsets = side_column->get_split_offsets();
+	for (int i = 0; i < offsets.size(); i++) {
+		side.push_back(offsets[i]);
+	}
+	d["side"] = side;
+	return d;
+}
+
+void LagoonicBentoBoard::_apply_layout(const Dictionary &p_layout) {
+	set_split_offset(int(p_layout.get("main", 0)));
+	const Array side = p_layout.get("side", Array());
+	PackedInt32Array offsets = side_column->get_split_offsets();
+	for (int i = 0; i < offsets.size(); i++) {
+		offsets.set(i, i < side.size() ? int(side[i]) : 0);
+	}
+	side_column->set_split_offsets(offsets);
+	clamp_split_offset();
+}
+
+Dictionary LagoonicBentoBoard::get_layout() const {
+	return _read_layout();
+}
+
+void LagoonicBentoBoard::set_layout(const Dictionary &p_layout) {
+	_apply_layout(p_layout);
+}
+
 void LagoonicBentoBoard::set_main(LagoonicBento *p_bento) {
 	if (main_bento != nullptr) {
 		remove_child(main_bento);
@@ -274,7 +306,10 @@ LagoonicBentoBoard::LagoonicBentoBoard() {
 	add_theme_constant_override(SNAME("separation"), int(12 * EDSCALE));
 	add_theme_constant_override(SNAME("minimum_grab_thickness"), int(12 * EDSCALE));
 
-	side_column = memnew(VSplitContainer);
+	side_column = memnew(SplitContainer);
+	side_column->set_vertical(true);
+	// Este tablero no esta en ClassDB, asi que no puede conectarse a su propia
+	// senal "dragged"; quien guarda los tamanos los compara con get_layout().
 	side_column->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	side_column->set_v_size_flags(Control::SIZE_EXPAND_FILL);
 	side_column->set_stretch_ratio(1.0f);

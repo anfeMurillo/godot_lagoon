@@ -52,6 +52,7 @@
 #include "scene/gui/scroll_bar.h"
 #include "core/os/keyboard.h"
 #include "editor/themes/editor_scale.h"
+#include "servers/display/display_server.h"
 #include "scene/gui/flow_container.h"
 #include "scene/gui/texture_rect.h"
 #include "scene/resources/font.h"
@@ -333,11 +334,28 @@ VBoxContainer *LagoonicChatView::_ensure_message_box(const String &p_msg_id, boo
 		content->add_child(media);
 		media_boxes[p_msg_id] = media;
 
+		HBoxContainer *footer = memnew(HBoxContainer);
+		footer->add_theme_constant_override(SNAME("separation"), int(6 * EDSCALE));
+		content->add_child(footer);
+
 		Label *worked = memnew(Label);
 		worked->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
 		worked->set_visible(false);
-		content->add_child(worked);
+		footer->add_child(worked);
 		worked_labels[p_msg_id] = worked;
+
+		// Copiar la respuesta: aparece cuando ya hay texto.
+		Button *copy = memnew(Button);
+		copy->set_flat(true);
+		copy->set_focus_mode(Control::FOCUS_NONE);
+		copy->set_text(String::utf8("Copiar"));
+		copy->set_tooltip_text(String::utf8("Copia esta respuesta al portapapeles."));
+		copy->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
+		copy->add_theme_color_override(SceneStringName(font_color), LagoonicVibeTheme::current().text_muted);
+		copy->set_visible(false);
+		copy->connect(SceneStringName(pressed), callable_mp(this, &LagoonicChatView::_on_copy_pressed).bind(p_msg_id));
+		footer->add_child(copy);
+		copy_buttons[p_msg_id] = copy;
 	}
 	return box;
 }
@@ -396,6 +414,16 @@ void LagoonicChatView::_refresh_tool_icon(const String &p_key, int p_state) {
 	}
 }
 
+void LagoonicChatView::_on_copy_pressed(const String &p_msg_id) {
+	if (!assistant_texts.has(p_msg_id) || DisplayServer::get_singleton() == nullptr) {
+		return;
+	}
+	DisplayServer::get_singleton()->clipboard_set(assistant_texts[p_msg_id].strip_edges());
+	if (copy_buttons.has(p_msg_id)) {
+		copy_buttons[p_msg_id]->set_text(String::utf8("Copiado"));
+	}
+}
+
 void LagoonicChatView::_set_worked(const String &p_msg_id, uint64_t p_msec) {
 	if (!worked_labels.has(p_msg_id) || p_msec == 0) {
 		return;
@@ -429,7 +457,14 @@ void LagoonicChatView::notify_turn_finished() {
 }
 
 void LagoonicChatView::_notify_listeners(const StringName &p_what) {
-	for (const Callable &c : listeners) {
+	// Los paneles cerrados dejan su aviso colgando: fuera.
+	for (int i = listeners.size() - 1; i >= 0; i--) {
+		if (!listeners[i].is_valid()) {
+			listeners.remove_at(i);
+		}
+	}
+	const Vector<Callable> current = listeners; // Un aviso puede abrir o cerrar paneles.
+	for (const Callable &c : current) {
 		if (c.is_valid()) {
 			c.call(p_what);
 		}
@@ -1680,6 +1715,10 @@ void LagoonicChatView::upsert_assistant_message(const String &p_msg_id, const St
 		LagoonicMarkdownView *body = assistant_bodies[p_msg_id];
 		body->set_markdown(p_text);
 		assistant_texts[p_msg_id] = p_text;
+		if (copy_buttons.has(p_msg_id)) {
+			copy_buttons[p_msg_id]->set_visible(!p_text.strip_edges().is_empty());
+			copy_buttons[p_msg_id]->set_text(String::utf8("Copiar"));
+		}
 		if (Control *bubble = Object::cast_to<Control>(body->get_parent())) {
 			bubble->set_visible(!p_text.strip_edges().is_empty());
 		}
@@ -1839,8 +1878,89 @@ String LagoonicChatView::_narrate_tool(const String &p_label, const String &p_de
 		if (action == "scene save as" || action == "editor save") {
 			return with_file(String::utf8("Guardando la escena"));
 		}
-		if (action == "node add" || action == "editor node") {
+		if (action == "node add") {
 			return String::utf8("Agregando elementos a la escena");
+		}
+		if (action == "editor node") {
+			return String::utf8("Revisando un elemento de la escena");
+		}
+		if (action == "node edit" || action == "scene inherit") {
+			return String::utf8("Ordenando la escena");
+		}
+		if (action == "signal") {
+			return String::utf8("Conectando las piezas del juego");
+		}
+		if (action == "game input") {
+			return String::utf8("Jugando al juego");
+		}
+		if (action == "game wait") {
+			return String::utf8("Dejando correr el juego");
+		}
+		if (action == "game screenshot") {
+			return String::utf8("Mirando la pantalla del juego");
+		}
+		if (action == "game tree" || action == "game node" || action == "game exec") {
+			return String::utf8("Comprobando qué pasa en el juego");
+		}
+		if (action == "game monitors" || action == "profiler") {
+			return String::utf8("Midiendo el rendimiento del juego");
+		}
+		if (action == "game stop") {
+			return String::utf8("Cerrando el juego");
+		}
+		if (action == "debug") {
+			return String::utf8("Buscando el fallo paso a paso");
+		}
+		if (action == "input map" || action == "add gamepad support") {
+			return String::utf8("Configurando los controles");
+		}
+		if (action == "project setting" || action == "autoload" || action == "layer names" || action == "plugin") {
+			return String::utf8("Ajustando el proyecto");
+		}
+		if (action == "collision") {
+			return String::utf8("Ajustando las colisiones");
+		}
+		if (action == "tileset" || action == "tilemap") {
+			return String::utf8("Dibujando el nivel");
+		}
+		if (action == "animation" || action == "sprite frames") {
+			return String::utf8("Creando animaciones");
+		}
+		if (action == "particles" || action == "shader") {
+			return String::utf8("Creando efectos visuales");
+		}
+		if (action == "theme") {
+			return String::utf8("Dando estilo a la interfaz");
+		}
+		if (action == "navigation") {
+			return String::utf8("Preparando los caminos del nivel");
+		}
+		if (action == "audio bus") {
+			return String::utf8("Ajustando el sonido");
+		}
+		if (action == "resource" || action == "import options") {
+			return with_file(String::utf8("Preparando recursos"));
+		}
+		if (action == "filesystem") {
+			return String::utf8("Ordenando los archivos");
+		}
+		if (action == "find references") {
+			return String::utf8("Buscando dónde se usa un archivo");
+		}
+		if (action == "class doc" || action == "class list") {
+			return String::utf8("Consultando la documentación de Godot");
+		}
+		if (action == "localization") {
+			return String::utf8("Añadiendo idiomas");
+		}
+		if (action == "godot exec" || action == "editor exec") {
+			return String::utf8("Haciendo un ajuste a medida");
+		}
+		if (action == "editor action" || action == "editor select" || action == "editor open scene" || action == "editor status" || action == "editor reload") {
+			return String::utf8("Usando el editor");
+		}
+		if (action.begins_with("asset")) {
+			return String::utf8("Creando recursos para el juego");
 		}
 		if (action == "node set property") {
 			return String::utf8("Ajustando propiedades");
@@ -2029,6 +2149,9 @@ void LagoonicChatView::set_assistant_timeline(const String &p_msg_id, const Arra
 	LagoonicMarkdownView *body = assistant_bodies[p_msg_id];
 	body->set_markdown(final_text);
 	assistant_texts[p_msg_id] = all_text; // Solo para encontrar archivos.
+	if (copy_buttons.has(p_msg_id)) {
+		copy_buttons[p_msg_id]->set_visible(!all_text.strip_edges().is_empty());
+	}
 	if (Control *bubble = Object::cast_to<Control>(body->get_parent())) {
 		bubble->set_visible(!final_text.is_empty());
 	}
@@ -2235,6 +2358,7 @@ void LagoonicChatView::clear_messages() {
 	tool_phrases.clear();
 	tool_raw_labels.clear();
 	worked_labels.clear();
+	copy_buttons.clear();
 	media_boxes.clear();
 	assistant_texts.clear();
 	turn_message_ids.clear();

@@ -63,6 +63,7 @@
 #include "editor/settings/editor_settings.h"
 #include "lagoonic_bento.h"
 #include "lagoonic_bento_panels.h"
+#include "../runtime/lagoonic_coding_agents.h"
 #include "scene/gui/popup_menu.h"
 #include "servers/display/display_server.h"
 
@@ -154,7 +155,7 @@ void LagoonicVibeWorkspace::_refresh_icons() {
 		agent_dock->refresh_icons();
 	}
 	if (add_panel_button != nullptr && is_inside_tree()) {
-		add_panel_button->set_button_icon(get_editor_theme_icon(SNAME("Add")));
+		add_panel_button->set_button_icon(get_editor_theme_icon(SNAME("Panels2")));
 	}
 }
 
@@ -172,6 +173,7 @@ static const LagoonicBentoType LAGOONIC_BENTOS[] = {
 	{ "changes", "Cambios", "Edit", "Archivos que ha tocado este chat" },
 	{ "files", "Archivos", "Folder", "Explora tu proyecto y menciona archivos" },
 	{ "context", "Contexto", "Performance", "Modelo, mensajes y tiempo de este chat" },
+	{ "team", "Equipo", "Groups", "El líder y los ayudantes que lanza, en vivo" },
 };
 
 void LagoonicVibeWorkspace::_update_chat_width() {
@@ -197,19 +199,14 @@ void LagoonicVibeWorkspace::_update_title_margins() {
 }
 
 void LagoonicVibeWorkspace::_on_add_panel_pressed() {
+	// Todos los paneles con su casilla: se abren y cierran desde aqui.
 	add_panel_menu->clear();
 	for (const LagoonicBentoType &t : LAGOONIC_BENTOS) {
-		if (bento_board->get_side(t.id) != nullptr) {
-			continue;
-		}
-		add_panel_menu->add_icon_item(get_editor_theme_icon(StringName(t.icon)), String::utf8(t.title));
+		add_panel_menu->add_icon_check_item(get_editor_theme_icon(StringName(t.icon)), String::utf8(t.title));
 		const int idx = add_panel_menu->get_item_count() - 1;
+		add_panel_menu->set_item_checked(idx, bento_board->get_side(t.id) != nullptr);
 		add_panel_menu->set_item_metadata(idx, String(t.id));
 		add_panel_menu->set_item_tooltip(idx, String::utf8(t.hint));
-	}
-	if (add_panel_menu->get_item_count() == 0) {
-		add_panel_menu->add_item(String::utf8("Ya están todos abiertos"));
-		add_panel_menu->set_item_disabled(0, true);
 	}
 	const Rect2 r = add_panel_button->get_screen_rect();
 	add_panel_menu->set_position(Point2i(r.position.x, r.position.y + r.size.y + 4));
@@ -219,9 +216,62 @@ void LagoonicVibeWorkspace::_on_add_panel_pressed() {
 
 void LagoonicVibeWorkspace::_on_add_panel_selected(int p_index) {
 	const Variant meta = add_panel_menu->get_item_metadata(p_index);
-	if (meta.get_type() == Variant::STRING) {
+	if (meta.get_type() != Variant::STRING) {
+		return;
+	}
+	if (bento_board->get_side(meta) != nullptr) {
+		_close_bento(meta);
+	} else {
 		_open_bento(meta);
 	}
+}
+
+Dictionary LagoonicVibeWorkspace::_get_team() {
+	_ensure_runtime_host();
+	Dictionary d;
+	const String boss = LagoonicAgentSettings::get_boss();
+	const LagoonicCodingAgents::AgentInfo *info = LagoonicCodingAgents::get_agent(boss);
+	d["boss_name"] = info != nullptr ? String::utf8(info->name) : String("OpenCode");
+	d["workers"] = LagoonicAgentSettings::crew_workers();
+	d["busy"] = agent_dock != nullptr && agent_dock->get_chat_view() != nullptr && agent_dock->get_chat_view()->is_busy();
+	d["now_msec"] = OS::get_singleton()->get_ticks_msec();
+	d["tasks"] = (runtime_host.is_valid() && runtime_host->get_crew().is_valid()) ? runtime_host->get_crew()->snapshot() : Array();
+	return d;
+}
+
+void LagoonicVibeWorkspace::_check_team_started() {
+	if (runtime_host.is_null() || runtime_host->get_crew().is_null() || bento_board == nullptr) {
+		return;
+	}
+	// El lider acaba de lanzar un ayudante: se abre el panel para verlo.
+	// Si el usuario lo cierra, no vuelve hasta la siguiente tarea nueva.
+	const int count = runtime_host->get_crew()->get_task_counter();
+	if (count > team_tasks_seen) {
+		team_tasks_seen = count;
+		_open_bento("team");
+	}
+}
+
+void LagoonicVibeWorkspace::_save_layout() {
+	// Se llama cada pocos segundos: solo escribe cuando el usuario movio algo.
+	if (EditorSettings::get_singleton() == nullptr || bento_board == nullptr || !layout_restored) {
+		return;
+	}
+	const Dictionary layout = bento_board->get_layout();
+	if (layout == saved_layout) {
+		return;
+	}
+	saved_layout = layout;
+	EditorSettings::get_singleton()->set_project_metadata("lagoonic", "bento_layout", layout);
+	EditorSettings::get_singleton()->save_project_metadata();
+}
+
+void LagoonicVibeWorkspace::_restore_layout(const Dictionary &p_layout) {
+	if (bento_board != nullptr && !p_layout.is_empty()) {
+		bento_board->set_layout(p_layout);
+	}
+	saved_layout = bento_board != nullptr ? bento_board->get_layout() : Dictionary();
+	layout_restored = true;
 }
 
 Array LagoonicVibeWorkspace::_get_changes() {
@@ -266,6 +316,10 @@ void LagoonicVibeWorkspace::_open_bento(const String &p_id, bool p_save) {
 		LagoonicContextPanel *panel = memnew(LagoonicContextPanel);
 		panel->setup(chat);
 		bento->set_content(panel);
+	} else if (p_id == "team") {
+		LagoonicTeamPanel *panel = memnew(LagoonicTeamPanel);
+		panel->setup(callable_mp(this, &LagoonicVibeWorkspace::_get_team));
+		bento->set_content(panel);
 	}
 	bento_board->add_side(bento);
 	bento->apply_palette();
@@ -300,6 +354,9 @@ void LagoonicVibeWorkspace::_restore_bentos() {
 	for (const String &id : ids) {
 		_open_bento(id, false);
 	}
+	// Los tamanos que el usuario dejo, cuando el tablero ya tiene su ancho.
+	const Variant layout = EditorSettings::get_singleton()->get_project_metadata("lagoonic", "bento_layout", Dictionary());
+	callable_mp(this, &LagoonicVibeWorkspace::_restore_layout).call_deferred(layout.get_type() == Variant::DICTIONARY ? Dictionary(layout) : Dictionary());
 }
 
 void LagoonicVibeWorkspace::_consume_initial_prompt() {
@@ -655,6 +712,7 @@ void LagoonicVibeWorkspace::_on_runtime_event(const Dictionary &p_event) {
 	if (agent_dock != nullptr) {
 		agent_dock->hook_push_agent_event(p_event);
 	}
+	_check_team_started();
 	// Al terminar un turno el servidor ya puso titulo al chat: refresca.
 	if (String(p_event.get("type", "")) == "busy" && !bool(p_event.get("busy", true)) && runtime_host.is_valid() && agent_dock != nullptr && agent_dock->get_chat_view() != nullptr) {
 		agent_dock->get_chat_view()->set_sessions(runtime_host->list_sessions());
@@ -735,6 +793,8 @@ void LagoonicVibeWorkspace::_on_agent_event(const StringName &p_event, const Var
 		runtime_host->set_crew_worker(String(p_a), bool(p_b));
 	} else if (p_event == SNAME("poll_tick")) {
 		runtime_host->poll_connection();
+		_check_team_started();
+		_save_layout();
 	}
 }
 
@@ -785,6 +845,7 @@ void LagoonicVibeWorkspace::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("open_classic_editor"), &LagoonicVibeWorkspace::open_classic_editor);
 	ClassDB::bind_method(D_METHOD("return_to_vibe_coding"), &LagoonicVibeWorkspace::return_to_vibe_coding);
 	ClassDB::bind_method(D_METHOD("send_initial_prompt", "prompt"), &LagoonicVibeWorkspace::send_initial_prompt);
+	ClassDB::bind_method(D_METHOD("get_runtime_host"), &LagoonicVibeWorkspace::get_runtime_host);
 	ClassDB::bind_method(D_METHOD("_consume_initial_prompt"), &LagoonicVibeWorkspace::_consume_initial_prompt);
 
 	ADD_SIGNAL(MethodInfo("vibe_mode_changed", PropertyInfo(Variant::BOOL, "enabled")));
@@ -895,8 +956,8 @@ LagoonicVibeWorkspace::LagoonicVibeWorkspace() {
 
 	// Derecha: "+ Panel", "▶ Jugar", "Abrir editor".
 	add_panel_button = memnew(Button);
-	add_panel_button->set_text(TTRC("Panel"));
-	add_panel_button->set_tooltip_text(String::utf8("Añade un panel junto al chat: plan, cambios, archivos o contexto."));
+	add_panel_button->set_text(TTRC("Paneles"));
+	add_panel_button->set_tooltip_text(String::utf8("Abre o cierra paneles junto al chat: plan, cambios, archivos, contexto y equipo."));
 	add_panel_button->add_theme_style_override(SNAME("normal"), ghost_button_style);
 	add_panel_button->add_theme_style_override(SceneStringName(hover), ghost_button_hover_style);
 	add_panel_button->add_theme_style_override(SceneStringName(pressed), ghost_button_hover_style);

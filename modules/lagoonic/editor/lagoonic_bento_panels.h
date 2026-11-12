@@ -46,6 +46,9 @@ class ProgressBar;
 class Timer;
 class Tree;
 
+#include "core/templates/hash_map.h"
+#include "core/templates/hash_set.h"
+
 // Plan del agente: lista completa de pasos con su estado y progreso.
 class LagoonicPlanPanel : public VBoxContainer {
 	GDCLASS(LagoonicPlanPanel, VBoxContainer);
@@ -120,4 +123,29 @@ class LagoonicContextPanel : public VBoxContainer {
 public:
 	void setup(LagoonicChatView *p_chat);
 	LagoonicContextPanel();
+};
+
+// Equipo: el lider del chat y los ayudantes que lanza, enlazados a el, con
+// el estado de cada tarea en vivo (en cola, trabajando, termino, fallo).
+class LagoonicTeamPanel : public VBoxContainer {
+	GDCLASS(LagoonicTeamPanel, VBoxContainer);
+
+	Callable provider; // () -> {boss_name, busy, workers: [{id, name}], tasks: [...], now_msec}
+	Label *summary = nullptr;
+	VBoxContainer *list = nullptr;
+	Timer *timer = nullptr;
+	String signature; // Lo que hay pintado; solo se reconstruye si cambia.
+	HashMap<int, Label *> status_labels; // tarea -> linea de estado (tiempo en vivo).
+	HashSet<int> open_reports;
+
+	void _refresh();
+	void _rebuild(const Dictionary &p_team);
+	void _update_times(const Dictionary &p_team);
+	void _on_report_toggled(int p_number);
+	static String _status_text(const Dictionary &p_task, uint64_t p_now);
+
+public:
+	void setup(const Callable &p_provider);
+
+	LagoonicTeamPanel();
 };

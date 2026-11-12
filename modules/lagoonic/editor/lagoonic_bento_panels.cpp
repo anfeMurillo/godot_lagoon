@@ -41,9 +41,12 @@
 #include "editor/file_system/editor_file_system.h"
 #include "editor/themes/editor_scale.h"
 #include "scene/gui/button.h"
+#include "scene/gui/color_rect.h"
 #include "scene/gui/grid_container.h"
 #include "scene/gui/label.h"
 #include "scene/gui/line_edit.h"
+#include "scene/gui/margin_container.h"
+#include "scene/gui/panel_container.h"
 #include "scene/gui/progress_bar.h"
 #include "scene/gui/scroll_container.h"
 #include "scene/gui/texture_rect.h"
@@ -316,6 +319,11 @@ static void _bento_fill_tree(Control *p_owner, Tree *p_tree, TreeItem *p_parent,
 	const Ref<Texture2D> folder_icon = p_owner->get_editor_theme_icon(SNAME("Folder"));
 	for (int i = 0; i < p_dir->get_subdir_count(); i++) {
 		EditorFileSystemDirectory *sub = p_dir->get_subdir(i);
+		// La pieza interna de Lagoonic no es parte del juego del usuario.
+		const String sub_path = sub->get_path();
+		if (sub_path == "res://addons/lagoonic/" || (sub_path == "res://addons/" && sub->get_file_count() == 0 && sub->get_subdir_count() == 1 && sub->get_subdir(0)->get_name() == "lagoonic")) {
+			continue;
+		}
 		if (p_filter.is_empty()) {
 			TreeItem *item = p_tree->create_item(p_parent);
 			item->set_text(0, sub->get_name());
@@ -472,6 +480,11 @@ void LagoonicContextPanel::_refresh() {
 		values["updated"]->set_text(String::utf8("—"));
 	}
 	values["project"]->set_text(ProjectSettings::get_singleton()->globalize_path("res://").trim_suffix("/").get_file());
+	// Las celdas son estrechas: el texto entero queda al pasar el raton.
+	for (const KeyValue<String, Label *> &kv : values) {
+		kv.value->set_tooltip_text(kv.value->get_text());
+		kv.value->set_mouse_filter(Control::MOUSE_FILTER_PASS);
+	}
 }
 
 LagoonicContextPanel::LagoonicContextPanel() {
@@ -496,5 +509,316 @@ LagoonicContextPanel::LagoonicContextPanel() {
 	timer->set_wait_time(1.0);
 	timer->set_autostart(true);
 	timer->connect("timeout", callable_mp(this, &LagoonicContextPanel::_refresh));
+	add_child(timer);
+}
+
+// ---------------------------------------------------------------- Equipo
+
+static String _team_duration(uint64_t p_msec) {
+	const uint64_t secs = p_msec / 1000;
+	if (secs < 60) {
+		return vformat("%d s", int(secs));
+	}
+	if (secs < 3600) {
+		return vformat("%d min %d s", int(secs / 60), int(secs % 60));
+	}
+	return vformat("%d h %d min", int(secs / 3600), int((secs % 3600) / 60));
+}
+
+String LagoonicTeamPanel::_status_text(const Dictionary &p_task, uint64_t p_now) {
+	const String status = p_task.get("status", "queued");
+	const uint64_t started = p_task.get("started_msec", 0);
+	const uint64_t finished = p_task.get("finished_msec", 0);
+	if (status == "running") {
+		return String::utf8("Trabajando · ") + _team_duration(p_now > started ? p_now - started : 0);
+	}
+	if (status == "succeeded") {
+		return finished > started ? String::utf8("Terminó en ") + _team_duration(finished - started) : String::utf8("Terminó");
+	}
+	if (status == "failed") {
+		return String::utf8("No pudo terminar");
+	}
+	if (status == "cancelled") {
+		return String::utf8("Cancelada");
+	}
+	return String::utf8("En cola");
+}
+
+void LagoonicTeamPanel::setup(const Callable &p_provider) {
+	provider = p_provider;
+	callable_mp(this, &LagoonicTeamPanel::_refresh).call_deferred();
+}
+
+void LagoonicTeamPanel::_on_report_toggled(int p_number) {
+	if (open_reports.has(p_number)) {
+		open_reports.erase(p_number);
+	} else {
+		open_reports.insert(p_number);
+	}
+	signature = String(); // Fuerza reconstruir.
+	_refresh();
+}
+
+void LagoonicTeamPanel::_refresh() {
+	if (!provider.is_valid() || !is_visible_in_tree()) {
+		return;
+	}
+	const Variant got = provider.call();
+	if (got.get_type() != Variant::DICTIONARY) {
+		return;
+	}
+	const Dictionary team = got;
+	// Firma de lo que cambia la estructura (no el tiempo que corre).
+	String sig = String(team.get("boss_name", "")) + "|" + itos(int(bool(team.get("busy", false)))) + "|";
+	const Array workers = team.get("workers", Array());
+	for (int i = 0; i < workers.size(); i++) {
+		sig += String(Dictionary(workers[i]).get("id", "")) + ",";
+	}
+	const Array tasks = team.get("tasks", Array());
+	for (int i = 0; i < tasks.size(); i++) {
+		const Dictionary t = tasks[i];
+		sig += "|" + itos(int(t.get("number", 0))) + ":" + String(t.get("status", ""));
+	}
+	if (sig != signature) {
+		signature = sig;
+		_rebuild(team);
+	} else {
+		_update_times(team);
+	}
+}
+
+void LagoonicTeamPanel::_update_times(const Dictionary &p_team) {
+	const uint64_t now = p_team.get("now_msec", 0);
+	const Array tasks = p_team.get("tasks", Array());
+	for (int i = 0; i < tasks.size(); i++) {
+		const Dictionary t = tasks[i];
+		if (String(t.get("status", "")) != "running") {
+			continue;
+		}
+		Label **label = status_labels.getptr(int(t.get("number", 0)));
+		if (label != nullptr) {
+			(*label)->set_text(_status_text(t, now));
+		}
+	}
+}
+
+void LagoonicTeamPanel::_rebuild(const Dictionary &p_team) {
+	for (int i = list->get_child_count() - 1; i >= 0; i--) {
+		Node *c = list->get_child(i);
+		list->remove_child(c);
+		c->queue_free();
+	}
+	status_labels.clear();
+	const LagoonicVibeTheme::Palette p = LagoonicVibeTheme::current();
+	const uint64_t now = p_team.get("now_msec", 0);
+	const Array workers = p_team.get("workers", Array());
+	const Array tasks = p_team.get("tasks", Array());
+	const bool busy = p_team.get("busy", false);
+	const Color green = Color(0.4, 0.82, 0.5);
+	const Color red = Color(0.95, 0.45, 0.45);
+	const Color active = p.accent.lerp(Color(1, 1, 1), 0.2f);
+
+	int running = 0;
+	int queued = 0;
+	int done = 0;
+	HashSet<String> busy_workers;
+	for (int i = 0; i < tasks.size(); i++) {
+		const Dictionary t = tasks[i];
+		const String status = t.get("status", "");
+		if (status == "running") {
+			running++;
+			busy_workers.insert(t.get("worker_id", ""));
+		} else if (status == "queued") {
+			queued++;
+			busy_workers.insert(t.get("worker_id", ""));
+		} else {
+			done++;
+		}
+	}
+	if (workers.is_empty() && tasks.is_empty()) {
+		summary->set_text(String::utf8("Tu líder trabaja solo. Añade ayudantes en Configuración › Equipo y verás aquí cada tarea que les reparta."));
+	} else if (tasks.is_empty()) {
+		summary->set_text(String::utf8("Cuando el líder reparta una tarea a un ayudante, aparecerá aquí enlazada a él."));
+	} else if (running + queued > 0) {
+		PackedStringArray parts;
+		if (running > 0) {
+			parts.push_back(vformat(String::utf8("%d trabajando"), running));
+		}
+		if (queued > 0) {
+			parts.push_back(vformat(String::utf8("%d en cola"), queued));
+		}
+		if (done > 0) {
+			parts.push_back(vformat(String::utf8("%d terminadas"), done));
+		}
+		summary->set_text(String::utf8(" · ").join(parts));
+	} else {
+		summary->set_text(done == 1 ? String::utf8("1 tarea repartida, ya terminada") : vformat(String::utf8("%d tareas repartidas, todas terminadas"), done));
+	}
+
+	// --- Lider ---
+	PanelContainer *boss_card = memnew(PanelContainer);
+	{
+		Ref<StyleBoxFlat> sb;
+		sb.instantiate();
+		sb->set_bg_color(Color(p.accent, 0.12f));
+		sb->set_border_color(Color(p.accent, 0.45f));
+		sb->set_border_width_all(1);
+		sb->set_corner_radius_all(int(10 * EDSCALE));
+		sb->set_content_margin_individual(12 * EDSCALE, 8 * EDSCALE, 12 * EDSCALE, 8 * EDSCALE);
+		boss_card->add_theme_style_override(SceneStringName(panel), sb);
+	}
+	list->add_child(boss_card);
+	VBoxContainer *boss_box = memnew(VBoxContainer);
+	boss_box->add_theme_constant_override(SNAME("separation"), int(2 * EDSCALE));
+	boss_card->add_child(boss_box);
+	Label *boss_caption = memnew(Label);
+	boss_caption->set_text(String::utf8("Líder"));
+	boss_caption->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
+	boss_box->add_child(boss_caption);
+	Label *boss_name = memnew(Label);
+	boss_name->set_text(p_team.get("boss_name", "OpenCode"));
+	boss_name->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
+	boss_name->set_custom_minimum_size(Size2(1, 0));
+	boss_box->add_child(boss_name);
+	Label *boss_state = memnew(Label);
+	boss_state->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
+	if (running + queued > 0) {
+		boss_state->set_text(String::utf8("Esperando a su equipo"));
+	} else if (busy) {
+		boss_state->set_text(String::utf8("Trabajando"));
+	} else {
+		boss_state->set_text(String::utf8("Listo"));
+	}
+	boss_box->add_child(boss_state);
+
+	// --- Tareas, colgando del lider por una linea ---
+	if (!tasks.is_empty()) {
+		HBoxContainer *branch = memnew(HBoxContainer);
+		branch->add_theme_constant_override(SNAME("separation"), int(10 * EDSCALE));
+		list->add_child(branch);
+		MarginContainer *line_margin = memnew(MarginContainer);
+		line_margin->add_theme_constant_override(SNAME("margin_left"), int(14 * EDSCALE));
+		branch->add_child(line_margin);
+		ColorRect *line = memnew(ColorRect);
+		line->set_color(Color(p.accent, 0.45f));
+		line->set_custom_minimum_size(Size2(MAX(1, int(2 * EDSCALE)), 0));
+		line->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+		line_margin->add_child(line);
+		VBoxContainer *cards = memnew(VBoxContainer);
+		cards->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+		cards->add_theme_constant_override(SNAME("separation"), int(8 * EDSCALE));
+		branch->add_child(cards);
+
+		// Lo mas reciente arriba: es lo que el usuario quiere ver.
+		for (int i = tasks.size() - 1; i >= 0; i--) {
+			const Dictionary t = tasks[i];
+			const String status = t.get("status", "queued");
+			const int number = t.get("number", 0);
+			Color dot_color = p.text_muted;
+			String mark = String::utf8("○");
+			if (status == "running") {
+				dot_color = active;
+				mark = String::utf8("●");
+			} else if (status == "succeeded") {
+				dot_color = green;
+				mark = String::utf8("✓");
+			} else if (status == "failed") {
+				dot_color = red;
+				mark = String::utf8("!");
+			} else if (status == "cancelled") {
+				mark = String::utf8("×");
+			}
+			PanelContainer *card = memnew(PanelContainer);
+			{
+				Ref<StyleBoxFlat> sb;
+				sb.instantiate();
+				sb->set_bg_color(Color(p.text, status == "running" ? 0.07f : 0.04f));
+				sb->set_border_color(status == "running" ? Color(active, 0.5f) : Color(p.border, 0.6f));
+				sb->set_border_width_all(1);
+				sb->set_corner_radius_all(int(10 * EDSCALE));
+				sb->set_content_margin_individual(10 * EDSCALE, 8 * EDSCALE, 10 * EDSCALE, 8 * EDSCALE);
+				card->add_theme_style_override(SceneStringName(panel), sb);
+			}
+			cards->add_child(card);
+			VBoxContainer *box = memnew(VBoxContainer);
+			box->add_theme_constant_override(SNAME("separation"), int(3 * EDSCALE));
+			card->add_child(box);
+
+			HBoxContainer *head = memnew(HBoxContainer);
+			head->add_theme_constant_override(SNAME("separation"), int(8 * EDSCALE));
+			box->add_child(head);
+			Label *dot = memnew(Label);
+			dot->set_text(mark);
+			dot->set_custom_minimum_size(Size2(14 * EDSCALE, 0));
+			dot->add_theme_color_override(SceneStringName(font_color), dot_color);
+			head->add_child(dot);
+			Label *who = memnew(Label);
+			who->set_text(t.get("worker_name", ""));
+			who->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+			who->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
+			who->set_custom_minimum_size(Size2(1, 0));
+			head->add_child(who);
+			Label *num = memnew(Label);
+			num->set_text(vformat(String::utf8("Tarea %d"), number));
+			num->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
+			head->add_child(num);
+
+			Label *title = memnew(Label);
+			title->set_text(t.get("title", ""));
+			title->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+			title->set_custom_minimum_size(Size2(1, 0));
+			box->add_child(title);
+
+			Label *state = memnew(Label);
+			state->set_text(_status_text(t, now));
+			state->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
+			if (status == "failed") {
+				state->add_theme_color_override(SceneStringName(font_color), red);
+			}
+			box->add_child(state);
+			status_labels[number] = state;
+
+			const String report = String(t.get("report", "")).strip_edges();
+			if (!report.is_empty() && (status == "succeeded" || status == "failed")) {
+				const bool open = open_reports.has(number);
+				Button *toggle = memnew(Button);
+				toggle->set_flat(true);
+				toggle->set_focus_mode(Control::FOCUS_NONE);
+				toggle->set_h_size_flags(Control::SIZE_SHRINK_BEGIN);
+				toggle->set_text(open ? String::utf8("Ocultar lo que contó") : String::utf8("Ver lo que contó al líder"));
+				toggle->connect(SceneStringName(pressed), callable_mp(this, &LagoonicTeamPanel::_on_report_toggled).bind(number));
+				box->add_child(toggle);
+				if (open) {
+					Label *text = _bento_muted(report.length() > 1500 ? report.substr(0, 1500) + String::utf8("…") : report);
+					box->add_child(text);
+				}
+			}
+		}
+	}
+
+	// --- Ayudantes sin tarea ahora mismo ---
+	PackedStringArray idle;
+	for (int i = 0; i < workers.size(); i++) {
+		const Dictionary w = workers[i];
+		if (!busy_workers.has(String(w.get("id", "")))) {
+			idle.push_back(w.get("name", ""));
+		}
+	}
+	if (!idle.is_empty()) {
+		list->add_child(_bento_muted(String::utf8("Disponibles: ") + String(", ").join(idle)));
+	}
+}
+
+LagoonicTeamPanel::LagoonicTeamPanel() {
+	add_theme_constant_override(SNAME("separation"), int(10 * EDSCALE));
+	summary = _bento_muted(String());
+	add_child(summary);
+	list = memnew(VBoxContainer);
+	list->add_theme_constant_override(SNAME("separation"), int(8 * EDSCALE));
+	add_child(_bento_scroll(list));
+	timer = memnew(Timer);
+	timer->set_wait_time(0.5);
+	timer->set_autostart(true);
+	timer->connect("timeout", callable_mp(this, &LagoonicTeamPanel::_refresh));
 	add_child(timer);
 }

@@ -94,13 +94,15 @@ public:
 	LagoonicBento();
 };
 
-class LagoonicBentoBoard : public HSplitContainer {
-	GDCLASS(LagoonicBentoBoard, HSplitContainer);
+class LagoonicBentoBoard : public SplitContainer {
+	GDCLASS(LagoonicBentoBoard, SplitContainer);
 
 	LagoonicBento *main_bento = nullptr;
-	VSplitContainer *side_column = nullptr;
+	SplitContainer *side_column = nullptr;
 
 	void _update_side_visibility();
+	Dictionary _read_layout() const;
+	void _apply_layout(const Dictionary &p_layout);
 
 public:
 	void set_main(LagoonicBento *p_bento);
@@ -110,6 +112,9 @@ public:
 	void remove_side(const String &p_id);
 	LagoonicBento *get_side(const String &p_id) const;
 	PackedStringArray get_side_ids() const;
+	// Tamanos que el usuario dio a las tarjetas: {main: int, side: [int]}.
+	Dictionary get_layout() const;
+	void set_layout(const Dictionary &p_layout);
 	void apply_palette();
 
 	LagoonicBentoBoard();

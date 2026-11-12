@@ -108,6 +108,13 @@ private:
 	void _save_bentos();
 	void _restore_bentos();
 	Array _get_changes();
+	Dictionary _get_team();
+	void _check_team_started();
+	void _save_layout();
+	void _restore_layout(const Dictionary &p_layout);
+	Dictionary saved_layout;
+	bool layout_restored = false;
+	int team_tasks_seen = 0; // Tareas de ayudantes ya vistas (abre el panel Equipo).
 	Button *projects_button = nullptr;
 	Label *project_title_label = nullptr;
 	Button *play_button = nullptr;

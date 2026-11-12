@@ -214,6 +214,8 @@ private:
 	String turn_message_id; // Ultimo mensaje del asistente del turno.
 	String last_activity_label;
 	HashMap<String, Label *> worked_labels; // msg_id -> "Trabajo durante".
+	HashMap<String, Button *> copy_buttons; // msg_id -> "Copiar".
+	void _on_copy_pressed(const String &p_msg_id);
 	HashMap<String, Button *> activity_headers; // msg_id -> "N pasos".
 	HashMap<String, int> activity_counts;
 	HashMap<String, String> tool_raw_details; // Solo interno (rutas de medios); nunca se muestra.

@@ -119,6 +119,8 @@ struct LagoonicCrewTask {
 	String worker_id; // 'opencode' or the coding agent's id.
 	String status = "queued"; // queued|running|succeeded|failed|cancelled.
 	String report;
+	uint64_t started_msec = 0; // Ticks when the worker started; 0 while queued.
+	uint64_t finished_msec = 0; // Ticks when it ended; 0 while it runs.
 };
 
 struct LagoonicCrewWorkerEntry {
@@ -185,6 +187,7 @@ private:
 	bool _sleep_gap() const; // False when the round must stop now.
 
 	static bool _report_is_failure(const String &p_report);
+	void _mirror_task(const LagoonicCrewTask &p_task); // Call with the mutex held.
 
 protected:
 	static void _bind_methods();
@@ -213,6 +216,11 @@ public:
 	// queued and no round runs. No-op when in progress, empty, or failed.
 	void maybe_run(const String &p_boss_session_id);
 	bool is_in_progress() const;
+	// Every task the boss started in this session, oldest first, for the UI:
+	// {number, title, worker_name, worker_id, status, report, started_msec,
+	// finished_msec}. Times are engine ticks.
+	Array snapshot() const;
+	String get_boss_id() const;
 	bool is_failed() const;
 	int get_rounds() const;
 	int get_task_counter() const;
