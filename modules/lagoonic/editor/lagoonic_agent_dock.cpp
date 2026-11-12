@@ -30,6 +30,8 @@
 
 #include "lagoonic_agent_dock.h"
 
+#include "lagoonic_agent_settings.h"
+
 #include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
 #include "scene/gui/button.h"
@@ -394,6 +396,15 @@ void LagoonicAgentDock::hook_push_agent_event(const Dictionary &p_event) {
 		if (message.has("timeline")) {
 			chat_view->set_assistant_timeline(String(message.get("id", "")), message.get("timeline", Array()));
 		}
+	} else if (type == "acp_options") {
+		// Modelos y opciones de Claude Code, Codex...: se guardan para el
+		// proximo arranque y se muestran si ese agente sigue al mando.
+		const String agent = p_event.get("agent", "");
+		const Array options = p_event.get("options", Array());
+		if (!agent.is_empty() && !options.is_empty()) {
+			LagoonicAgentSettings::set_acp_options(agent, options);
+			chat_view->set_acp_options(agent, options, LagoonicAgentSettings::get_acp_choices(agent));
+		}
 	} else if (type == "todos") {
 		LagoonicCrewView *crew = chat_view->get_crew_view();
 		if (crew != nullptr) {
@@ -438,6 +449,23 @@ void LagoonicAgentDock::hook_push_agent_event(const Dictionary &p_event) {
 bool LagoonicAgentDock::handle_session_event(const Ref<LagoonicRuntimeHost> &p_host, const StringName &p_event, const Variant &p_a, const String &p_cwd, const Dictionary &p_secret_env, const String &p_model) {
 	if (p_host.is_null() || chat_view == nullptr) {
 		return false;
+	}
+	if (p_event == SNAME("acp_options_requested")) {
+		const String agent = p_a;
+		const Dictionary choices = LagoonicAgentSettings::get_acp_choices(agent);
+		chat_view->set_acp_options(agent, LagoonicAgentSettings::get_acp_options(agent), choices);
+		p_host->set_acp_choices(choices);
+		p_host->probe_acp_options(agent, p_cwd);
+		return true;
+	}
+	if (p_event == SNAME("acp_option_changed")) {
+		const String agent = chat_view->get_chat_boss();
+		const Array args = p_a.get_type() == Variant::ARRAY ? Array(p_a) : Array();
+		if (args.size() == 2) { // [id de opcion, valor]
+			LagoonicAgentSettings::set_acp_choice(agent, String(args[0]), String(args[1]));
+		}
+		p_host->set_acp_choices(LagoonicAgentSettings::get_acp_choices(agent));
+		return true;
 	}
 	const bool is_session_event = p_event == SNAME("sessions_requested") || p_event == SNAME("session_selected") ||
 			p_event == SNAME("new_session_requested") || p_event == SNAME("session_delete_requested") ||

@@ -1343,7 +1343,200 @@ String LagoonicAcpRunner::session_new(const String &p_cwd, const Array &p_mcp_se
 		return String();
 	}
 	acp_session_id = sid;
+	session_info = result;
 	return sid;
+}
+
+static Dictionary _option_value(const Dictionary &p_entry) {
+	Dictionary v;
+	v["value"] = _dstr(p_entry, "value");
+	const String name = _dstr(p_entry, "name");
+	v["name"] = name.is_empty() ? String(v["value"]) : name;
+	v["description"] = _dstr(p_entry, "description");
+	return v;
+}
+
+Array LagoonicAcpRunner::parse_options(const Dictionary &p_session) {
+	Array models_first;
+	Array rest;
+	bool has_model = false;
+	const Array config = _darr(p_session, "configOptions");
+	for (int i = 0; i < config.size(); i++) {
+		if (config[i].get_type() != Variant::DICTIONARY) {
+			continue;
+		}
+		const Dictionary item = config[i];
+		const String type = _dstr(item, "type");
+		if (!type.is_empty() && type != "select") {
+			continue;
+		}
+		Array values;
+		const Array raw = _darr(item, "options");
+		for (int j = 0; j < raw.size(); j++) {
+			if (raw[j].get_type() != Variant::DICTIONARY) {
+				continue;
+			}
+			const Dictionary entry = raw[j];
+			if (entry.has("options")) { // Grouped: {group, name, options[]}.
+				const Array grouped = _darr(entry, "options");
+				for (int k = 0; k < grouped.size(); k++) {
+					if (grouped[k].get_type() == Variant::DICTIONARY) {
+						const Dictionary v = _option_value(grouped[k]);
+						if (!String(v["value"]).is_empty()) {
+							values.push_back(v);
+						}
+					}
+				}
+			} else {
+				const Dictionary v = _option_value(entry);
+				if (!String(v["value"]).is_empty()) {
+					values.push_back(v);
+				}
+			}
+		}
+		const String id = _dstr(item, "id");
+		if (id.is_empty() || values.size() < 2) {
+			continue;
+		}
+		Dictionary option;
+		option["id"] = id;
+		const String name = _dstr(item, "name");
+		option["name"] = name.is_empty() ? id : name;
+		option["category"] = _dstr(item, "category");
+		option["current"] = _dstr(item, "currentValue");
+		option["values"] = values;
+		option["via_set_model"] = false;
+		if (String(option["category"]) == "model") {
+			has_model = true;
+			models_first.push_back(option);
+		} else {
+			rest.push_back(option);
+		}
+	}
+	// Older adapters: {models: {currentModelId, availableModels[]}}.
+	const Dictionary models = _ddict(p_session, "models");
+	if (!has_model && !models.is_empty()) {
+		Array values;
+		const Array available = _darr(models, "availableModels");
+		for (int i = 0; i < available.size(); i++) {
+			if (available[i].get_type() != Variant::DICTIONARY) {
+				continue;
+			}
+			const Dictionary m = available[i];
+			const String model_id = _dstr(m, "modelId");
+			if (model_id.is_empty()) {
+				continue;
+			}
+			Dictionary v;
+			v["value"] = model_id;
+			const String name = _dstr(m, "name");
+			v["name"] = name.is_empty() ? model_id : name;
+			v["description"] = _dstr(m, "description");
+			values.push_back(v);
+		}
+		if (values.size() >= 2) {
+			Dictionary option;
+			option["id"] = "model";
+			option["name"] = "Model";
+			option["category"] = "model";
+			option["current"] = _dstr(models, "currentModelId");
+			option["values"] = values;
+			option["via_set_model"] = true;
+			models_first.push_back(option);
+		}
+	}
+	models_first.append_array(rest);
+	return models_first;
+}
+
+static bool _option_offers(const Dictionary &p_option, const String &p_value) {
+	const Array values = p_option.get("values", Array());
+	for (int i = 0; i < values.size(); i++) {
+		if (String(Dictionary(values[i]).get("value", "")) == p_value) {
+			return true;
+		}
+	}
+	return false;
+}
+
+Array LagoonicAcpRunner::_apply_options(const String &p_acp_session_id, const Array &p_options) {
+	Array options = p_options;
+	PackedStringArray ids;
+	for (int i = 0; i < options.size(); i++) {
+		ids.push_back(Dictionary(options[i]).get("id", ""));
+	}
+	for (int n = 0; n < ids.size(); n++) {
+		int index = -1;
+		for (int i = 0; i < options.size(); i++) {
+			if (String(Dictionary(options[i]).get("id", "")) == ids[n]) {
+				index = i;
+				break;
+			}
+		}
+		if (index < 0) {
+			continue;
+		}
+		Dictionary option = options[index];
+		String wanted = chosen_options.get(ids[n], "");
+		if (String(option.get("category", "")) == "mode" && !requested_mode.is_empty()) {
+			wanted = requested_mode;
+		}
+		if (wanted.is_empty() || wanted == String(option.get("current", "")) || !_option_offers(option, wanted)) {
+			continue;
+		}
+		bool ok = false;
+		Dictionary params;
+		params["sessionId"] = p_acp_session_id;
+		Dictionary result;
+		if (bool(option.get("via_set_model", false))) {
+			params["modelId"] = wanted;
+			result = _call("session/set_model", params, DEFAULT_TIMEOUT_MS, ok);
+		} else {
+			params["configId"] = ids[n];
+			params["value"] = wanted;
+			result = _call("session/set_config_option", params, DEFAULT_TIMEOUT_MS, ok);
+		}
+		if (!ok) {
+			WARN_PRINT(vformat("Lagoonic: the agent did not accept %s = %s.", ids[n], wanted));
+			continue;
+		}
+		if (result.has("configOptions")) {
+			// The agent answers with every option as it is now (a new model
+			// can bring other effort levels).
+			Dictionary merged = result;
+			if (session_info.has("models")) {
+				merged["models"] = session_info["models"];
+			}
+			options = parse_options(merged);
+		} else {
+			option["current"] = wanted;
+			options[index] = option;
+		}
+	}
+	return options;
+}
+
+Array LagoonicAcpRunner::probe_options(const String &p_adapter_bin, const PackedStringArray &p_args, const String &p_cwd, const Dictionary &p_env) {
+	Array options;
+	const bool was_silent = silent;
+	silent = true;
+	if (spawn(p_adapter_bin, p_args, p_cwd, p_env) == OK) {
+		const Dictionary init_result = initialize(1, "lagoonic", "1", DEFAULT_TIMEOUT_MS);
+		if (!init_result.has("error") && !session_new(p_cwd, Array(), DEFAULT_TIMEOUT_MS).is_empty()) {
+			options = parse_options(session_info);
+		}
+	}
+	close();
+	silent = was_silent;
+	return options;
+}
+
+void LagoonicAcpRunner::set_chosen_options(const Dictionary &p_choices) {
+	chosen_options = p_choices.duplicate();
+}
+
+void LagoonicAcpRunner::set_requested_mode(const String &p_mode) {
+	requested_mode = p_mode;
 }
 
 Dictionary LagoonicAcpRunner::session_prompt(const String &p_acp_session_id, const String &p_prompt_text, const Array &p_prompt_blocks, int p_timeout_ms) {
@@ -1447,6 +1640,32 @@ Dictionary LagoonicAcpRunner::run_turn(const String &p_adapter_bin, const Packed
 	if (ok) {
 		sid = session_new(p_cwd, p_mcp_servers, DEFAULT_TIMEOUT_MS);
 		ok = !sid.is_empty();
+	}
+	if (ok) {
+		Array options = parse_options(session_info);
+		if (requested_mode == "plan") {
+			bool offers_plan = false;
+			for (int i = 0; i < options.size(); i++) {
+				const Dictionary option = options[i];
+				if (String(option.get("category", "")) == "mode" && _option_offers(option, "plan")) {
+					offers_plan = true;
+				}
+			}
+			if (!offers_plan) {
+				_set_error(String::utf8("This agent has no plan mode; switch to Automatic or Ask first. / Este agente no tiene modo de solo planificar; cambia a Automático o Preguntar antes."));
+				ok = false;
+			}
+		}
+		if (ok) {
+			options = _apply_options(sid, options);
+			if (!silent && !options.is_empty()) {
+				Dictionary event;
+				event["type"] = "acp_options";
+				event["session_id"] = session_id;
+				event["options"] = options;
+				emit_signal("acp_event", event);
+			}
+		}
 	}
 	Dictionary prompt_result;
 	if (ok) {

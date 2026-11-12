@@ -70,6 +70,7 @@
 class Button;
 class Label;
 class OptionButton;
+class MenuButton;
 class PanelContainer;
 class RichTextLabel;
 class ScrollContainer;
@@ -116,6 +117,21 @@ private:
 	void _rebuild_effort_options();
 	static String _effort_label(const String &p_variant);
 	void _on_effort_selected(int p_index);
+
+	// Agente que responde el chat. OpenCode usa el catalogo de modelos;
+	// los agentes ACP (Claude Code, Codex...) traen sus propias opciones.
+	String chat_boss = "opencode";
+	bool acp_mode = false;
+	Array oc_models; // Catalogo de OpenCode (set_models), para volver a el.
+	String oc_default_ref;
+	Array acp_options; // Ver LagoonicAcpRunner::parse_options().
+	Dictionary acp_choices; // id de opcion -> valor elegido.
+	MenuButton *acp_more_button = nullptr; // Resto de opciones del agente.
+	void _render_opencode_models();
+	void _render_acp_options();
+	Dictionary _acp_option_by_category(const String &p_category) const;
+	String _acp_value(const Dictionary &p_option) const;
+	void _on_acp_more_id(int p_id, const String &p_option_id);
 
 	LagoonicCrewView *crew_view = nullptr;
 
@@ -330,6 +346,9 @@ public:
 	// el agente usa si no se elige ninguno.
 	void set_models(const Array &p_models, const String &p_default_ref);
 	// Variante de esfuerzo ("" = la normal del modelo).
+	// Opciones del agente ACP activo, tal como las ofrece, y lo elegido.
+	void set_acp_options(const String &p_agent_id, const Array &p_options, const Dictionary &p_choices);
+	String get_chat_boss() const { return chat_boss; }
 	void set_effort(const String &p_variant);
 	String get_effort() const;
 

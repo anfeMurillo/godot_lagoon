@@ -190,6 +190,23 @@ public:
 	// text, report, error, log}. Exactly 1 process, always reaped.
 	Dictionary run_turn(const String &p_adapter_bin, const PackedStringArray &p_args, const String &p_cwd, const Dictionary &p_env, const Array &p_mcp_servers, const String &p_prompt, const Array &p_prompt_blocks = Array(), bool p_auto_approve = false, bool p_silent = false, const String &p_session_id = "lagoonic");
 
+	// Options the agent lets the client choose per session (model,
+	// effort, mode...), read from the session/new result: ACP
+	// configOptions of type "select", or the older "models" field (set
+	// with session/set_model). Each entry: {id, name, category, current,
+	// values: [{value, name, description}], via_set_model}. Model first.
+	static Array parse_options(const Dictionary &p_session);
+	// Starts the adapter just to read its options, then closes it.
+	// Blocking: call from a worker thread. Empty on failure.
+	Array probe_options(const String &p_adapter_bin, const PackedStringArray &p_args, const String &p_cwd, const Dictionary &p_env);
+	// Values run_turn() applies after session/new: option id -> value.
+	// The key "mode" with a category "mode" option also accepts the
+	// requested_mode below.
+	void set_chosen_options(const Dictionary &p_choices);
+	// "plan" / "default" / "" : permission mode for the turn, applied to
+	// the agent's category "mode" option when it offers that value.
+	void set_requested_mode(const String &p_mode);
+
 	void set_session_id(const String &p_session_id);
 	String get_session_id() const;
 	void set_auto_approve(bool p_auto_approve);
@@ -223,6 +240,12 @@ private:
 	int64_t next_id = 1;
 	String acp_session_id;
 	String last_error;
+	Dictionary session_info; // Last session/new result.
+	Dictionary chosen_options;
+	String requested_mode;
+	// Sets the chosen options on the session; returns the options as
+	// they are afterwards.
+	Array _apply_options(const String &p_acp_session_id, const Array &p_options);
 
 	Ref<LagoonicAcpMapper> mapper;
 	HashMap<int64_t, PendingCall> pending;

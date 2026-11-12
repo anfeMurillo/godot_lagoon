@@ -48,6 +48,13 @@ public:
 	static String get_effort();
 	static void set_effort(const String &p_variant);
 
+	// Agentes ACP (Claude Code, Codex...): sus propias opciones (modelo,
+	// esfuerzo...) tal como las ofrecio el agente la ultima vez, y lo que
+	// el usuario eligio (id de opcion -> valor).
+	static Array get_acp_options(const String &p_agent_id);
+	static void set_acp_options(const String &p_agent_id, const Array &p_options);
+	static Dictionary get_acp_choices(const String &p_agent_id);
+	static void set_acp_choice(const String &p_agent_id, const String &p_option_id, const String &p_value);
 	static bool has_provider_key(const String &p_provider_id);
 	static Error set_provider_key(const String &p_provider_id, const String &p_value);
 	static Error remove_provider_key(const String &p_provider_id);

@@ -12,6 +12,8 @@
 
 #include "core/io/config_file.h"
 #include "core/object/callable_mp.h"
+#include "core/object/object_id.h"
+#include "core/templates/local_vector.h"
 #include "editor/file_system/editor_paths.h"
 
 const LagoonicAgentSettings::Provider LagoonicAgentSettings::PROVIDERS[PROVIDER_COUNT] = {
@@ -73,6 +75,10 @@ void _write(const String &p_key, const Variant &p_value) {
 	cf->save(path);
 }
 
+// Chats abiertos (dock clasico y modo vibe): cambiar el agente en
+// Configuracion > Equipo los actualiza al momento.
+LocalVector<ObjectID> _chats;
+
 } // namespace
 
 const LagoonicAgentSettings::Provider *LagoonicAgentSettings::get_provider(const String &p_id) {
@@ -91,6 +97,44 @@ String LagoonicAgentSettings::get_boss() {
 
 void LagoonicAgentSettings::set_boss(const String &p_agent_id) {
 	_write("boss", p_agent_id);
+	for (uint32_t i = 0; i < _chats.size();) {
+		LagoonicChatView *chat = ObjectDB::get_instance<LagoonicChatView>(_chats[i]);
+		if (chat == nullptr) {
+			_chats.remove_at_unordered(i);
+			continue;
+		}
+		chat->set_boss_agent(get_boss());
+		i++;
+	}
+}
+
+Array LagoonicAgentSettings::get_acp_options(const String &p_agent_id) {
+	const Variant v = _read("acp_options_" + p_agent_id, Array());
+	return v.get_type() == Variant::ARRAY ? Array(v) : Array();
+}
+
+void LagoonicAgentSettings::set_acp_options(const String &p_agent_id, const Array &p_options) {
+	if (!p_agent_id.is_empty()) {
+		_write("acp_options_" + p_agent_id, p_options);
+	}
+}
+
+Dictionary LagoonicAgentSettings::get_acp_choices(const String &p_agent_id) {
+	const Variant v = _read("acp_choices_" + p_agent_id, Dictionary());
+	return v.get_type() == Variant::DICTIONARY ? Dictionary(v) : Dictionary();
+}
+
+void LagoonicAgentSettings::set_acp_choice(const String &p_agent_id, const String &p_option_id, const String &p_value) {
+	if (p_agent_id.is_empty() || p_option_id.is_empty()) {
+		return;
+	}
+	Dictionary choices = get_acp_choices(p_agent_id);
+	if (p_value.is_empty()) {
+		choices.erase(p_option_id);
+	} else {
+		choices[p_option_id] = p_value;
+	}
+	_write("acp_choices_" + p_agent_id, choices);
 }
 
 int LagoonicAgentSettings::get_mode() {
@@ -195,6 +239,9 @@ Array LagoonicAgentSettings::crew_workers() {
 void LagoonicAgentSettings::apply_to_chat(LagoonicChatView *p_chat) {
 	if (p_chat == nullptr) {
 		return;
+	}
+	if (!_chats.has(p_chat->get_instance_id())) {
+		_chats.push_back(p_chat->get_instance_id());
 	}
 	p_chat->set_mode(get_mode());
 	p_chat->set_boss_options(PackedStringArray());

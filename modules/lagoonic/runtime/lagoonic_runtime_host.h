@@ -125,7 +125,24 @@ class LagoonicRuntimeHost : public RefCounted {
 	String acp_prompt;
 	String acp_session;
 	bool acp_auto_approve = false;
+	String acp_agent; // Boss id of the running/last ACP turn.
+	Dictionary acp_choices; // Option id -> value chosen in the chat.
 
+	// Reads an agent's options (models, effort...) without a prompt.
+	Ref<LagoonicAcpRunner> acp_probe_runner;
+	Thread acp_probe_thread;
+	SafeFlag acp_probing;
+	String probe_agent;
+	String probe_bin;
+	PackedStringArray probe_args;
+	Dictionary probe_env;
+	String probe_cwd;
+	static void _acp_probe_main(void *p_userdata);
+	void _on_acp_probe_finished(const String &p_agent_id, const Array &p_options);
+
+	// Adapter of a chat agent on this machine; false (with r_error) when
+	// the agent has none or it is not installed.
+	bool _resolve_acp(const String &p_agent_id, String &r_bin, PackedStringArray &r_args, String &r_path, String &r_error) const;
 	Error _send_acp(const String &p_boss_id, const String &p_session_id, const String &p_text, int p_mode);
 	static void _acp_thread_main(void *p_userdata);
 	void _on_acp_event(const Dictionary &p_event);
@@ -190,6 +207,13 @@ public:
 	void set_crew(const String &p_boss_id, const Array &p_workers);
 	// Keeps cached workers, switches boss only (boss_changed event).
 	void set_crew_boss(const String &p_boss_id);
+	// Options chosen in the chat for the ACP boss (model, effort...):
+	// option id -> value, applied at the start of each turn.
+	void set_acp_choices(const Dictionary &p_choices);
+	// Starts the agent's adapter in the background to list its options;
+	// emits {type:"acp_options", agent, options} when done. No-op while
+	// another probe runs.
+	void probe_acp_options(const String &p_agent_id, const String &p_cwd);
 	// Adds/updates one worker entry {id, name=id} (worker_toggled event).
 	void set_crew_worker(const String &p_worker_id, bool p_enabled);
 

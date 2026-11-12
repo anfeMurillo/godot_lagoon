@@ -275,6 +275,8 @@ void LagoonicRuntimeHost::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("load_history", "session_id"), &LagoonicRuntimeHost::load_history);
 	ClassDB::bind_method(D_METHOD("set_crew", "boss_id", "workers"), &LagoonicRuntimeHost::set_crew);
 	ClassDB::bind_method(D_METHOD("set_crew_boss", "boss_id"), &LagoonicRuntimeHost::set_crew_boss);
+	ClassDB::bind_method(D_METHOD("set_acp_choices", "choices"), &LagoonicRuntimeHost::set_acp_choices);
+	ClassDB::bind_method(D_METHOD("probe_acp_options", "agent_id", "cwd"), &LagoonicRuntimeHost::probe_acp_options);
 	ClassDB::bind_method(D_METHOD("set_crew_worker", "worker_id", "enabled"), &LagoonicRuntimeHost::set_crew_worker);
 	ClassDB::bind_method(D_METHOD("is_server_up"), &LagoonicRuntimeHost::is_server_up);
 	ClassDB::bind_method(D_METHOD("poll_connection"), &LagoonicRuntimeHost::poll_connection);
@@ -313,6 +315,12 @@ LagoonicRuntimeHost::~LagoonicRuntimeHost() {
 	}
 	if (acp_thread.is_started()) {
 		acp_thread.wait_to_finish();
+	}
+	if (acp_probe_runner.is_valid()) {
+		acp_probe_runner->close();
+	}
+	if (acp_probe_thread.is_started()) {
+		acp_probe_thread.wait_to_finish();
 	}
 	if (crew.is_valid()) {
 		crew->set_runner(nullptr);
@@ -936,6 +944,95 @@ String lagoonic_find_on_host(const String &p_bin, const Vector<String> &p_dirs) 
 
 } // namespace
 
+bool LagoonicRuntimeHost::_resolve_acp(const String &p_agent_id, String &r_bin, PackedStringArray &r_args, String &r_path, String &r_error) const {
+	const LagoonicCodingAgents::AgentInfo *agent = LagoonicCodingAgents::get_agent(p_agent_id);
+	if (agent == nullptr || agent->acp == nullptr) {
+		r_error = vformat(String::utf8("%s no se puede usar en el chat."), p_agent_id);
+		return false;
+	}
+	// `npm prefix -g` is a subprocess: ask once per editor run.
+	static const String npm_prefix = LagoonicCodingAgents::npm_global_prefix();
+	const Vector<String> dirs = LagoonicCodingAgents::host_search_dirs(npm_prefix);
+	const Vector<String> command = String::utf8(agent->acp).split(" ", false);
+	r_bin = lagoonic_find_on_host(command[0], dirs);
+	if (r_bin.is_empty()) {
+		String how;
+		if (agent->acp_install != nullptr) {
+			how = String::utf8(" Instala su conector para el chat con: ") + String::utf8(agent->acp_install);
+		}
+		r_error = vformat(String::utf8("%s no está listo para el chat.%s"), String::utf8(agent->name), how);
+		return false;
+	}
+	r_args.clear();
+	for (int i = 1; i < command.size(); i++) {
+		r_args.push_back(command[i]);
+	}
+	r_path = String();
+	for (int i = 0; i < dirs.size(); i++) {
+		if (!dirs[i].is_empty()) {
+			r_path += (r_path.is_empty() ? "" : (LagoonicCodingAgents::is_windows() ? ";" : ":")) + dirs[i];
+		}
+	}
+	return true;
+}
+
+void LagoonicRuntimeHost::set_acp_choices(const Dictionary &p_choices) {
+	state_mutex.lock();
+	acp_choices = p_choices.duplicate();
+	state_mutex.unlock();
+}
+
+void LagoonicRuntimeHost::probe_acp_options(const String &p_agent_id, const String &p_cwd) {
+	if (acp_probing.is_set()) {
+		return;
+	}
+	String bin, path_value, error;
+	PackedStringArray args;
+	if (!_resolve_acp(p_agent_id, bin, args, path_value, error)) {
+		return; // The chat shows the install hint when the user sends.
+	}
+	if (acp_probe_thread.is_started()) {
+		acp_probe_thread.wait_to_finish(); // Previous probe already ended.
+	}
+	if (acp_probe_runner.is_null()) {
+		acp_probe_runner.instantiate();
+	}
+	probe_agent = p_agent_id;
+	probe_bin = bin;
+	probe_args = args;
+	probe_env.clear();
+	if (!path_value.is_empty()) {
+		probe_env["PATH"] = path_value;
+	}
+	probe_cwd = p_cwd.is_empty() ? get_project_dir() : p_cwd;
+	if (probe_cwd.is_empty()) {
+		probe_cwd = OS::get_singleton()->get_user_data_dir();
+	}
+	acp_probing.set();
+	acp_probe_thread.start(&LagoonicRuntimeHost::_acp_probe_main, this);
+}
+
+void LagoonicRuntimeHost::_acp_probe_main(void *p_userdata) {
+	LagoonicRuntimeHost *self = static_cast<LagoonicRuntimeHost *>(p_userdata);
+	const Array options = self->acp_probe_runner->probe_options(self->probe_bin, self->probe_args, self->probe_cwd, self->probe_env);
+	callable_mp(self, &LagoonicRuntimeHost::_on_acp_probe_finished).call_deferred(self->probe_agent, options);
+}
+
+void LagoonicRuntimeHost::_on_acp_probe_finished(const String &p_agent_id, const Array &p_options) {
+	acp_probing.clear();
+	if (acp_probe_thread.is_started()) {
+		acp_probe_thread.wait_to_finish();
+	}
+	if (p_options.is_empty()) {
+		return;
+	}
+	Dictionary event;
+	event["type"] = String("acp_options");
+	event["agent"] = p_agent_id;
+	event["options"] = p_options;
+	_emit_event(event);
+}
+
 Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_session_id, const String &p_text, int p_mode) {
 	const LagoonicCodingAgents::AgentInfo *agent = LagoonicCodingAgents::get_agent(p_boss_id);
 	if (agent == nullptr || agent->acp == nullptr) {
@@ -943,10 +1040,6 @@ Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_se
 		return ERR_UNAVAILABLE;
 	}
 	const String name = String::utf8(agent->name);
-	if (p_mode == 2) {
-		_emit_error(vformat(String::utf8("%s solo ofrece los modos Autónomo y Preguntar; cambia a uno de ellos."), name));
-		return ERR_UNAVAILABLE;
-	}
 	if (acp_busy.is_set()) {
 		_emit_error(vformat(String::utf8("%s todavía está respondiendo."), name));
 		return ERR_BUSY;
@@ -957,6 +1050,7 @@ Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_se
 	state_mutex.lock();
 	const String dir = project_dir;
 	String session = p_session_id.is_empty() ? current_session : p_session_id;
+	const Dictionary choices = acp_choices;
 	state_mutex.unlock();
 	if (dir.is_empty()) {
 		_emit_error("No project directory: open a project first.");
@@ -966,24 +1060,11 @@ Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_se
 		session = "acp-" + p_boss_id;
 	}
 
-	// `npm prefix -g` is a subprocess: ask once per editor run.
-	static const String npm_prefix = LagoonicCodingAgents::npm_global_prefix();
-	const Vector<String> dirs = LagoonicCodingAgents::host_search_dirs(npm_prefix);
-	const Vector<String> command = String::utf8(agent->acp).split(" ", false);
-	const String adapter = lagoonic_find_on_host(command[0], dirs);
-	if (adapter.is_empty()) {
-		String how;
-		if (agent->acp_install != nullptr) {
-			how = String::utf8(" Instala su conector para el chat con: ") + String::utf8(agent->acp_install);
-		}
-		_emit_error(vformat(String::utf8("%s no está listo para el chat.%s"), name, how));
+	String adapter, path_value, resolve_error;
+	PackedStringArray adapter_args;
+	if (!_resolve_acp(p_boss_id, adapter, adapter_args, path_value, resolve_error)) {
+		_emit_error(resolve_error);
 		return ERR_FILE_NOT_FOUND;
-	}
-	String path_value;
-	for (int i = 0; i < dirs.size(); i++) {
-		if (!dirs[i].is_empty()) {
-			path_value += (path_value.is_empty() ? "" : (LagoonicCodingAgents::is_windows() ? ";" : ":")) + dirs[i];
-		}
 	}
 
 	// lagoonic-mcp gives the agent the Godot tools, like OpenCode's config.
@@ -1021,10 +1102,12 @@ Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_se
 		acp_runner->connect(SNAME("acp_permission"), callable_mp(this, &LagoonicRuntimeHost::_on_acp_permission), CONNECT_DEFERRED);
 	}
 	acp_bin = adapter;
-	acp_args.clear();
-	for (int i = 1; i < command.size(); i++) {
-		acp_args.push_back(command[i]);
-	}
+	acp_args = adapter_args;
+	acp_agent = p_boss_id;
+	acp_runner->set_chosen_options(choices);
+	// Lagoonic's mode picks the agent's own mode when it has one:
+	// Preguntar antes -> "default" (asks first), Solo planificar -> "plan".
+	acp_runner->set_requested_mode(p_mode == 2 ? String("plan") : (p_mode == 1 ? String("default") : String()));
 	acp_env.clear();
 	if (!path_value.is_empty()) {
 		acp_env["PATH"] = path_value;
@@ -1048,6 +1131,9 @@ void LagoonicRuntimeHost::_acp_thread_main(void *p_userdata) {
 
 void LagoonicRuntimeHost::_on_acp_event(const Dictionary &p_event) {
 	Dictionary event = p_event;
+	if (String(event.get("type", "")) == "acp_options") {
+		event["agent"] = acp_agent;
+	}
 	if (String(event.get("type", "")) == "permission") {
 		Dictionary request = event.get("request", Dictionary());
 		if (!request.has("sessionId")) {

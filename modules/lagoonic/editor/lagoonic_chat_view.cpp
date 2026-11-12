@@ -35,6 +35,8 @@
 #include "lagoonic_model_viewer.h"
 #include "lagoonic_vibe_theme.h"
 
+#include "../runtime/lagoonic_coding_agents.h"
+
 #include "core/input/input_event.h"
 #include "core/os/os.h"
 #include "core/config/project_settings.h"
@@ -65,6 +67,8 @@
 #include "scene/gui/label.h"
 #include "scene/gui/line_edit.h"
 #include "scene/gui/margin_container.h"
+#include "scene/gui/menu_button.h"
+#include "scene/gui/popup_menu.h"
 #include "scene/gui/option_button.h"
 #include "scene/gui/panel_container.h"
 #include "scene/gui/rich_text_label.h"
@@ -74,6 +78,13 @@
 #include "servers/text/text_server.h"
 
 static const char *LAGOONIC_BOSS_IDS[6] = { "opencode", "claude", "codex", "qwen", "kimi", "goose" };
+
+static Array _acp_pair(const String &p_option_id, const String &p_value) {
+	Array pair;
+	pair.push_back(p_option_id);
+	pair.push_back(p_value);
+	return pair;
+}
 
 void LagoonicChatView::_fire(const StringName &p_event, const Variant &p_a, const Variant &p_b) {
 	if (event_callback.is_valid()) {
@@ -1062,12 +1073,30 @@ void LagoonicChatView::_on_model_selected(int p_index) {
 	if (model_option == nullptr) {
 		return;
 	}
+	if (acp_mode) {
+		const Dictionary option = _acp_option_by_category("model");
+		const String value = p_index >= 0 ? String(model_option->get_item_metadata(p_index)) : String();
+		if (!option.is_empty() && !value.is_empty()) {
+			acp_choices[option["id"]] = value;
+			_fire(SNAME("acp_option_changed"), _acp_pair(option["id"], value));
+		}
+		return;
+	}
 	preferred_model = get_current_model();
 	_rebuild_effort_options();
 	_fire(SNAME("model_changed"), preferred_model);
 }
 
 void LagoonicChatView::_on_effort_selected(int p_index) {
+	if (acp_mode) {
+		const Dictionary option = _acp_option_by_category("thought_level");
+		const String value = p_index >= 0 ? String(effort_option->get_item_metadata(p_index)) : String();
+		if (!option.is_empty() && !value.is_empty()) {
+			acp_choices[option["id"]] = value;
+			_fire(SNAME("acp_option_changed"), _acp_pair(option["id"], value));
+		}
+		return;
+	}
 	preferred_effort = get_effort();
 	_fire(SNAME("effort_changed"), preferred_effort);
 }
@@ -1091,7 +1120,7 @@ String LagoonicChatView::_effort_label(const String &p_variant) {
 }
 
 void LagoonicChatView::_rebuild_effort_options() {
-	if (effort_option == nullptr) {
+	if (effort_option == nullptr || acp_mode) {
 		return;
 	}
 	effort_option->clear();
@@ -1117,9 +1146,23 @@ void LagoonicChatView::_rebuild_effort_options() {
 }
 
 void LagoonicChatView::set_models(const Array &p_models, const String &p_default_ref) {
+	oc_models = p_models;
+	oc_default_ref = p_default_ref;
+	if (!acp_mode) {
+		_render_opencode_models();
+	}
+}
+
+void LagoonicChatView::_render_opencode_models() {
 	if (model_option == nullptr) {
 		return;
 	}
+	if (acp_more_button != nullptr) {
+		acp_more_button->set_visible(false);
+	}
+	const Array &p_models = oc_models;
+	const String &p_default_ref = oc_default_ref;
+	model_option->set_tooltip_text(TTRC("Modelo"));
 	model_variants.clear();
 	model_option->clear();
 	String default_name;
@@ -1152,12 +1195,154 @@ void LagoonicChatView::set_models(const Array &p_models, const String &p_default
 	_rebuild_effort_options();
 }
 
+Dictionary LagoonicChatView::_acp_option_by_category(const String &p_category) const {
+	for (int i = 0; i < acp_options.size(); i++) {
+		const Dictionary option = acp_options[i];
+		if (String(option.get("category", "")) == p_category) {
+			return option;
+		}
+	}
+	return Dictionary();
+}
+
+String LagoonicChatView::_acp_value(const Dictionary &p_option) const {
+	const String id = p_option.get("id", "");
+	const String chosen = acp_choices.get(id, "");
+	const Array values = p_option.get("values", Array());
+	for (int i = 0; i < values.size(); i++) {
+		if (String(Dictionary(values[i]).get("value", "")) == chosen) {
+			return chosen;
+		}
+	}
+	return p_option.get("current", "");
+}
+
+void LagoonicChatView::set_acp_options(const String &p_agent_id, const Array &p_options, const Dictionary &p_choices) {
+	if (p_agent_id != chat_boss) {
+		return; // Llego tarde: el usuario ya cambio de agente.
+	}
+	acp_options = p_options;
+	acp_choices = p_choices.duplicate();
+	if (acp_mode) {
+		_render_acp_options();
+	}
+}
+
+void LagoonicChatView::_render_acp_options() {
+	if (model_option == nullptr || effort_option == nullptr) {
+		return;
+	}
+	const LagoonicCodingAgents::AgentInfo *info = LagoonicCodingAgents::get_agent(chat_boss);
+	const String agent_name = info != nullptr ? String::utf8(info->name) : chat_boss;
+
+	// Modelo: los del agente, con su descripcion de ayuda.
+	model_variants.clear();
+	model_option->clear();
+	const Dictionary model = _acp_option_by_category("model");
+	if (model.is_empty()) {
+		model_option->add_item(acp_options.is_empty() ? String::utf8("Cargando modelos…") : vformat(String::utf8("Modelo de %s"), agent_name));
+		model_option->set_item_metadata(0, String());
+		model_option->set_item_disabled(0, true);
+	} else {
+		const String current = _acp_value(model);
+		const Array values = model.get("values", Array());
+		for (int i = 0; i < values.size(); i++) {
+			const Dictionary v = values[i];
+			model_option->add_item(String(v.get("name", v.get("value", ""))));
+			const int idx = model_option->get_item_count() - 1;
+			model_option->set_item_metadata(idx, String(v.get("value", "")));
+			const String description = v.get("description", "");
+			if (!description.is_empty()) {
+				model_option->set_item_tooltip(idx, description);
+			}
+			if (String(v.get("value", "")) == current) {
+				model_option->select(idx);
+			}
+		}
+	}
+	model_option->set_tooltip_text(vformat(String::utf8("Modelo de %s"), agent_name));
+
+	// Esfuerzo: el del agente (Claude Code: low ... max).
+	effort_option->clear();
+	const Dictionary effort = _acp_option_by_category("thought_level");
+	if (!effort.is_empty()) {
+		const String current = _acp_value(effort);
+		const Array values = effort.get("values", Array());
+		for (int i = 0; i < values.size(); i++) {
+			const Dictionary v = values[i];
+			const String value = v.get("value", "");
+			effort_option->add_item(value == "default" ? String::utf8("Esfuerzo por defecto") : _effort_label(value));
+			const int idx = effort_option->get_item_count() - 1;
+			effort_option->set_item_metadata(idx, value);
+			if (value == current) {
+				effort_option->select(idx);
+			}
+		}
+	}
+	effort_option->set_visible(!effort.is_empty());
+
+	// El resto (modo rapido, persona...) en un menu "Opciones". El modo de
+	// permisos ya lo cubre el selector Automatico / Preguntar / Planificar.
+	if (acp_more_button == nullptr) {
+		return;
+	}
+	PopupMenu *popup = acp_more_button->get_popup();
+	popup->clear(true);
+	int shown = 0;
+	for (int i = 0; i < acp_options.size(); i++) {
+		const Dictionary option = acp_options[i];
+		const String category = option.get("category", "");
+		if (category == "model" || category == "thought_level" || category == "mode") {
+			continue;
+		}
+		const String id = option.get("id", "");
+		PopupMenu *sub = memnew(PopupMenu);
+		const String current = _acp_value(option);
+		const Array values = option.get("values", Array());
+		for (int j = 0; j < values.size(); j++) {
+			const Dictionary v = values[j];
+			sub->add_radio_check_item(String(v.get("name", v.get("value", ""))), j);
+			sub->set_item_metadata(j, String(v.get("value", "")));
+			sub->set_item_checked(j, String(v.get("value", "")) == current);
+			const String description = v.get("description", "");
+			if (!description.is_empty()) {
+				sub->set_item_tooltip(j, description);
+			}
+		}
+		sub->connect(SceneStringName(id_pressed), callable_mp(this, &LagoonicChatView::_on_acp_more_id).bind(id));
+		popup->add_submenu_node_item(String(option.get("name", id)), sub);
+		shown++;
+	}
+	acp_more_button->set_visible(shown > 0);
+}
+
+void LagoonicChatView::_on_acp_more_id(int p_id, const String &p_option_id) {
+	for (int i = 0; i < acp_options.size(); i++) {
+		const Dictionary option = acp_options[i];
+		if (String(option.get("id", "")) != p_option_id) {
+			continue;
+		}
+		const Array values = option.get("values", Array());
+		if (p_id < 0 || p_id >= values.size()) {
+			return;
+		}
+		const String value = Dictionary(values[p_id]).get("value", "");
+		acp_choices[p_option_id] = value;
+		_fire(SNAME("acp_option_changed"), _acp_pair(p_option_id, value));
+		callable_mp(this, &LagoonicChatView::_render_acp_options).call_deferred();
+		return;
+	}
+}
+
 void LagoonicChatView::set_effort(const String &p_variant) {
 	preferred_effort = p_variant;
 	_rebuild_effort_options();
 }
 
 String LagoonicChatView::get_effort() const {
+	if (acp_mode) {
+		return String(); // El esfuerzo del agente ACP va en sus opciones.
+	}
 	if (effort_option != nullptr && effort_option->is_visible() && effort_option->get_selected() >= 0) {
 		return effort_option->get_item_metadata(effort_option->get_selected());
 	}
@@ -1593,6 +1778,18 @@ void LagoonicChatView::set_boss_options(const PackedStringArray &p_agent_ids) {
 }
 
 void LagoonicChatView::set_boss_agent(const String &p_agent_id) {
+	if (p_agent_id != chat_boss) {
+		chat_boss = p_agent_id;
+		acp_mode = !p_agent_id.is_empty() && p_agent_id != "opencode";
+		acp_options.clear();
+		acp_choices.clear();
+		if (acp_mode) {
+			_render_acp_options();
+			_fire(SNAME("acp_options_requested"), p_agent_id); // Guardadas al instante, frescas despues.
+		} else {
+			_render_opencode_models();
+		}
+	}
 	if (boss_option == nullptr) {
 		return;
 	}
@@ -1637,6 +1834,9 @@ void LagoonicChatView::set_current_model(const String &p_model_ref) {
 		return;
 	}
 	preferred_model = p_model_ref;
+	if (acp_mode) {
+		return; // El selector muestra los modelos del agente ACP.
+	}
 	for (int i = 0; i < model_option->get_item_count(); i++) {
 		if (model_option->is_item_separator(i)) {
 			continue;
@@ -1654,6 +1854,9 @@ void LagoonicChatView::set_current_model(const String &p_model_ref) {
 }
 
 String LagoonicChatView::get_current_model() const {
+	if (acp_mode) {
+		return String(); // No es un modelo de OpenCode.
+	}
 	if (model_option != nullptr && model_option->get_selected() >= 0) {
 		const Variant meta = model_option->get_item_metadata(model_option->get_selected());
 		if (meta.get_type() == Variant::STRING) {
@@ -2497,6 +2700,8 @@ void LagoonicChatView::_bind_methods() {
 	ADD_SIGNAL(MethodInfo("session_delete_requested", PropertyInfo(Variant::STRING, "session_id")));
 	ADD_SIGNAL(MethodInfo("session_rename_requested", PropertyInfo(Variant::ARRAY, "id_and_title")));
 	ADD_SIGNAL(MethodInfo("boss_changed", PropertyInfo(Variant::STRING, "agent_id")));
+	ADD_SIGNAL(MethodInfo("acp_options_requested", PropertyInfo(Variant::STRING, "agent_id")));
+	ADD_SIGNAL(MethodInfo("acp_option_changed", PropertyInfo(Variant::ARRAY, "option_and_value")));
 	ADD_SIGNAL(MethodInfo("model_changed", PropertyInfo(Variant::STRING, "model_ref")));
 	ADD_SIGNAL(MethodInfo("mode_changed", PropertyInfo(Variant::INT, "mode")));
 	ADD_SIGNAL(MethodInfo("effort_changed", PropertyInfo(Variant::STRING, "variant")));
@@ -2520,6 +2725,8 @@ LagoonicChatView::LagoonicChatView() {
 	signal_argc[SNAME("session_delete_requested")] = 1;
 	signal_argc[SNAME("session_rename_requested")] = 1;
 	signal_argc[SNAME("boss_changed")] = 1;
+	signal_argc[SNAME("acp_options_requested")] = 1;
+	signal_argc[SNAME("acp_option_changed")] = 1;
 	signal_argc[SNAME("model_changed")] = 1;
 	signal_argc[SNAME("mode_changed")] = 1;
 	signal_argc[SNAME("effort_changed")] = 1;
@@ -2869,6 +3076,14 @@ LagoonicChatView::LagoonicChatView() {
 	}
 	model_option->set_custom_minimum_size(Size2(0, 0));
 	effort_option->set_visible(false);
+	acp_more_button = memnew(MenuButton);
+	acp_more_button->set_text(TTRC("Opciones"));
+	acp_more_button->set_tooltip_text(String::utf8("Más opciones del agente."));
+	acp_more_button->set_flat(true);
+	acp_more_button->set_focus_mode(Control::FOCUS_NONE);
+	acp_more_button->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+	acp_more_button->set_visible(false);
+	composer_controls->add_child(acp_more_button);
 	Control *controls_spacer = memnew(Control);
 	controls_spacer->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	controls_spacer->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
