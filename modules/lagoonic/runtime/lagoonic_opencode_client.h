@@ -57,6 +57,7 @@
 // only introduces lagoonic_opencode_client / lagoonic_event_mapper symbols.
 
 #include "core/object/ref_counted.h"
+#include "core/templates/hash_map.h"
 
 #include "core/io/http_client.h"
 #include "core/os/mutex.h"
@@ -88,8 +89,16 @@ public:
 	String lagoonic_get_auth_mode() const;
 	String lagoonic_get_base_url() const;
 
-	// GET /global/health -> true when {healthy: true}.
+	// GET /global/health -> true when {healthy: true} (1.x), or GET /api/info
+	// answers with a version (2.x).
 	bool lagoonic_health();
+	// True when the server speaks the OpenCode 2.x API (`opencode serve`,
+	// "v2 API", checked against 2.2.7). Probed once with GET /api/info: 2.x
+	// answers JSON, 1.x has no such route. LAGOONIC_OPENCODE_API=v1|v2 skips
+	// the probe. Every method below routes to the matching API, and 2.x
+	// events are translated to the 1.x frames LagoonicEventMapper reads
+	// (see lagoonic_opencode_v2.h).
+	bool lagoonic_is_api_v2();
 	// GET /global/health -> version string ("" when unknown).
 	String lagoonic_version();
 
@@ -111,7 +120,7 @@ public:
 	// When the server answers 404 / not-found (deleted session), a
 	// replacement session is created once and the prompt is retried with it;
 	// `lagoonic_session_recreated(old_id, new_id)` is emitted in that case.
-	Dictionary lagoonic_prompt_parts_async(const String &p_session_id, const String &p_directory, const Array &p_parts, const String &p_provider_id, const String &p_model_id, const String &p_agent = String());
+	Dictionary lagoonic_prompt_parts_async(const String &p_session_id, const String &p_directory, const Array &p_parts, const String &p_provider_id, const String &p_model_id, const String &p_agent = String(), const String &p_variant = String());
 
 	// POST /session/:id/permissions/:permissionID?directory= {response}.
 	// reply: "once" | "always" | "reject".
@@ -128,6 +137,8 @@ public:
 	Array lagoonic_diff_full(const String &p_session_id, const String &p_directory);
 	// DELETE /session/:id?directory=.
 	bool lagoonic_delete_session(const String &p_directory, const String &p_session_id);
+	// PATCH titulo de la sesion.
+	bool lagoonic_rename_session(const String &p_directory, const String &p_session_id, const String &p_title);
 
 	// True when a message/HTTP status means "the server no longer knows this
 	// session" (caller is expected to recreate it). Matches HTTP 404 and
@@ -159,6 +170,12 @@ private:
 	LagoonicHttpResult _lagoonic_http_request(HTTPClient::Method p_method, const String &p_path_query, const String &p_body = String(), bool p_is_sse = false);
 	String _lagoonic_auth_header() const;
 	static String _lagoonic_with_directory(const String &p_path, const String &p_directory);
+	// 2.x routing: `location[directory]` query (same as the
+	// x-opencode-directory header) plus any extra `&key=value` pairs.
+	static String _lagoonic_v2_path(const String &p_path, const String &p_directory, const String &p_extra_query = String());
+	// `{data}` of a 2.x response body (the body itself when unwrapped).
+	static Variant _lagoonic_v2_data(const String &p_body);
+	Array _lagoonic_v2_list_providers(const String &p_directory);
 
 	// SSE worker entry point (runs on lagoonic_sse_thread). Never touches
 	// the scene tree; the only cross-thread call is call_deferred().
@@ -175,6 +192,13 @@ private:
 	String lagoonic_password;
 	String lagoonic_auth_mode = "basic";
 	int64_t lagoonic_timeout_ms = LAGOONIC_HTTP_TIMEOUT_MS;
+	// 0 = not probed yet, 1 = OpenCode 1.x, 2 = OpenCode 2.x.
+	mutable Mutex lagoonic_api_mutex;
+	int lagoonic_api = 0;
+	// Last model / agent selected per session on a 2.x server, so a prompt
+	// only switches them when they change (2.x prompts carry neither).
+	HashMap<String, String> lagoonic_v2_model;
+	HashMap<String, String> lagoonic_v2_agent;
 
 	Thread lagoonic_sse_thread;
 	mutable Mutex lagoonic_sse_mutex;

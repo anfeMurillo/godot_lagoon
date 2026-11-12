@@ -171,6 +171,32 @@ Dictionary LagoonicEventMapper::_lagoonic_ensure_message(const String &p_id, con
 	return message;
 }
 
+// Orden real de la respuesta: fragmentos de texto y pasos tal como llegan.
+// La vista pone el texto seguido de un paso como narracion en la actividad
+// y deja en la burbuja solo el texto final.
+static void _lagoonic_timeline_add(Dictionary &r_message, const String &p_kind, const String &p_id, const String &p_text) {
+	Array timeline = r_message.get("timeline", Array());
+	for (int i = 0; i < timeline.size(); i++) {
+		Dictionary entry = timeline[i];
+		if (String(entry.get("id", "")) == p_id && String(entry.get("kind", "")) == p_kind) {
+			if (!p_text.is_empty()) {
+				entry["text"] = String(entry.get("text", "")) + p_text;
+				timeline[i] = entry;
+				r_message["timeline"] = timeline;
+			}
+			return;
+		}
+	}
+	Dictionary entry;
+	entry["kind"] = p_kind;
+	entry["id"] = p_id;
+	if (p_kind == "text") {
+		entry["text"] = p_text;
+	}
+	timeline.push_back(entry);
+	r_message["timeline"] = timeline;
+}
+
 bool LagoonicEventMapper::_lagoonic_is_this_session(const String &p_id) const {
 	return p_id.is_empty() || p_id == lagoonic_session_id;
 }
@@ -400,6 +426,7 @@ Dictionary LagoonicEventMapper::_lagoonic_on_part_updated(const Dictionary &p_pr
 		lagoonic_saw_activity = true;
 		Dictionary message = _lagoonic_ensure_message(message_id, "assistant");
 		message["text"] = String(message["text"]) + full.substr(already);
+		_lagoonic_timeline_add(message, "text", part_id, full.substr(already));
 		lagoonic_messages[message_id] = message;
 		events.push_back(_lagoonic_message_event(message));
 		out["events"] = events;
@@ -457,6 +484,7 @@ Dictionary LagoonicEventMapper::_lagoonic_on_part_delta(const Dictionary &p_prop
 	lagoonic_emitted_text[part_id] = previous + int64_t(text.length());
 	Dictionary message = _lagoonic_ensure_message(message_id, "assistant");
 	message["text"] = String(message["text"]) + text;
+	_lagoonic_timeline_add(message, "text", part_id, text);
 	lagoonic_messages[message_id] = message;
 	events.push_back(_lagoonic_message_event(message));
 	out["events"] = events;
@@ -526,6 +554,7 @@ Dictionary LagoonicEventMapper::_lagoonic_on_tool_part(const String &p_part_id, 
 			row["detail"] = d.is_empty() ? String("Done") : d;
 		}
 		rows.push_back(row);
+		_lagoonic_timeline_add(message, "tool", p_part_id, String());
 	}
 	lagoonic_tools_by_message[p_message_id] = rows;
 	message["tools"] = rows.duplicate(true);
@@ -630,7 +659,21 @@ String LagoonicEventMapper::_lagoonic_tool_detail(const Dictionary &p_state) {
 
 String LagoonicEventMapper::lagoonic_tool_label(const String &p_raw_tool, const String &p_detail) const {
 	const String name = lagoonic_display_tool_name(p_raw_tool);
-	const String subject = _lagoonic_short_name(p_detail);
+	// Una ruta se acorta al nombre del fichero; un comando o una frase se
+	// muestran enteros (compactados), si no "2>/dev/null | grep" quedaria
+	// como "null | grep".
+	String detail = p_detail.strip_edges();
+	const int nl = detail.find("\n");
+	if (nl >= 0) {
+		detail = detail.left(nl).strip_edges() + String::utf8(" …");
+	}
+	if (detail.contains(" ")) {
+		while (detail.contains("  ")) {
+			detail = detail.replace("  ", " ");
+		}
+		return detail.is_empty() ? name : (name + String::utf8(" · ") + (detail.length() > 90 ? detail.left(88) + String::utf8("…") : detail));
+	}
+	const String subject = _lagoonic_short_name(detail);
 	return subject.is_empty() ? name : (name + String::utf8(" · ") + subject);
 }
 

@@ -35,7 +35,11 @@
 #include "core/object/class_db.h"
 #include "core/os/os.h"
 
+#include "lagoonic_coding_agents.h"
 #include "lagoonic_config_writer.h"
+#include "lagoonic_mcp_locator.h"
+
+#include "core/io/file_access.h"
 
 // ---------------------------------------------------------------------------
 // Crew runner: the LagoonicCrewOrchestrator side effects, implemented on top
@@ -258,12 +262,17 @@ public:
 
 void LagoonicRuntimeHost::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("ensure_server", "project_dir", "default_model", "secret_env"), &LagoonicRuntimeHost::ensure_server);
-	ClassDB::bind_method(D_METHOD("send_prompt", "session_id", "text", "mode", "model"), &LagoonicRuntimeHost::send_prompt);
+	ClassDB::bind_method(D_METHOD("send_prompt", "session_id", "text", "mode", "model", "variant"), &LagoonicRuntimeHost::send_prompt, DEFVAL(String()));
 	ClassDB::bind_method(D_METHOD("abort"), &LagoonicRuntimeHost::abort);
 	ClassDB::bind_method(D_METHOD("respond_permission", "permission_id", "reply"), &LagoonicRuntimeHost::respond_permission);
 	ClassDB::bind_method(D_METHOD("revert_message", "message_id"), &LagoonicRuntimeHost::revert_message);
 	ClassDB::bind_method(D_METHOD("create_session", "title"), &LagoonicRuntimeHost::create_session, DEFVAL(String()));
 	ClassDB::bind_method(D_METHOD("select_session", "session_id"), &LagoonicRuntimeHost::select_session);
+	ClassDB::bind_method(D_METHOD("list_sessions"), &LagoonicRuntimeHost::list_sessions);
+	ClassDB::bind_method(D_METHOD("delete_session", "session_id"), &LagoonicRuntimeHost::delete_session);
+	ClassDB::bind_method(D_METHOD("rename_session", "session_id", "title"), &LagoonicRuntimeHost::rename_session);
+	ClassDB::bind_method(D_METHOD("get_changes"), &LagoonicRuntimeHost::get_changes);
+	ClassDB::bind_method(D_METHOD("load_history", "session_id"), &LagoonicRuntimeHost::load_history);
 	ClassDB::bind_method(D_METHOD("set_crew", "boss_id", "workers"), &LagoonicRuntimeHost::set_crew);
 	ClassDB::bind_method(D_METHOD("set_crew_boss", "boss_id"), &LagoonicRuntimeHost::set_crew_boss);
 	ClassDB::bind_method(D_METHOD("set_crew_worker", "worker_id", "enabled"), &LagoonicRuntimeHost::set_crew_worker);
@@ -271,6 +280,8 @@ void LagoonicRuntimeHost::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("poll_connection"), &LagoonicRuntimeHost::poll_connection);
 	ClassDB::bind_method(D_METHOD("get_session"), &LagoonicRuntimeHost::get_session);
 	ClassDB::bind_method(D_METHOD("get_project_dir"), &LagoonicRuntimeHost::get_project_dir);
+	ClassDB::bind_method(D_METHOD("set_project_dir", "project_dir"), &LagoonicRuntimeHost::set_project_dir);
+	ClassDB::bind_method(D_METHOD("get_crew_boss"), &LagoonicRuntimeHost::get_crew_boss);
 	ClassDB::bind_method(D_METHOD("set_opencode_bin", "bin"), &LagoonicRuntimeHost::set_opencode_bin);
 	ClassDB::bind_method(D_METHOD("get_opencode_bin"), &LagoonicRuntimeHost::get_opencode_bin);
 
@@ -296,6 +307,12 @@ LagoonicRuntimeHost::LagoonicRuntimeHost() {
 }
 
 LagoonicRuntimeHost::~LagoonicRuntimeHost() {
+	if (acp_runner.is_valid()) {
+		acp_runner->close(); // Ends a running turn so its thread returns.
+	}
+	if (acp_thread.is_started()) {
+		acp_thread.wait_to_finish();
+	}
 	if (crew.is_valid()) {
 		crew->set_runner(nullptr);
 		crew->cancel();
@@ -445,9 +462,15 @@ Error LagoonicRuntimeHost::ensure_server(const String &p_project_dir, const Stri
 	return OK;
 }
 
-Error LagoonicRuntimeHost::send_prompt(const String &p_session_id, const String &p_text, int p_mode, const String &p_model) {
+Error LagoonicRuntimeHost::send_prompt(const String &p_session_id, const String &p_text, int p_mode, const String &p_model, const String &p_variant) {
 	if (p_text.strip_edges().is_empty()) {
 		return ERR_INVALID_PARAMETER;
+	}
+	// The boss chosen in Configuracion > Equipo answers the chat; only
+	// OpenCode goes through the server below.
+	const String boss = get_crew_boss();
+	if (!boss.is_empty() && boss != "opencode") {
+		return _send_acp(boss, p_session_id, p_text, p_mode);
 	}
 	// Lazy (re)start, like supervisor.ts onUnexpectedExit -> next message.
 	if (!is_server_up() || !supervisor->check_health()) {
@@ -489,7 +512,7 @@ Error LagoonicRuntimeHost::send_prompt(const String &p_session_id, const String 
 	text_part["type"] = String("text");
 	text_part["text"] = p_text;
 	parts.push_back(text_part);
-	const Dictionary res = client->lagoonic_prompt_parts_async(session, dir, parts, provider, model_id, agent);
+	const Dictionary res = client->lagoonic_prompt_parts_async(session, dir, parts, provider, model_id, agent, p_variant);
 	client_mutex.unlock();
 
 	if (bool(res.get("recreated", false))) {
@@ -514,6 +537,9 @@ Error LagoonicRuntimeHost::send_prompt(const String &p_session_id, const String 
 
 Error LagoonicRuntimeHost::abort() {
 	crew->cancel();
+	if (acp_busy.is_set() && acp_runner.is_valid()) {
+		acp_runner->session_cancel(acp_runner->get_acp_session_id());
+	}
 	state_mutex.lock();
 	const String session = current_session;
 	const String dir = project_dir;
@@ -534,6 +560,10 @@ Error LagoonicRuntimeHost::abort() {
 Error LagoonicRuntimeHost::respond_permission(const String &p_permission_id, int p_reply) {
 	if (p_permission_id.is_empty()) {
 		return ERR_INVALID_PARAMETER;
+	}
+	if (p_permission_id.begins_with("acp-") && acp_runner.is_valid()) {
+		acp_runner->resolve_permission(p_permission_id, p_reply != 2);
+		return OK;
 	}
 	String reply_str = "once";
 	if (p_reply == 1) {
@@ -608,6 +638,159 @@ void LagoonicRuntimeHost::select_session(const String &p_session_id) {
 	// here on, live turns render incrementally.
 	mapper->lagoonic_configure(p_session_id);
 	_emit_status("session:" + p_session_id);
+}
+
+Array LagoonicRuntimeHost::list_sessions() {
+	Array out;
+	if (!is_server_up()) {
+		return out;
+	}
+	const String dir = get_project_dir();
+	client_mutex.lock();
+	const Array rows = client->lagoonic_list_sessions(dir);
+	client_mutex.unlock();
+	for (int i = 0; i < rows.size(); i++) {
+		const Dictionary row = rows[i];
+		if (String(row.get("title", "")).begins_with(LagoonicEventMapper::LAGOONIC_WORKER_PREFIX)) {
+			continue;
+		}
+		out.push_back(row);
+	}
+	// Mas recientes primero (la API 1.x no garantiza el orden).
+	for (int i = 1; i < out.size(); i++) {
+		for (int j = i; j > 0 && int64_t(Dictionary(out[j]).get("updated_at", 0)) > int64_t(Dictionary(out[j - 1]).get("updated_at", 0)); j--) {
+			const Variant tmp = out[j];
+			out[j] = out[j - 1];
+			out[j - 1] = tmp;
+		}
+	}
+	return out;
+}
+
+bool LagoonicRuntimeHost::delete_session(const String &p_session_id) {
+	if (p_session_id.is_empty() || !is_server_up()) {
+		return false;
+	}
+	const String dir = get_project_dir();
+	client_mutex.lock();
+	const bool ok = client->lagoonic_delete_session(dir, p_session_id);
+	client_mutex.unlock();
+	if (ok && get_session() == p_session_id) {
+		state_mutex.lock();
+		current_session = String();
+		state_mutex.unlock();
+		mapper->lagoonic_configure(String());
+		_emit_status("session:");
+	}
+	return ok;
+}
+
+Array LagoonicRuntimeHost::get_changes() {
+	const String session = get_session();
+	if (session.is_empty() || !is_server_up()) {
+		return Array();
+	}
+	const String dir = get_project_dir();
+	client_mutex.lock();
+	const Array rows = client->lagoonic_diff(session, dir);
+	client_mutex.unlock();
+	return rows;
+}
+
+bool LagoonicRuntimeHost::rename_session(const String &p_session_id, const String &p_title) {
+	if (p_session_id.is_empty() || p_title.strip_edges().is_empty() || !is_server_up()) {
+		return false;
+	}
+	const String dir = get_project_dir();
+	client_mutex.lock();
+	const bool ok = client->lagoonic_rename_session(dir, p_session_id, p_title.strip_edges());
+	client_mutex.unlock();
+	return ok;
+}
+
+Array LagoonicRuntimeHost::load_history(const String &p_session_id) {
+	Array events;
+	if (p_session_id.is_empty() || !is_server_up()) {
+		return events;
+	}
+	const String dir = get_project_dir();
+	client_mutex.lock();
+	const Array messages = client->lagoonic_list_messages(p_session_id, dir);
+	client_mutex.unlock();
+	for (int i = 0; i < messages.size(); i++) {
+		const Dictionary msg = messages[i];
+		const String role = msg.get("role", "user");
+		const Array parts = msg.get("parts", Array());
+		String text;
+		Array tools;
+		Array timeline;
+		int64_t first_ms = 0;
+		int64_t last_ms = 0;
+		for (int j = 0; j < parts.size(); j++) {
+			const Dictionary part = parts[j];
+			const String type = part.get("type", "");
+			if (type == "text") {
+				if (bool(part.get("synthetic", false))) {
+					continue;
+				}
+				const String t = part.get("text", "");
+				if (!t.strip_edges().is_empty()) {
+					text += (text.is_empty() ? String() : String("\n\n")) + t;
+					Dictionary entry;
+					entry["kind"] = String("text");
+					entry["id"] = String(part.get("id", itos(j)));
+					entry["text"] = t;
+					timeline.push_back(entry);
+				}
+			} else if (type == "tool") {
+				const String raw = part.get("tool", "");
+				if (raw.is_empty() || mapper->lagoonic_is_hidden_tool(raw)) {
+					continue;
+				}
+				const Dictionary state = part.get("state", Dictionary());
+				const String status = state.get("status", "");
+				const String detail = mapper->lagoonic_extract_tool_detail(state);
+				const String title = state.get("title", "");
+				Dictionary row;
+				row["id"] = String(part.get("id", itos(j)));
+				row["label"] = mapper->lagoonic_tool_label(raw, detail.is_empty() ? title : detail);
+				row["state"] = status == "error" ? String("error") : String("done");
+				row["detail"] = status == "error" ? ("Error: " + String(state.get("error", ""))).left(240) : (detail.is_empty() ? title : detail);
+				tools.push_back(row);
+				Dictionary entry;
+				entry["kind"] = String("tool");
+				entry["id"] = row["id"];
+				timeline.push_back(entry);
+				const Dictionary time = state.get("time", Dictionary());
+				const int64_t start = time.get("start", 0);
+				const int64_t end = time.get("end", 0);
+				if (start > 0 && (first_ms == 0 || start < first_ms)) {
+					first_ms = start;
+				}
+				last_ms = MAX(last_ms, end);
+			}
+		}
+		if (text.is_empty() && tools.is_empty()) {
+			continue;
+		}
+		Dictionary message;
+		message["id"] = String(msg.get("id", ""));
+		message["role"] = role;
+		message["text"] = text;
+		message["tools"] = tools;
+		message["timeline"] = timeline;
+		message["created_at"] = msg.get("time", 0);
+		if (first_ms > 0 && last_ms > first_ms) {
+			message["worked_ms"] = last_ms - first_ms;
+		}
+		Dictionary event;
+		event["type"] = String("message");
+		event["session_id"] = p_session_id;
+		event["history"] = true;
+		event["message"] = message;
+		events.push_back(event);
+	}
+	return events;
 }
 
 void LagoonicRuntimeHost::set_crew(const String &p_boss_id, const Array &p_workers) {
@@ -712,6 +895,195 @@ String LagoonicRuntimeHost::get_project_dir() const {
 	const String dir = project_dir;
 	state_mutex.unlock();
 	return dir;
+}
+
+void LagoonicRuntimeHost::set_project_dir(const String &p_project_dir) {
+	if (p_project_dir.strip_edges().is_empty()) {
+		return;
+	}
+	state_mutex.lock();
+	project_dir = p_project_dir.strip_edges();
+	state_mutex.unlock();
+}
+
+String LagoonicRuntimeHost::get_crew_boss() const {
+	state_mutex.lock();
+	const String boss = crew_boss_id;
+	state_mutex.unlock();
+	return boss;
+}
+
+// ---------------------------------------------------------- ACP boss turns
+
+namespace {
+
+// Absolute path of p_bin in the host search dirs (PATH + npm/brew/local
+// bins), or "" when absent. Apps opened from Finder get a minimal PATH,
+// so execvp alone would miss npm-installed adapters.
+String lagoonic_find_on_host(const String &p_bin, const Vector<String> &p_dirs) {
+	const Vector<String> names = LagoonicCodingAgents::candidate_names(p_bin);
+	for (int i = 0; i < p_dirs.size(); i++) {
+		for (int j = 0; j < names.size(); j++) {
+			const String path = p_dirs[i].path_join(names[j]);
+			if (FileAccess::exists(path)) {
+				return path;
+			}
+		}
+	}
+	return String();
+}
+
+} // namespace
+
+Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_session_id, const String &p_text, int p_mode) {
+	const LagoonicCodingAgents::AgentInfo *agent = LagoonicCodingAgents::get_agent(p_boss_id);
+	if (agent == nullptr || agent->acp == nullptr) {
+		_emit_error(vformat(String::utf8("%s no se puede usar en el chat."), p_boss_id));
+		return ERR_UNAVAILABLE;
+	}
+	const String name = String::utf8(agent->name);
+	if (p_mode == 2) {
+		_emit_error(vformat(String::utf8("%s solo ofrece los modos Autónomo y Preguntar; cambia a uno de ellos."), name));
+		return ERR_UNAVAILABLE;
+	}
+	if (acp_busy.is_set()) {
+		_emit_error(vformat(String::utf8("%s todavía está respondiendo."), name));
+		return ERR_BUSY;
+	}
+	if (acp_thread.is_started()) {
+		acp_thread.wait_to_finish(); // Previous turn already ended.
+	}
+	state_mutex.lock();
+	const String dir = project_dir;
+	String session = p_session_id.is_empty() ? current_session : p_session_id;
+	state_mutex.unlock();
+	if (dir.is_empty()) {
+		_emit_error("No project directory: open a project first.");
+		return ERR_INVALID_PARAMETER;
+	}
+	if (session.is_empty()) {
+		session = "acp-" + p_boss_id;
+	}
+
+	// `npm prefix -g` is a subprocess: ask once per editor run.
+	static const String npm_prefix = LagoonicCodingAgents::npm_global_prefix();
+	const Vector<String> dirs = LagoonicCodingAgents::host_search_dirs(npm_prefix);
+	const Vector<String> command = String::utf8(agent->acp).split(" ", false);
+	const String adapter = lagoonic_find_on_host(command[0], dirs);
+	if (adapter.is_empty()) {
+		String how;
+		if (agent->acp_install != nullptr) {
+			how = String::utf8(" Instala su conector para el chat con: ") + String::utf8(agent->acp_install);
+		}
+		_emit_error(vformat(String::utf8("%s no está listo para el chat.%s"), name, how));
+		return ERR_FILE_NOT_FOUND;
+	}
+	String path_value;
+	for (int i = 0; i < dirs.size(); i++) {
+		if (!dirs[i].is_empty()) {
+			path_value += (path_value.is_empty() ? "" : (LagoonicCodingAgents::is_windows() ? ";" : ":")) + dirs[i];
+		}
+	}
+
+	// lagoonic-mcp gives the agent the Godot tools, like OpenCode's config.
+	Array mcp_servers;
+	const Vector<String> mcp_command = LagoonicMcpLocator::command();
+	if (mcp_command.is_empty()) {
+		WARN_PRINT("Lagoonic: lagoonic-mcp was not found, so the agent has no Godot tools.");
+	} else {
+		Array mcp_env;
+		const char *env_names[3] = { "GODOT_PATH", "LAGOONIC_PLATFORM", "PATH" };
+		const String env_values[3] = { OS::get_singleton()->get_executable_path(), "desktop", path_value };
+		for (int i = 0; i < 3; i++) {
+			Dictionary entry;
+			entry["name"] = String(env_names[i]);
+			entry["value"] = env_values[i];
+			mcp_env.push_back(entry);
+		}
+		Array mcp_args;
+		for (int i = 1; i < mcp_command.size(); i++) {
+			mcp_args.push_back(mcp_command[i]);
+		}
+		mcp_args.push_back("--project");
+		mcp_args.push_back(dir);
+		Dictionary server;
+		server["name"] = String("lagoonic");
+		server["command"] = mcp_command[0];
+		server["args"] = mcp_args;
+		server["env"] = mcp_env;
+		mcp_servers.push_back(server);
+	}
+
+	if (acp_runner.is_null()) {
+		acp_runner.instantiate();
+		acp_runner->connect(SNAME("acp_event"), callable_mp(this, &LagoonicRuntimeHost::_on_acp_event), CONNECT_DEFERRED);
+		acp_runner->connect(SNAME("acp_permission"), callable_mp(this, &LagoonicRuntimeHost::_on_acp_permission), CONNECT_DEFERRED);
+	}
+	acp_bin = adapter;
+	acp_args.clear();
+	for (int i = 1; i < command.size(); i++) {
+		acp_args.push_back(command[i]);
+	}
+	acp_env.clear();
+	if (!path_value.is_empty()) {
+		acp_env["PATH"] = path_value;
+	}
+	acp_mcp_servers = mcp_servers;
+	acp_cwd = dir;
+	acp_prompt = p_text;
+	acp_session = session;
+	acp_auto_approve = (p_mode == 0);
+	acp_busy.set();
+	acp_thread.start(&LagoonicRuntimeHost::_acp_thread_main, this);
+	return OK;
+}
+
+void LagoonicRuntimeHost::_acp_thread_main(void *p_userdata) {
+	LagoonicRuntimeHost *self = static_cast<LagoonicRuntimeHost *>(p_userdata);
+	const Dictionary result = self->acp_runner->run_turn(self->acp_bin, self->acp_args, self->acp_cwd, self->acp_env,
+			self->acp_mcp_servers, self->acp_prompt, Array(), self->acp_auto_approve, false, self->acp_session);
+	callable_mp(self, &LagoonicRuntimeHost::_on_acp_finished).call_deferred(result);
+}
+
+void LagoonicRuntimeHost::_on_acp_event(const Dictionary &p_event) {
+	Dictionary event = p_event;
+	if (String(event.get("type", "")) == "permission") {
+		Dictionary request = event.get("request", Dictionary());
+		if (!request.has("sessionId")) {
+			request["sessionId"] = String(request.get("session_id", acp_session));
+			event["request"] = request;
+		}
+	}
+	_emit_event(event);
+}
+
+void LagoonicRuntimeHost::_on_acp_permission(const Dictionary &p_request) {
+	Dictionary request = p_request;
+	request["sessionId"] = String(request.get("session_id", acp_session));
+	Dictionary event;
+	event["type"] = String("permission");
+	event["session_id"] = request["sessionId"];
+	event["request"] = request;
+	_emit_event(event);
+}
+
+void LagoonicRuntimeHost::_on_acp_finished(const Dictionary &p_result) {
+	acp_busy.clear();
+	if (acp_thread.is_started()) {
+		acp_thread.wait_to_finish();
+	}
+	if (!bool(p_result.get("ok", false))) {
+		String message = String(p_result.get("error", ""));
+		if (message.is_empty()) {
+			message = String::utf8("El agente terminó sin responder.");
+		}
+		_emit_error(message);
+		Dictionary idle;
+		idle["type"] = String("busy");
+		idle["session_id"] = acp_session;
+		idle["busy"] = false;
+		_emit_event(idle);
+	}
 }
 
 Mutex *LagoonicRuntimeHost::get_client_mutex() const {

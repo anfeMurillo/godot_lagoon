@@ -261,6 +261,10 @@ x86/
 [Aa][Rr][Mm]64/
 bld/
 [Bb]in/
+# Lagoonic: versiona solo el README de layout del runtime PC (docs/PC_PACKAGING.md).
+![Bb]in/
+[Bb]in/*
+![Bb]in/README-runtime.md
 [Oo]bj/
 [Ll]og/
 [Ll]ogs/

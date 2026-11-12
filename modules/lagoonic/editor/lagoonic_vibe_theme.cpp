@@ -69,7 +69,15 @@ void _button_fonts(Ref<Theme> &t, const StringName &p_type, const Color &p_norma
 	t->set_color("icon_disabled_color", p_type, p_disabled);
 }
 
+struct CustomTheme {
+	String id;
+	String name;
+	Color main;
+	Color secondary;
+};
+
 struct ThemeState {
+	Vector<CustomTheme> customs;
 	bool loaded = false;
 	String preset_id = "laguna";
 	bool custom_accent = false;
@@ -112,6 +120,18 @@ void _load() {
 	if (s.custom_accent) {
 		s.accent = cf->get_value("theme", "accent", Color());
 	}
+	const Array customs = cf->get_value("custom_themes", "list", Array());
+	for (const Variant &v : customs) {
+		const Dictionary d = v;
+		CustomTheme ct;
+		ct.id = d.get("id", String());
+		ct.name = d.get("name", String());
+		ct.main = d.get("main", Color(0.1f, 0.1f, 0.12f));
+		ct.secondary = d.get("secondary", Color(0.16f, 0.78f, 0.91f));
+		if (ct.id.begins_with("custom_")) {
+			s.customs.push_back(ct);
+		}
+	}
 }
 
 void _save_and_notify() {
@@ -125,6 +145,18 @@ void _save_and_notify() {
 			cf->set_value("theme", "accent", s.accent);
 		}
 		cf->set_value("ui", "animations", s.animations);
+		Array customs;
+		for (const CustomTheme &ct : s.customs) {
+			Dictionary d;
+			d["id"] = ct.id;
+			d["name"] = ct.name;
+			d["main"] = ct.main;
+			d["secondary"] = ct.secondary;
+			customs.push_back(d);
+		}
+		if (!customs.is_empty()) {
+			cf->set_value("custom_themes", "list", customs);
+		}
 		cf->save(path);
 	}
 	LagoonicVibeTheme::apply_to_editor();
@@ -146,6 +178,22 @@ LagoonicVibeTheme::Palette _make(const char *p_id, const char *p_name, Color bg,
 	p.on_accent = on_acc;
 	p.light = light;
 	return p;
+}
+
+// Paleta a partir de un preset de color del editor de Godot (base + acento):
+// los presets de "Ajustes rapidos" viven aqui, como un tema mas de Lagoonic.
+LagoonicVibeTheme::Palette _from_godot(const char *p_id, const char *p_name, const Color &p_base, const Color &p_accent, bool p_light = false) {
+	const Color on_acc = p_accent.get_luminance() > 0.55f ? Color(0.05f, 0.06f, 0.08f) : Color(1, 1, 1);
+	if (p_light) {
+		const Color txt(0.11f, 0.12f, 0.15f);
+		return _make(p_id, p_name, p_base, p_base.lerp(Color(1, 1, 1), 0.6f), p_base.darkened(0.05f), p_base.darkened(0.16f),
+				p_accent, txt, txt.lerp(p_base, 0.45f), p_base.lerp(Color(1, 1, 1), 0.75f), on_acc, true);
+	}
+	// Base negra (OLED): las tarjetas necesitan algo de luz para distinguirse.
+	const Color surf = p_base.get_luminance() < 0.02f ? Color(0.06f, 0.06f, 0.07f) : p_base;
+	const Color txt(0.93f, 0.94f, 0.96f);
+	return _make(p_id, p_name, surf.darkened(0.3f), surf, surf.lightened(0.07f), Color(surf.lightened(0.2f), 0.9f),
+			p_accent, txt, txt.lerp(surf, 0.4f), surf.darkened(0.15f), on_acc);
 }
 
 } // namespace
@@ -412,6 +460,16 @@ const Vector<LagoonicVibeTheme::Palette> &LagoonicVibeTheme::presets() {
 		list.push_back(_make("lavanda", "Lavanda (claro)",
 				Color(0.96f, 0.955f, 0.985f), Color(1, 1, 1), Color(0.93f, 0.92f, 0.98f), Color(0.83f, 0.81f, 0.92f),
 				Color(0.46f, 0.33f, 0.9f), Color(0.13f, 0.1f, 0.22f), Color(0.45f, 0.42f, 0.56f), Color(0.985f, 0.98f, 1), Color(1, 1, 1), true));
+		// Presets de color del editor de Godot (mismos base y acento que upstream).
+		list.push_back(_from_godot("godot", "Godot", Color(0.161f, 0.161f, 0.161f), Color(0.337f, 0.62f, 1.0f)));
+		list.push_back(_from_godot("breeze_dark", "Breeze Dark", Color(0.1255f, 0.1373f, 0.149f), Color(0.239f, 0.682f, 0.914f)));
+		list.push_back(_from_godot("godot_2", "Godot 2", Color(0.24f, 0.23f, 0.27f), Color(0.53f, 0.67f, 0.89f)));
+		list.push_back(_from_godot("godot_3", "Godot 3", Color(0.21f, 0.24f, 0.29f), Color(0.44f, 0.73f, 0.98f)));
+		list.push_back(_from_godot("gris", "Gris", Color(0.24f, 0.24f, 0.24f), Color(0.44f, 0.73f, 0.98f)));
+		list.push_back(_from_godot("oled", "Negro (OLED)", Color(0, 0, 0), Color(0.45f, 0.75f, 1.0f)));
+		list.push_back(_from_godot("solarized_dark", "Solarized oscuro", Color(0.03f, 0.21f, 0.26f), Color(0.15f, 0.55f, 0.82f)));
+		list.push_back(_from_godot("godot_light", "Godot (claro)", Color(0.9f, 0.9f, 0.9f), Color(0.18f, 0.50f, 1.00f), true));
+		list.push_back(_from_godot("solarized_light", "Solarized claro", Color(0.89f, 0.86f, 0.79f), Color(0.15f, 0.55f, 0.82f), true));
 	}
 	return list;
 }
@@ -425,7 +483,7 @@ LagoonicVibeTheme::Palette LagoonicVibeTheme::current() {
 	_load();
 	const ThemeState &s = _state();
 	Palette p = presets()[0];
-	for (const Palette &candidate : presets()) {
+	for (const Palette &candidate : all_palettes()) {
 		if (candidate.id == s.preset_id) {
 			p = candidate;
 			break;
@@ -436,6 +494,91 @@ LagoonicVibeTheme::Palette LagoonicVibeTheme::current() {
 		p.on_accent = s.accent.get_luminance() > 0.55f ? Color(0.05f, 0.07f, 0.10f) : Color(1, 1, 1);
 	}
 	return p;
+}
+
+Vector<LagoonicVibeTheme::Palette> LagoonicVibeTheme::all_palettes() {
+	_load();
+	Vector<Palette> list = presets();
+	for (const CustomTheme &ct : _state().customs) {
+		list.push_back(palette_from_colors(ct.id, ct.name, ct.main, ct.secondary));
+	}
+	return list;
+}
+
+LagoonicVibeTheme::Palette LagoonicVibeTheme::palette_from_colors(const String &p_id, const String &p_name, const Color &p_main, const Color &p_secondary) {
+	const Color main(p_main, 1.0f);
+	Palette p = _from_godot("", "", main, Color(p_secondary, 1.0f), main.get_luminance() > 0.5f);
+	p.id = p_id;
+	p.name = p_name;
+	return p;
+}
+
+bool LagoonicVibeTheme::is_custom(const String &p_id) {
+	String name;
+	Color main, secondary;
+	return get_custom(p_id, name, main, secondary);
+}
+
+bool LagoonicVibeTheme::get_custom(const String &p_id, String &r_name, Color &r_main, Color &r_secondary) {
+	_load();
+	for (const CustomTheme &ct : _state().customs) {
+		if (ct.id == p_id) {
+			r_name = ct.name;
+			r_main = ct.main;
+			r_secondary = ct.secondary;
+			return true;
+		}
+	}
+	return false;
+}
+
+String LagoonicVibeTheme::save_custom(const String &p_id, const String &p_name, const Color &p_main, const Color &p_secondary) {
+	_load();
+	ThemeState &s = _state();
+	const String name = p_name.strip_edges().is_empty() ? String::utf8("Mi tema") : p_name.strip_edges();
+	String id = p_id;
+	bool found = false;
+	for (CustomTheme &ct : s.customs) {
+		if (!id.is_empty() && ct.id == id) {
+			ct.name = name;
+			ct.main = Color(p_main, 1.0f);
+			ct.secondary = Color(p_secondary, 1.0f);
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		int n = 1;
+		while (is_custom("custom_" + itos(n))) {
+			n++;
+		}
+		CustomTheme ct;
+		ct.id = "custom_" + itos(n);
+		ct.name = name;
+		ct.main = Color(p_main, 1.0f);
+		ct.secondary = Color(p_secondary, 1.0f);
+		s.customs.push_back(ct);
+		id = ct.id;
+	}
+	s.preset_id = id;
+	s.custom_accent = false; // El secundario del tema manda.
+	_save_and_notify();
+	return id;
+}
+
+void LagoonicVibeTheme::delete_custom(const String &p_id) {
+	_load();
+	ThemeState &s = _state();
+	for (int i = 0; i < s.customs.size(); i++) {
+		if (s.customs[i].id == p_id) {
+			s.customs.remove_at(i);
+			break;
+		}
+	}
+	if (s.preset_id == p_id) {
+		s.preset_id = presets()[0].id;
+	}
+	_save_and_notify();
 }
 
 void LagoonicVibeTheme::set_preset(const String &p_id) {
@@ -582,7 +725,7 @@ Ref<Theme> LagoonicVibeTheme::build() {
 	// Burbuja del agente: tarjeta oscura, pico arriba a la izquierda.
 	t->set_type_variation(AGENT_BUBBLE, "PanelContainer");
 	{
-		Ref<StyleBoxFlat> sb = _flat(surf, brd, 18, 16, 12);
+		Ref<StyleBoxFlat> sb = _flat(surf, Color(brd, 0.45f), 18, 18, 14);
 		sb->set_corner_radius(CORNER_TOP_LEFT, (int)_s(5));
 		t->set_stylebox("panel", AGENT_BUBBLE, sb);
 	}

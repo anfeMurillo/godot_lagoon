@@ -32,6 +32,7 @@
 
 #include "lagoonic_agent_dock.h"
 #include "lagoonic_agent_settings.h"
+#include "lagoonic_model_catalog.h"
 #include "lagoonic_vibe_theme.h"
 
 #include "core/config/engine.h"
@@ -206,6 +207,7 @@ void LagoonicDock::_ensure_runtime_host() {
 		return;
 	}
 	runtime_host.instantiate();
+	runtime_host->set_opencode_bin(LagoonicModelCatalog::opencode_binary());
 	runtime_host->connect(SNAME("runtime_event"), callable_mp(this, &LagoonicDock::_on_runtime_event));
 	runtime_host->connect(SNAME("runtime_status"), callable_mp(this, &LagoonicDock::_on_runtime_status));
 }
@@ -214,9 +216,17 @@ void LagoonicDock::_on_runtime_event(const Dictionary &p_event) {
 	if (agent_dock != nullptr) {
 		agent_dock->hook_push_agent_event(p_event);
 	}
+	// Al terminar un turno el servidor ya puso titulo al chat: refresca.
+	if (String(p_event.get("type", "")) == "busy" && !bool(p_event.get("busy", true)) && runtime_host.is_valid() && agent_dock != nullptr && agent_dock->get_chat_view() != nullptr) {
+		agent_dock->get_chat_view()->set_sessions(runtime_host->list_sessions());
+	}
 }
 
 void LagoonicDock::_on_runtime_status(const String &p_status) {
+	if (p_status.begins_with("session:") && agent_dock != nullptr && agent_dock->get_chat_view() != nullptr) {
+		// El host creo o cambio la sesion (p. ej. al primer envio).
+		agent_dock->get_chat_view()->set_current_session(p_status.substr(8));
+	}
 	if (agent_dock != nullptr) {
 		const bool up = runtime_host.is_valid() && runtime_host->is_server_up();
 		agent_dock->hook_set_connection(up);
@@ -237,15 +247,30 @@ void LagoonicDock::_on_agent_event(const StringName &p_event, const Variant &p_a
 		if (model.is_empty()) {
 			model = LagoonicAgentSettings::get_model(); // Configuracion > Agentes.
 		}
-		if (runtime_host->ensure_server(cwd, model, LagoonicAgentSettings::secret_env()) == OK) {
+		// Configuracion > Equipo is the source of truth for the boss; the
+		// chat picker writes there too (boss_changed below).
+		const String boss = LagoonicAgentSettings::get_boss();
+		if (chat != nullptr) {
+			chat->set_boss_agent(boss);
+		}
+		runtime_host->set_crew_boss(boss);
+		if (boss != "opencode") {
+			// Claude Code, Codex... answer through their ACP adapter: no
+			// OpenCode server needed for this turn.
+			runtime_host->set_project_dir(cwd);
+			if (runtime_host->send_prompt(session, String(p_a), mode, model) != OK && chat != nullptr) {
+				chat->set_busy(false);
+			}
+		} else if (runtime_host->ensure_server(cwd, model, LagoonicAgentSettings::secret_env()) == OK) {
 			if (!crew_applied) {
 				// Configuracion > Equipo: necesita la carpeta del proyecto, que
 				// el host conoce tras ensure_server().
-				const String boss = (chat != nullptr) ? chat->get_boss_agent() : LagoonicAgentSettings::get_boss();
 				runtime_host->set_crew(boss, LagoonicAgentSettings::crew_workers());
 				crew_applied = true;
 			}
-			runtime_host->send_prompt(session, String(p_a), mode, model);
+			runtime_host->send_prompt(session, String(p_a), mode, model, (chat != nullptr) ? chat->get_effort() : LagoonicAgentSettings::get_effort());
+		} else if (chat != nullptr) {
+			chat->set_busy(false);
 		}
 	} else if (p_event == SNAME("abort_requested")) {
 		runtime_host->abort();
@@ -253,14 +278,16 @@ void LagoonicDock::_on_agent_event(const StringName &p_event, const Variant &p_a
 		runtime_host->respond_permission(String(p_a), int(p_b));
 	} else if (p_event == SNAME("revert_requested")) {
 		runtime_host->revert_message(String(p_a));
-	} else if (p_event == SNAME("new_session_requested")) {
-		const String sid = runtime_host->create_session(String());
-		if (!sid.is_empty() && chat != nullptr) {
-			chat->set_current_session(sid);
-		}
-	} else if (p_event == SNAME("session_selected")) {
-		runtime_host->select_session(String(p_a));
+	} else if (agent_dock != nullptr && agent_dock->handle_session_event(runtime_host, p_event, p_a, cwd, LagoonicAgentSettings::secret_env(), (chat != nullptr && !chat->get_current_model().is_empty()) ? chat->get_current_model() : LagoonicAgentSettings::get_model())) {
+		// Chats del proyecto: nuevo, cambiar, borrar, listar.
+	} else if (p_event == SNAME("mode_changed")) {
+		LagoonicAgentSettings::set_mode(int(p_a)); // El chat recuerda la ultima eleccion.
+	} else if (p_event == SNAME("model_changed")) {
+		LagoonicAgentSettings::set_model(String(p_a));
+	} else if (p_event == SNAME("effort_changed")) {
+		LagoonicAgentSettings::set_effort(String(p_a));
 	} else if (p_event == SNAME("boss_changed")) {
+		LagoonicAgentSettings::set_boss(String(p_a)); // Same choice as Configuracion > Equipo.
 		runtime_host->set_crew_boss(String(p_a));
 	} else if (p_event == SNAME("worker_toggled")) {
 		runtime_host->set_crew_worker(String(p_a), bool(p_b));

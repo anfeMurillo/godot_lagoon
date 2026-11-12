@@ -3,17 +3,23 @@
 /**************************************************************************/
 /*  Configuracion de Lagoonic (capa sobre el inicio). Secciones:          */
 /*  Temas (colores, acento, animaciones), Agentes (agente principal,      */
-/*  modo, modelo y claves), Equipo (orquestacion) e Idioma.               */
+/*  modo, modelo y claves), Equipo (orquestacion), Editor (escala, red,   */
+/*  actualizaciones, carpetas) e Idioma.                                  */
 /**************************************************************************/
 
 #pragma once
 
 #include "scene/gui/control.h"
 
+#include "lagoonic_vibe_theme.h"
+
 class Button;
 class CheckBox;
 class CheckButton;
-class ColorPickerButton;
+class GridContainer;
+class HBoxContainer;
+class LagoonicSwatchPicker;
+class PanelContainer;
 class InputEvent;
 class Label;
 class LineEdit;
@@ -27,6 +33,7 @@ class LagoonicSettingsPanel : public Control {
 		SECTION_THEMES,
 		SECTION_AGENTS,
 		SECTION_CREW,
+		SECTION_EDITOR,
 		SECTION_LANGUAGE,
 		SECTION_COUNT,
 	};
@@ -42,12 +49,38 @@ class LagoonicSettingsPanel : public Control {
 	Button *nav_buttons[SECTION_COUNT] = {};
 	VBoxContainer *sections[SECTION_COUNT] = {};
 
+	enum ColorEditorMode {
+		EDITOR_NEW_THEME,
+		EDITOR_EDIT_THEME,
+		EDITOR_ACCENT,
+	};
+
 	// Temas.
+	GridContainer *theme_grid = nullptr;
+	Vector<LagoonicVibeTheme::Palette> grid_palettes;
 	Vector<Button *> preset_buttons;
+	HBoxContainer *custom_row = nullptr;
+	Label *custom_label = nullptr;
 	Vector<Button *> accent_chips;
-	ColorPickerButton *accent_picker = nullptr;
 	Button *accent_reset = nullptr;
 	CheckButton *animations_toggle = nullptr;
+	OptionButton *style_option = nullptr;
+
+	// Editor de color (tema propio o acento).
+	Control *editor_layer = nullptr;
+	PanelContainer *editor_card = nullptr;
+	Label *editor_title = nullptr;
+	HBoxContainer *editor_theme_box = nullptr;
+	Control *editor_preview = nullptr;
+	LineEdit *editor_name = nullptr;
+	Vector<Button *> editor_slots;
+	Vector<Control *> editor_slot_dots;
+	LagoonicSwatchPicker *editor_picker = nullptr;
+	Button *editor_save = nullptr;
+	int editor_mode = EDITOR_NEW_THEME;
+	int editor_slot = 0;
+	String editor_theme_id;
+	Color editor_colors[2];
 
 	// Agentes.
 	Vector<String> boss_ids;
@@ -69,6 +102,16 @@ class LagoonicSettingsPanel : public Control {
 	Vector<CheckBox *> crew_checks;
 	Vector<String> crew_ids;
 
+	// Editor (lo que antes estaba en los Ajustes rapidos de Godot).
+	OptionButton *scale_option = nullptr;
+	OptionButton *network_option = nullptr;
+	OptionButton *updates_option = nullptr;
+	OptionButton *naming_option = nullptr;
+	Control *editor_restart_row = nullptr;
+	Button *all_settings_button = nullptr;
+	Callable all_settings_callback;
+	int scale_at_open = -1;
+
 	// Idioma.
 	OptionButton *language_option = nullptr;
 	Vector<String> language_codes;
@@ -79,6 +122,7 @@ class LagoonicSettingsPanel : public Control {
 	VBoxContainer *_build_themes();
 	VBoxContainer *_build_agents();
 	VBoxContainer *_build_crew();
+	VBoxContainer *_build_editor();
 	VBoxContainer *_build_language();
 	void _show_section(int p_section);
 	void _sync_from_palette();
@@ -86,7 +130,18 @@ class LagoonicSettingsPanel : public Control {
 
 	void _on_preset_pressed(int p_index);
 	void _on_accent_chip_pressed(int p_index);
-	void _on_accent_changed(const Color &p_color);
+	void _rebuild_theme_grid();
+	static void _paint_palette(Control *p_canvas, const LagoonicVibeTheme::Palette &p_palette);
+	void _on_edit_custom_pressed();
+	void _on_delete_custom_pressed();
+	void _build_color_editor();
+	void _open_color_editor(int p_mode);
+	void _close_color_editor();
+	void _select_slot(int p_slot);
+	void _on_editor_color_changed(const Color &p_color);
+	void _draw_slot_dot(int p_slot);
+	void _draw_editor_preview();
+	void _on_editor_save();
 	void _on_accent_reset();
 	void _on_animations_toggled(bool p_on);
 	void _on_dim_input(const Ref<InputEvent> &p_event);
@@ -108,6 +163,14 @@ class LagoonicSettingsPanel : public Control {
 	void _on_crew_toggled(bool p_on);
 	void _on_crew_worker_toggled(bool p_on, int p_index);
 
+	void _sync_editor();
+	void _on_style_selected(int p_index);
+	void _on_scale_selected(int p_index);
+	void _on_network_selected(int p_index);
+	void _on_updates_selected(int p_index);
+	void _on_naming_selected(int p_index);
+	void _on_all_settings_pressed();
+
 	static String _current_language();
 	void _sync_language();
 	void _on_language_selected(int p_index);
@@ -120,6 +183,8 @@ protected:
 public:
 	void open();
 	void close();
+	// "Todos los ajustes del editor": solo donde hay a quien pedirselo (inicio).
+	void set_all_settings_callback(const Callable &p_callback);
 
 	LagoonicSettingsPanel();
 };

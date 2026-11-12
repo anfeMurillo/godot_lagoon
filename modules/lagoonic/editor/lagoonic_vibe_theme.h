@@ -58,6 +58,18 @@ public:
 
 	// Temas predefinidos (Configuracion > Temas).
 	static const Vector<Palette> &presets();
+	// Predefinidos + los que crea el usuario, en el orden de la rejilla.
+	static Vector<Palette> all_palettes();
+	// Paleta completa a partir de dos colores: principal (fondo) y secundario
+	// (acento). Si el principal es claro, el tema es claro.
+	static Palette palette_from_colors(const String &p_id, const String &p_name, const Color &p_main, const Color &p_secondary);
+
+	// Temas del usuario (id "custom_N"), guardados en lagoonic_theme.cfg.
+	static bool is_custom(const String &p_id);
+	static bool get_custom(const String &p_id, String &r_name, Color &r_main, Color &r_secondary);
+	// Crea (id vacio) o actualiza un tema propio, lo activa y devuelve su id.
+	static String save_custom(const String &p_id, const String &p_name, const Color &p_main, const Color &p_secondary);
+	static void delete_custom(const String &p_id);
 	// Paleta activa: preset elegido + acento personalizado si lo hay.
 	static Palette current();
 	static String get_preset_id();

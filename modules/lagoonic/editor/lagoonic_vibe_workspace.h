@@ -52,7 +52,9 @@ class LagoonicVibeWorkspace : public PanelContainer {
 
 public:
 	static constexpr int WATER_HEADER_HEIGHT = 120;
-	static constexpr int CENTER_COLUMN_MAX_WIDTH = 920;
+	static constexpr int CHAT_WATER_HEIGHT = 76; // Agua en la cabecera de la tarjeta del chat.
+	static constexpr int TOP_BAR_HEIGHT = 56;
+	static constexpr int CENTER_COLUMN_MAX_WIDTH = 880;
 
 private:
 	static inline LagoonicVibeWorkspace *singleton = nullptr;
@@ -88,6 +90,24 @@ private:
 	Ref<StyleBoxFlat> return_pill_hover_style;
 
 	LagoonicWaterCaustics *water_caustics = nullptr;
+
+	// --- Bento: el chat es la tarjeta principal; el resto se anade ---
+	class LagoonicBentoBoard *bento_board = nullptr;
+	class LagoonicBento *chat_bento = nullptr;
+	MarginContainer *chat_center = nullptr;
+	Label *chat_title_label = nullptr;
+	MarginContainer *top_bar_margin = nullptr;
+	Button *add_panel_button = nullptr;
+	class PopupMenu *add_panel_menu = nullptr;
+	void _update_chat_width();
+	void _update_title_margins();
+	void _on_add_panel_pressed();
+	void _on_add_panel_selected(int p_index);
+	void _open_bento(const String &p_id, bool p_save = true);
+	void _close_bento(const String &p_id);
+	void _save_bentos();
+	void _restore_bentos();
+	Array _get_changes();
 	Button *projects_button = nullptr;
 	Label *project_title_label = nullptr;
 	Button *play_button = nullptr;

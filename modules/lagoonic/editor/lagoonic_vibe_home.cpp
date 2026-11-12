@@ -11,11 +11,14 @@
 #include "scene/main/window.h"
 #include "servers/display/display_server.h"
 
+#include "lagoonic_about_dialog.h"
 #include "lagoonic_water_caustics.h"
+#include "lagoonic_pm_bridge.h"
 #include "lagoonic_settings_panel.h"
 #include "lagoonic_lily_veil.h"
 #include "lagoonic_vibe_theme.h"
 
+#include "core/config/project_settings.h"
 #include "core/input/input_event.h"
 #include "core/io/config_file.h"
 #include "core/io/dir_access.h"
@@ -28,15 +31,23 @@
 #include "editor/editor_string_names.h"
 #include "editor/file_system/editor_paths.h"
 #include "editor/gui/editor_file_dialog.h"
+#include "editor/project_manager/project_dialog.h"
+#include "editor/project_manager/project_manager.h"
+#include "editor/settings/editor_settings.h"
 #include "editor/themes/editor_scale.h"
 #include "main/main.h"
 #include "scene/gui/box_container.h"
 #include "scene/gui/button.h"
+#include "scene/gui/flow_container.h"
 #include "scene/gui/label.h"
+#include "scene/gui/line_edit.h"
 #include "scene/gui/margin_container.h"
+#include "scene/gui/option_button.h"
+#include "scene/gui/popup_menu.h"
 #include "scene/gui/scroll_container.h"
 #include "scene/gui/separator.h"
 #include "scene/gui/text_edit.h"
+#include "scene/gui/texture_rect.h"
 #include "scene/main/scene_tree.h"
 
 namespace {
@@ -50,6 +61,28 @@ struct ProjectEntryComparator {
 		}
 		return p_a.name.nocasecmp_to(p_b.name) < 0;
 	}
+};
+
+// Lo que pinta una tarjeta, venga de la lista clasica o del respaldo propio.
+struct CardData {
+	String name;
+	String path;
+	String description;
+	String meta;
+	PackedStringArray tags;
+	Ref<Texture2D> icon;
+	bool favorite = false;
+	bool missing = false;
+};
+
+enum CardMenuId {
+	CARD_MENU_OPEN_VERBOSE,
+	CARD_MENU_OPEN_RECOVERY,
+	CARD_MENU_SHOW_IN_FM,
+	CARD_MENU_RENAME,
+	CARD_MENU_DUPLICATE,
+	CARD_MENU_TAGS,
+	CARD_MENU_REMOVE,
 };
 } // namespace
 
@@ -91,7 +124,36 @@ void LagoonicVibeHome::_build_ui() {
 	main_scroll->set_horizontal_scroll_mode(ScrollContainer::SCROLL_MODE_DISABLED);
 	root_vbox->add_child(main_scroll);
 
-	// 3. Pie: Configuracion y Gestor clasico, abajo a la derecha.
+	// 2b. Vista de plantillas (AssetLib del gestor clasico), oculta hasta pedirla.
+	templates_view = memnew(VBoxContainer);
+	templates_view->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	templates_view->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+	templates_view->add_theme_constant_override("separation", 8);
+	templates_view->hide();
+	root_vbox->add_child(templates_view);
+
+	MarginContainer *templates_header_margin = memnew(MarginContainer);
+	templates_header_margin->add_theme_constant_override("margin_left", 18);
+	templates_header_margin->add_theme_constant_override("margin_right", 18);
+	templates_header_margin->add_theme_constant_override("margin_top", 8);
+	templates_view->add_child(templates_header_margin);
+
+	HBoxContainer *templates_header = memnew(HBoxContainer);
+	templates_header->add_theme_constant_override("separation", 10);
+	templates_header_margin->add_child(templates_header);
+
+	templates_back_button = memnew(Button);
+	templates_back_button->set_text(String::utf8("← Volver a tus proyectos"));
+	templates_back_button->set_focus_mode(Control::FOCUS_NONE);
+	templates_back_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_show_templates).bind(false));
+	templates_header->add_child(templates_back_button);
+
+	Label *templates_title = memnew(Label);
+	templates_title->set_text(String::utf8("Plantillas de proyecto · Biblioteca de recursos de Godot"));
+	templates_title->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+	templates_header->add_child(templates_title);
+
+	// 3. Pie: Configuracion, ajustes del editor y Acerca de, abajo a la derecha.
 	MarginContainer *footer_margin = memnew(MarginContainer);
 	footer_margin->add_theme_constant_override("margin_top", 8);
 	footer_margin->add_theme_constant_override("margin_bottom", 14);
@@ -107,17 +169,17 @@ void LagoonicVibeHome::_build_ui() {
 
 	settings_button = memnew(Button);
 	settings_button->set_text(String::utf8("Configuración"));
-	settings_button->set_tooltip_text(String::utf8("Temas y preferencias de Lagoonic"));
+	settings_button->set_tooltip_text(String::utf8("Temas, agentes, editor e idioma"));
 	settings_button->set_focus_mode(Control::FOCUS_NONE);
 	settings_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_on_settings_pressed));
 	top_bar_hbox->add_child(settings_button);
 
-	classic_pm_button = memnew(Button);
-	classic_pm_button->set_text(String::utf8("Gestor clásico de Godot"));
-	classic_pm_button->set_tooltip_text(String::utf8("Abrir el gestor de proyectos clásico de Godot (AssetLib, etiquetas, importación y migración)"));
-	classic_pm_button->set_focus_mode(Control::FOCUS_NONE);
-	classic_pm_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_on_classic_pm_pressed));
-	top_bar_hbox->add_child(classic_pm_button);
+	about_button = memnew(Button);
+	about_button->set_text(String::utf8("Acerca de"));
+	about_button->set_tooltip_text(String::utf8("Versión de Lagoonic, créditos y licencias"));
+	about_button->set_focus_mode(Control::FOCUS_NONE);
+	about_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_on_about_pressed));
+	top_bar_hbox->add_child(about_button);
 
 
 	MarginContainer *scroll_margin = memnew(MarginContainer);
@@ -195,6 +257,37 @@ void LagoonicVibeHome::_build_ui() {
 	new_game_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_on_new_game_pressed));
 	prompt_actions->add_child(new_game_button);
 
+	// Mas formas de empezar: los flujos del gestor clasico.
+	HFlowContainer *more_actions = memnew(HFlowContainer);
+	more_actions->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	more_actions->add_theme_constant_override("h_separation", 8);
+	more_actions->add_theme_constant_override("v_separation", 8);
+	column->add_child(more_actions);
+
+	create_project_button = memnew(Button);
+	create_project_button->set_text(String::utf8("Crear proyecto..."));
+	create_project_button->set_tooltip_text(String::utf8("Proyecto vacío eligiendo carpeta, renderizador y control de versiones (Ctrl+N)"));
+	create_project_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_on_create_project_pressed));
+	more_actions->add_child(create_project_button);
+
+	import_project_button = memnew(Button);
+	import_project_button->set_text(String::utf8("Importar..."));
+	import_project_button->set_tooltip_text(String::utf8("Importar un project.godot o un .zip de proyecto (Ctrl+I)"));
+	import_project_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_on_import_project_pressed));
+	more_actions->add_child(import_project_button);
+
+	scan_button = memnew(Button);
+	scan_button->set_text(String::utf8("Escanear..."));
+	scan_button->set_tooltip_text(String::utf8("Buscar proyectos de Godot dentro de una carpeta y añadirlos a la lista"));
+	scan_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_on_scan_pressed));
+	more_actions->add_child(scan_button);
+
+	templates_button = memnew(Button);
+	templates_button->set_text(String::utf8("Plantillas"));
+	templates_button->set_tooltip_text(String::utf8("Descargar plantillas y demos desde la biblioteca de recursos de Godot"));
+	templates_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_show_templates).bind(true));
+	more_actions->add_child(templates_button);
+
 	status_label = memnew(Label);
 	status_label->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
 	status_label->hide();
@@ -218,6 +311,54 @@ void LagoonicVibeHome::_build_ui() {
 	projects_count_label = memnew(Label);
 	projects_count_label->hide();
 	projects_header_hbox->add_child(projects_count_label);
+
+	Control *header_spacer = memnew(Control);
+	header_spacer->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	projects_header_hbox->add_child(header_spacer);
+
+	remove_missing_button = memnew(Button);
+	remove_missing_button->set_text(String::utf8("Quitar faltantes"));
+	remove_missing_button->set_tooltip_text(String::utf8("Quitar de la lista los proyectos cuya carpeta ya no existe (no borra archivos)"));
+	remove_missing_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_on_remove_missing_pressed));
+	remove_missing_button->hide();
+	projects_header_hbox->add_child(remove_missing_button);
+
+	HBoxContainer *filter_row = memnew(HBoxContainer);
+	filter_row->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	filter_row->add_theme_constant_override("separation", 8);
+	projects_section->add_child(filter_row);
+
+	search_edit = memnew(LineEdit);
+	search_edit->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	search_edit->set_placeholder(String::utf8("Buscar por nombre, ruta o tag:etiqueta (Ctrl+F)"));
+	search_edit->set_clear_button_enabled(true);
+	search_edit->connect(SceneStringName(text_changed), callable_mp(this, &LagoonicVibeHome::_on_search_changed));
+	filter_row->add_child(search_edit);
+
+	Label *sort_label = memnew(Label);
+	sort_label->set_text(String::utf8("Ordenar:"));
+	filter_row->add_child(sort_label);
+
+	sort_option = memnew(OptionButton);
+	sort_option->add_item(String::utf8("Última edición"));
+	sort_option->add_item(String::utf8("Nombre"));
+	sort_option->add_item(String::utf8("Ruta"));
+	sort_option->add_item(String::utf8("Etiquetas"));
+	sort_option->connect(SceneStringName(item_selected), callable_mp(this, &LagoonicVibeHome::_on_sort_selected));
+	filter_row->add_child(sort_option);
+
+	card_menu = memnew(PopupMenu);
+	card_menu->add_item(String::utf8("Abrir con salida detallada"), CARD_MENU_OPEN_VERBOSE);
+	card_menu->add_item(String::utf8("Abrir en modo recuperación"), CARD_MENU_OPEN_RECOVERY);
+	card_menu->add_separator();
+	card_menu->add_item(String::utf8("Mostrar en el gestor de archivos"), CARD_MENU_SHOW_IN_FM);
+	card_menu->add_item(String::utf8("Renombrar..."), CARD_MENU_RENAME);
+	card_menu->add_item(String::utf8("Duplicar..."), CARD_MENU_DUPLICATE);
+	card_menu->add_item(String::utf8("Etiquetas..."), CARD_MENU_TAGS);
+	card_menu->add_separator();
+	card_menu->add_item(String::utf8("Quitar de la lista..."), CARD_MENU_REMOVE);
+	card_menu->connect(SceneStringName(id_pressed), callable_mp(this, &LagoonicVibeHome::_on_card_menu_id));
+	add_child(card_menu);
 
 	empty_state_panel = memnew(PanelContainer);
 	empty_state_panel->set_h_size_flags(Control::SIZE_EXPAND_FILL);
@@ -247,6 +388,7 @@ void LagoonicVibeHome::_notification(int p_what) {
 			// Controles genericos (campo de texto, menus, scroll) con el tema Lagoonic.
 			set_theme(LagoonicVibeTheme::build());
 			_update_theme_styles();
+			_connect_classic();
 			callable_mp(this, &LagoonicVibeHome::_play_intro).call_deferred();
 			refresh_projects();
 		} break;
@@ -366,23 +508,14 @@ void LagoonicVibeHome::_update_theme_styles() {
 	subtle_btn_hover->set_bg_color(pal.surface_hover);
 	(void)is_dark;
 
-	if (settings_button) {
-		settings_button->add_theme_style_override(SNAME("normal"), subtle_btn_normal);
-		settings_button->add_theme_style_override(SceneStringName(hover), subtle_btn_hover);
-		settings_button->add_theme_style_override(SceneStringName(pressed), subtle_btn_hover);
-		settings_button->add_theme_color_override(SceneStringName(font_color), text_primary);
-	}
-	if (classic_pm_button) {
-		classic_pm_button->add_theme_style_override(SNAME("normal"), subtle_btn_normal);
-		classic_pm_button->add_theme_style_override(SceneStringName(hover), subtle_btn_hover);
-		classic_pm_button->add_theme_style_override(SceneStringName(pressed), subtle_btn_hover);
-		classic_pm_button->add_theme_color_override(SceneStringName(font_color), text_primary);
-	}
-	if (open_folder_button) {
-		open_folder_button->add_theme_style_override(SNAME("normal"), subtle_btn_normal);
-		open_folder_button->add_theme_style_override(SceneStringName(hover), subtle_btn_hover);
-		open_folder_button->add_theme_style_override(SceneStringName(pressed), subtle_btn_hover);
-		open_folder_button->add_theme_color_override(SceneStringName(font_color), text_primary);
+	flat_btn_normal.instantiate();
+	flat_btn_normal->set_bg_color(Color(0, 0, 0, 0));
+	flat_btn_normal->set_corner_radius_all((int)Math::round(6.0f * scale));
+	flat_btn_normal->set_content_margin_individual(6.0f * scale, 2.0f * scale, 6.0f * scale, 2.0f * scale);
+
+	for (Button *b : { settings_button, about_button, open_folder_button, create_project_button,
+				 import_project_button, scan_button, templates_button, remove_missing_button, templates_back_button }) {
+		_style_subtle(b);
 	}
 
 	if (title_label) {
@@ -476,6 +609,11 @@ String LagoonicVibeHome::_read_project_name(const String &p_project_dir) {
 }
 
 void LagoonicVibeHome::_register_project_in_config(const String &p_project_dir) {
+	if (pm_list != nullptr) {
+		// Por la lista clasica: escribir projects.cfg a mano lo pisaria su copia en memoria.
+		LagoonicPMBridge::register_project(pm_list, p_project_dir.simplify_path());
+		return;
+	}
 	if (!EditorPaths::get_singleton()) {
 		return;
 	}
@@ -567,18 +705,16 @@ String LagoonicVibeHome::create_vibe_project(const String &p_prompt_text) {
 }
 
 void LagoonicVibeHome::refresh_projects() {
-	if (!projects_list_vbox) {
+	projects.clear();
+
+	if (pm_list != nullptr) {
+		// La lista clasica es la fuente: favoritos, etiquetas, faltantes, orden y filtro.
+		_scan_lagoonic_folder();
+		_rebuild_project_cards();
 		return;
 	}
 
-	while (projects_list_vbox->get_child_count() > 0) {
-		Node *child = projects_list_vbox->get_child(0);
-		projects_list_vbox->remove_child(child);
-		memdelete(child);
-	}
-	project_cards.clear();
-	projects.clear();
-
+	// Respaldo (sin gestor clasico debajo): projects.cfg + ~/Documents/Lagoonic Projects.
 	HashSet<String> seen_paths;
 
 	auto add_candidate_project = [&](const String &p_raw_path, bool p_favorite) {
@@ -603,7 +739,6 @@ void LagoonicVibeHome::refresh_projects() {
 		projects.push_back(entry);
 	};
 
-	// 1. Read from EditorPaths::get_singleton()->get_data_dir().path_join("projects.cfg").
 	if (EditorPaths::get_singleton()) {
 		String cfg_path = EditorPaths::get_singleton()->get_data_dir().path_join("projects.cfg");
 		if (FileAccess::exists(cfg_path)) {
@@ -619,7 +754,6 @@ void LagoonicVibeHome::refresh_projects() {
 		}
 	}
 
-	// 2. Scan ~/Documents/Lagoonic Projects for any project folders.
 	String docs_dir = OS::get_singleton()->get_system_dir(OS::SYSTEM_DIR_DOCUMENTS);
 	if (!docs_dir.is_empty()) {
 		String lagoonic_dir = docs_dir.path_join("Lagoonic Projects");
@@ -639,43 +773,169 @@ void LagoonicVibeHome::refresh_projects() {
 
 	SortArray<ProjectEntry, ProjectEntryComparator> sorter;
 	sorter.sort(projects.ptrw(), projects.size());
+	_rebuild_project_cards();
+}
 
-	if (projects.is_empty()) {
-		if (empty_state_panel) {
-			empty_state_panel->show();
+void LagoonicVibeHome::_scan_lagoonic_folder() {
+	if (pm_list == nullptr) {
+		return;
+	}
+	String docs_dir = OS::get_singleton()->get_system_dir(OS::SYSTEM_DIR_DOCUMENTS);
+	if (docs_dir.is_empty()) {
+		return;
+	}
+	String lagoonic_dir = docs_dir.path_join("Lagoonic Projects");
+	Ref<DirAccess> da = DirAccess::open(lagoonic_dir);
+	if (da.is_null()) {
+		return;
+	}
+	HashSet<String> known;
+	for (const ProjectList::Item &item : LagoonicPMBridge::get_items(pm_list)) {
+		known.insert(item.path);
+	}
+	da->list_dir_begin();
+	String entry = da->get_next();
+	while (!entry.is_empty()) {
+		if (da->current_is_dir() && !entry.begins_with(".")) {
+			String dir = lagoonic_dir.path_join(entry).simplify_path();
+			if (!known.has(dir) && FileAccess::exists(dir.path_join("project.godot"))) {
+				LagoonicPMBridge::register_project(pm_list, dir);
+			}
 		}
-		if (projects_count_label) {
-			projects_count_label->hide();
-		}
+		entry = da->get_next();
+	}
+	da->list_dir_end();
+}
+
+void LagoonicVibeHome::_rebuild_project_cards() {
+	if (!projects_list_vbox) {
 		return;
 	}
 
-	if (empty_state_panel) {
-		empty_state_panel->hide();
+	while (projects_list_vbox->get_child_count() > 0) {
+		Node *child = projects_list_vbox->get_child(0);
+		projects_list_vbox->remove_child(child);
+		memdelete(child);
+	}
+	project_cards.clear();
+	missing_paths.clear();
+
+	Vector<CardData> cards;
+	int total = 0;
+	if (pm_list != nullptr) {
+		for (const ProjectList::Item &item : LagoonicPMBridge::get_items(pm_list)) {
+			total++;
+			if (item.missing) {
+				missing_paths.insert(item.path);
+			}
+			if (item.control && !item.control->is_visible()) {
+				continue; // Filtrado por la busqueda.
+			}
+			CardData card;
+			card.name = item.project_name;
+			card.path = item.path;
+			card.description = item.description;
+			card.tags = item.tags;
+			card.favorite = item.favorite;
+			card.missing = item.missing;
+			card.icon = LagoonicPMBridge::get_item_icon(item);
+			PackedStringArray meta;
+			if (!item.project_version.is_empty()) {
+				meta.push_back("Godot " + item.project_version);
+			}
+			meta.push_back(item.missing ? String::utf8("Carpeta no encontrada") : vformat(String::utf8("Editado %s"), item.get_last_edited_string()));
+			card.meta = String::utf8(" · ").join(meta);
+			cards.push_back(card);
+		}
+	} else {
+		const String term = search_edit ? search_edit->get_text().strip_edges() : String();
+		for (const ProjectEntry &proj : projects) {
+			total++;
+			if (!term.is_empty() && !proj.name.containsn(term) && !proj.path.containsn(term)) {
+				continue;
+			}
+			CardData card;
+			card.name = proj.name;
+			card.path = proj.path;
+			card.favorite = proj.favorite;
+			cards.push_back(card);
+		}
+	}
+
+	if (remove_missing_button) {
+		remove_missing_button->set_visible(pm_list != nullptr && !missing_paths.is_empty());
 	}
 	if (projects_count_label) {
-		projects_count_label->set_text(vformat("(%d)", projects.size()));
-		projects_count_label->show();
+		if (total == 0) {
+			projects_count_label->hide();
+		} else {
+			projects_count_label->set_text(cards.size() == total ? vformat("(%d)", total) : vformat("(%d de %d)", cards.size(), total));
+			projects_count_label->show();
+		}
+	}
+	if (empty_state_label) {
+		empty_state_label->set_text(total == 0
+						? String::utf8("Aún no hay proyectos · Crea un juego nuevo, importa uno o descarga una plantilla.")
+						: String::utf8("Ningún proyecto coincide con la búsqueda."));
+	}
+	if (empty_state_panel) {
+		empty_state_panel->set_visible(cards.is_empty());
+	}
+	if (cards.is_empty()) {
+		return;
 	}
 
 	const LagoonicVibeTheme::Palette pal = LagoonicVibeTheme::current();
-	const Color text_primary = pal.text;
-	const Color text_muted = pal.text_muted;
+	const float scale = EDSCALE > 0.0f ? EDSCALE : 1.0f;
 
-	for (const ProjectEntry &proj : projects) {
+	for (const CardData &proj : cards) {
 		PanelContainer *card = memnew(PanelContainer);
 		card->set_h_size_flags(Control::SIZE_EXPAND_FILL);
-		card->set_default_cursor_shape(Control::CURSOR_POINTING_HAND);
 		if (project_card_style.is_valid()) {
 			card->add_theme_style_override(SceneStringName(panel), project_card_style);
 		}
-		card->connect(SceneStringName(gui_input), callable_mp(this, &LagoonicVibeHome::_on_card_gui_input).bind(proj.path));
+		if (!proj.missing) {
+			card->set_default_cursor_shape(Control::CURSOR_POINTING_HAND);
+			card->connect(SceneStringName(gui_input), callable_mp(this, &LagoonicVibeHome::_on_card_gui_input).bind(proj.path));
+		}
+		if (!proj.description.is_empty()) {
+			card->set_tooltip_text(proj.description);
+		}
 
 		HBoxContainer *row = memnew(HBoxContainer);
 		row->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 		row->add_theme_constant_override("separation", 12);
 		row->set_mouse_filter(Control::MOUSE_FILTER_PASS);
 		card->add_child(row);
+
+		if (pm_list != nullptr) {
+			Button *fav_btn = memnew(Button);
+			fav_btn->set_text(proj.favorite ? String::utf8("★") : String::utf8("☆"));
+			fav_btn->set_tooltip_text(proj.favorite ? String::utf8("Quitar de favoritos") : String::utf8("Añadir a favoritos"));
+			fav_btn->set_focus_mode(Control::FOCUS_NONE);
+			fav_btn->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+			_style_flat(fav_btn);
+			fav_btn->add_theme_font_size_override(SceneStringName(font_size), (int)Math::round(18.0f * scale));
+			const Color star = proj.favorite ? pal.accent : pal.text_muted;
+			fav_btn->add_theme_color_override(SceneStringName(font_color), star);
+			fav_btn->add_theme_color_override(SNAME("font_hover_color"), pal.accent);
+			fav_btn->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_on_favorite_pressed).bind(proj.path, !proj.favorite));
+			row->add_child(fav_btn);
+		}
+
+		if (proj.icon.is_valid()) {
+			TextureRect *icon = memnew(TextureRect);
+			icon->set_texture(proj.icon);
+			icon->set_expand_mode(TextureRect::EXPAND_IGNORE_SIZE);
+			icon->set_stretch_mode(TextureRect::STRETCH_KEEP_ASPECT_CENTERED);
+			icon->set_custom_minimum_size(Size2(40.0f, 40.0f) * scale);
+			icon->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+			icon->set_mouse_filter(Control::MOUSE_FILTER_PASS);
+			if (proj.missing) {
+				icon->set_modulate(Color(1, 1, 1, 0.5));
+			}
+			row->add_child(icon);
+		}
 
 		VBoxContainer *info_vbox = memnew(VBoxContainer);
 		info_vbox->set_h_size_flags(Control::SIZE_EXPAND_FILL);
@@ -684,18 +944,45 @@ void LagoonicVibeHome::refresh_projects() {
 		row->add_child(info_vbox);
 
 		Label *name_lbl = memnew(Label);
-		name_lbl->set_text(proj.name);
+		name_lbl->set_text(proj.missing ? vformat(String::utf8("%s (falta)"), proj.name) : proj.name);
 		name_lbl->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
-		name_lbl->add_theme_color_override(SceneStringName(font_color), text_primary);
+		name_lbl->add_theme_color_override(SceneStringName(font_color), proj.missing ? pal.text_muted : pal.text);
 		name_lbl->set_mouse_filter(Control::MOUSE_FILTER_PASS);
 		info_vbox->add_child(name_lbl);
 
 		Label *path_lbl = memnew(Label);
 		path_lbl->set_text(proj.path);
 		path_lbl->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
-		path_lbl->add_theme_color_override(SceneStringName(font_color), text_muted);
+		path_lbl->add_theme_color_override(SceneStringName(font_color), pal.text_muted);
 		path_lbl->set_mouse_filter(Control::MOUSE_FILTER_PASS);
 		info_vbox->add_child(path_lbl);
+
+		if (!proj.meta.is_empty() || !proj.tags.is_empty()) {
+			HFlowContainer *meta_row = memnew(HFlowContainer);
+			meta_row->add_theme_constant_override("h_separation", 6);
+			meta_row->set_mouse_filter(Control::MOUSE_FILTER_PASS);
+			info_vbox->add_child(meta_row);
+
+			if (!proj.meta.is_empty()) {
+				Label *meta_lbl = memnew(Label);
+				meta_lbl->set_text(proj.meta);
+				meta_lbl->add_theme_font_size_override(SceneStringName(font_size), (int)Math::round(12.0f * scale));
+				meta_lbl->add_theme_color_override(SceneStringName(font_color), pal.text_muted);
+				meta_lbl->set_mouse_filter(Control::MOUSE_FILTER_PASS);
+				meta_row->add_child(meta_lbl);
+			}
+			for (const String &tag : proj.tags) {
+				Button *tag_btn = memnew(Button);
+				tag_btn->set_text("#" + tag);
+				tag_btn->set_tooltip_text(vformat(String::utf8("Filtrar por la etiqueta \"%s\""), tag));
+				tag_btn->set_focus_mode(Control::FOCUS_NONE);
+				_style_flat(tag_btn);
+				tag_btn->add_theme_font_size_override(SceneStringName(font_size), (int)Math::round(12.0f * scale));
+				tag_btn->add_theme_color_override(SceneStringName(font_color), pal.accent);
+				tag_btn->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_on_tag_pressed).bind(tag));
+				meta_row->add_child(tag_btn);
+			}
+		}
 
 		HBoxContainer *btn_row = memnew(HBoxContainer);
 		btn_row->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
@@ -705,31 +992,313 @@ void LagoonicVibeHome::refresh_projects() {
 		Button *run_btn = memnew(Button);
 		run_btn->set_text(String::utf8("Ejecutar"));
 		run_btn->set_tooltip_text(vformat(String::utf8("Ejecutar %s"), proj.name));
-		if (subtle_btn_normal.is_valid()) {
-			run_btn->add_theme_style_override(SNAME("normal"), subtle_btn_normal);
-			run_btn->add_theme_style_override(SceneStringName(hover), subtle_btn_hover);
-			run_btn->add_theme_style_override(SceneStringName(pressed), subtle_btn_hover);
-			run_btn->add_theme_color_override(SceneStringName(font_color), text_primary);
-		}
+		run_btn->set_disabled(proj.missing);
+		_style_subtle(run_btn);
 		run_btn->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_run_project).bind(proj.path));
 		btn_row->add_child(run_btn);
 
 		Button *open_btn = memnew(Button);
 		open_btn->set_text(String::utf8("Abrir"));
 		open_btn->set_tooltip_text(vformat(String::utf8("Abrir %s en el editor de Vibe Coding"), proj.name));
-		if (primary_btn_normal.is_valid()) {
-			open_btn->add_theme_style_override(SNAME("normal"), primary_btn_normal);
-			open_btn->add_theme_style_override(SceneStringName(hover), primary_btn_hover);
-			open_btn->add_theme_style_override(SceneStringName(pressed), primary_btn_pressed);
-			open_btn->add_theme_color_override(SceneStringName(font_color), pal.on_accent);
-			open_btn->add_theme_color_override(SNAME("font_hover_color"), pal.on_accent);
-			open_btn->add_theme_color_override(SNAME("font_pressed_color"), pal.on_accent);
-		}
+		open_btn->set_disabled(proj.missing);
+		_style_primary(open_btn);
 		open_btn->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_open_project_in_editor).bind(proj.path));
 		btn_row->add_child(open_btn);
 
+		if (pm_list != nullptr) {
+			Button *more_btn = memnew(Button);
+			more_btn->set_text(String::utf8("···"));
+			more_btn->set_tooltip_text(String::utf8("Más acciones: renombrar, duplicar, etiquetas, quitar..."));
+			more_btn->set_focus_mode(Control::FOCUS_NONE);
+			_style_subtle(more_btn);
+			more_btn->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_on_card_menu_pressed).bind(proj.path, more_btn));
+			btn_row->add_child(more_btn);
+		}
+
 		projects_list_vbox->add_child(card);
 		project_cards.push_back(card);
+	}
+}
+
+void LagoonicVibeHome::_style_subtle(Button *p_button) const {
+	if (p_button == nullptr || subtle_btn_normal.is_null()) {
+		return;
+	}
+	const LagoonicVibeTheme::Palette pal = LagoonicVibeTheme::current();
+	p_button->add_theme_style_override(SNAME("normal"), subtle_btn_normal);
+	p_button->add_theme_style_override(SceneStringName(hover), subtle_btn_hover);
+	p_button->add_theme_style_override(SceneStringName(pressed), subtle_btn_hover);
+	p_button->add_theme_style_override(SNAME("disabled"), subtle_btn_normal);
+	p_button->add_theme_color_override(SceneStringName(font_color), pal.text);
+	p_button->add_theme_color_override(SNAME("font_disabled_color"), Color(pal.text_muted, 0.6f));
+}
+
+void LagoonicVibeHome::_style_primary(Button *p_button) const {
+	if (p_button == nullptr || primary_btn_normal.is_null()) {
+		return;
+	}
+	const LagoonicVibeTheme::Palette pal = LagoonicVibeTheme::current();
+	p_button->add_theme_style_override(SNAME("normal"), primary_btn_normal);
+	p_button->add_theme_style_override(SceneStringName(hover), primary_btn_hover);
+	p_button->add_theme_style_override(SceneStringName(pressed), primary_btn_pressed);
+	p_button->add_theme_style_override(SNAME("disabled"), subtle_btn_normal.is_valid() ? subtle_btn_normal : primary_btn_normal);
+	p_button->add_theme_color_override(SceneStringName(font_color), pal.on_accent);
+	p_button->add_theme_color_override(SNAME("font_hover_color"), pal.on_accent);
+	p_button->add_theme_color_override(SNAME("font_pressed_color"), pal.on_accent);
+	p_button->add_theme_color_override(SNAME("font_disabled_color"), Color(pal.text_muted, 0.6f));
+}
+
+void LagoonicVibeHome::_style_flat(Button *p_button) const {
+	if (p_button == nullptr || flat_btn_normal.is_null()) {
+		return;
+	}
+	p_button->add_theme_style_override(SNAME("normal"), flat_btn_normal);
+	p_button->add_theme_style_override(SceneStringName(hover), subtle_btn_hover.is_valid() ? subtle_btn_hover : flat_btn_normal);
+	p_button->add_theme_style_override(SceneStringName(pressed), flat_btn_normal);
+	p_button->add_theme_style_override(SNAME("focus"), flat_btn_normal);
+}
+
+void LagoonicVibeHome::_connect_classic() {
+	if (classic_connected) {
+		return;
+	}
+	pm = LagoonicPMBridge::as_project_manager(classic_pm_control);
+	pm_list = LagoonicPMBridge::get_list(pm);
+	if (pm == nullptr || pm_list == nullptr) {
+		pm = nullptr;
+		pm_list = nullptr;
+		for (Button *b : { create_project_button, import_project_button, scan_button, templates_button }) {
+			if (b) {
+				b->hide();
+			}
+		}
+		if (sort_option) {
+			// "Ordenar:" va justo antes del selector; sin lista clasica no hay orden.
+			if (Control *sort_label = Object::cast_to<Control>(sort_option->get_parent()->get_child(sort_option->get_index() - 1))) {
+				sort_label->hide();
+			}
+			sort_option->hide();
+		}
+		return;
+	}
+	classic_connected = true;
+
+	// El gestor clasico queda debajo, tapado: sus atajos no deben actuar a ciegas.
+	pm->set_process_shortcut_input(false);
+	set_process_shortcut_input(true);
+
+	const Callable refresh = callable_mp(this, &LagoonicVibeHome::_queue_refresh);
+	pm_list->connect(SNAME(ProjectList::SIGNAL_LIST_CHANGED), refresh);
+	if (ProjectDialog *dialog = LagoonicPMBridge::get_project_dialog(pm)) {
+		dialog->connect(SNAME("projects_updated"), refresh);
+		dialog->connect(SNAME("project_created"), refresh.unbind(2));
+		dialog->connect(SNAME("project_duplicated"), refresh.unbind(3));
+	}
+	for (ConfirmationDialog *dialog : LagoonicPMBridge::get_list_dialogs(pm)) {
+		if (dialog) {
+			dialog->connect(SceneStringName(confirmed), refresh);
+		}
+	}
+
+	if (sort_option) {
+		sort_option->select(LagoonicPMBridge::get_order_option(pm_list));
+	}
+	if (search_edit) {
+		search_edit->set_text(LagoonicPMBridge::get_search_term(pm_list));
+	}
+}
+
+void LagoonicVibeHome::_queue_refresh() {
+	if (refresh_queued) {
+		return;
+	}
+	refresh_queued = true;
+	callable_mp(this, &LagoonicVibeHome::_flush_refresh).call_deferred();
+}
+
+void LagoonicVibeHome::_flush_refresh() {
+	refresh_queued = false;
+	if (is_inside_tree()) {
+		refresh_projects();
+	}
+}
+
+bool LagoonicVibeHome::_select_for_action(const String &p_project_dir) {
+	if (pm == nullptr || pm_list == nullptr) {
+		_show_status(String::utf8("Esta acción necesita el gestor de proyectos de Godot, que no está disponible."), true);
+		return false;
+	}
+	if (!LagoonicPMBridge::select_only(pm_list, p_project_dir)) {
+		_show_status(vformat(String::utf8("El proyecto '%s' ya no está en la lista."), p_project_dir), true);
+		_queue_refresh();
+		return false;
+	}
+	_show_status(String());
+	return true;
+}
+
+void LagoonicVibeHome::_on_create_project_pressed() {
+	LagoonicPMBridge::new_project(pm);
+}
+
+void LagoonicVibeHome::_on_import_project_pressed() {
+	LagoonicPMBridge::import_project(pm);
+}
+
+void LagoonicVibeHome::_on_scan_pressed() {
+	LagoonicPMBridge::scan_projects(pm);
+}
+
+void LagoonicVibeHome::_on_about_pressed() {
+	// Dialogo propio con la marca de Lagoonic (el de Godot muestra su logo).
+	if (about_dialog == nullptr) {
+		about_dialog = memnew(LagoonicAboutDialog);
+		add_child(about_dialog);
+	}
+	about_dialog->popup_about();
+}
+
+void LagoonicVibeHome::_on_remove_missing_pressed() {
+	LagoonicPMBridge::erase_missing(pm);
+}
+
+void LagoonicVibeHome::_show_templates(bool p_show) {
+	if (p_show) {
+		if (asset_library == nullptr) {
+			asset_library = LagoonicPMBridge::get_asset_library(pm);
+			if (asset_library == nullptr) {
+				_show_status(String::utf8("La biblioteca de plantillas no está disponible en esta compilación."), true);
+				return;
+			}
+			// La AssetLib del gestor clasico se muda aqui: sigue conectada a su
+			// flujo de instalacion (dialogo "Instalar proyecto").
+			asset_library->reparent(templates_view, false);
+			asset_library->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+			asset_library->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+		}
+		// Igual que el gestor clasico: abrir la biblioteca activa el modo en linea.
+		if (EditorSettings::get_singleton() && (int)EDITOR_GET("network/connection/network_mode") == EditorSettings::NETWORK_OFFLINE) {
+			EditorSettings::get_singleton()->set_setting("network/connection/network_mode", EditorSettings::NETWORK_ONLINE);
+			EditorSettings::get_singleton()->notify_changes();
+			EditorSettings::get_singleton()->save();
+		}
+	}
+	if (main_scroll) {
+		main_scroll->set_visible(!p_show);
+	}
+	if (templates_view) {
+		templates_view->set_visible(p_show);
+	}
+	if (asset_library) {
+		asset_library->set_visible(p_show);
+	}
+	if (!p_show) {
+		_queue_refresh();
+	}
+}
+
+void LagoonicVibeHome::_on_search_changed(const String &p_text) {
+	if (pm_list != nullptr) {
+		pm_list->set_search_term(p_text.strip_edges());
+		pm_list->sort_projects(); // Aplica el filtro (oculta lo que no coincide).
+	}
+	_queue_refresh();
+}
+
+void LagoonicVibeHome::_on_sort_selected(int p_index) {
+	if (pm_list != nullptr) {
+		pm_list->set_order_option(p_index, true);
+	}
+	_queue_refresh();
+}
+
+void LagoonicVibeHome::_on_tag_pressed(const String &p_tag) {
+	if (pm_list == nullptr) {
+		return;
+	}
+	pm_list->add_search_tag(p_tag);
+	if (search_edit) {
+		search_edit->set_text(LagoonicPMBridge::get_search_term(pm_list));
+	}
+	_queue_refresh();
+}
+
+void LagoonicVibeHome::_on_favorite_pressed(const String &p_project_dir, bool p_favorite) {
+	LagoonicPMBridge::set_favorite(pm_list, p_project_dir, p_favorite);
+	_queue_refresh();
+}
+
+void LagoonicVibeHome::_on_card_menu_pressed(const String &p_project_dir, Button *p_button) {
+	if (card_menu == nullptr || p_button == nullptr) {
+		return;
+	}
+	card_menu_path = p_project_dir;
+	const bool missing = missing_paths.has(p_project_dir);
+	for (int id : { CARD_MENU_OPEN_VERBOSE, CARD_MENU_OPEN_RECOVERY, CARD_MENU_SHOW_IN_FM, CARD_MENU_RENAME, CARD_MENU_DUPLICATE, CARD_MENU_TAGS }) {
+		card_menu->set_item_disabled(card_menu->get_item_index(id), missing);
+	}
+	card_menu->reset_size();
+	const Vector2 pos = p_button->get_screen_position() + Vector2(0.0f, p_button->get_size().y);
+	card_menu->set_position(Vector2i(pos));
+	card_menu->popup();
+}
+
+void LagoonicVibeHome::_on_card_menu_id(int p_id) {
+	if (!_select_for_action(card_menu_path)) {
+		return;
+	}
+	switch (p_id) {
+		case CARD_MENU_OPEN_VERBOSE:
+			LagoonicPMBridge::open_selected_verbose(pm);
+			break;
+		case CARD_MENU_OPEN_RECOVERY:
+			LagoonicPMBridge::open_selected_recovery(pm);
+			break;
+		case CARD_MENU_SHOW_IN_FM:
+			LagoonicPMBridge::show_selected_in_file_manager(pm);
+			break;
+		case CARD_MENU_RENAME:
+			LagoonicPMBridge::rename_selected(pm);
+			break;
+		case CARD_MENU_DUPLICATE:
+			LagoonicPMBridge::duplicate_selected(pm);
+			break;
+		case CARD_MENU_TAGS:
+			LagoonicPMBridge::manage_tags_selected(pm);
+			break;
+		case CARD_MENU_REMOVE:
+			LagoonicPMBridge::erase_selected(pm);
+			break;
+	}
+}
+
+void LagoonicVibeHome::shortcut_input(const Ref<InputEvent> &p_event) {
+	Ref<InputEventKey> k = p_event;
+	if (k.is_null() || !k->is_pressed() || k->is_echo() || !k->is_command_or_control_pressed() || !is_visible_in_tree()) {
+		return;
+	}
+	switch (k->get_keycode()) {
+		case Key::F:
+			if (search_edit && main_scroll && main_scroll->is_visible()) {
+				search_edit->grab_focus();
+				search_edit->select_all();
+				accept_event();
+			}
+			break;
+		case Key::N:
+			if (pm) {
+				_on_create_project_pressed();
+				accept_event();
+			}
+			break;
+		case Key::I:
+			if (pm) {
+				_on_import_project_pressed();
+				accept_event();
+			}
+			break;
+		default:
+			break;
 	}
 }
 
@@ -743,19 +1312,12 @@ void LagoonicVibeHome::_on_palette_changed() {
 void LagoonicVibeHome::_on_settings_pressed() {
 	if (settings_panel == nullptr) {
 		settings_panel = memnew(LagoonicSettingsPanel);
+		if (pm != nullptr) {
+			settings_panel->set_all_settings_callback(callable_mp_static(&LagoonicPMBridge::show_all_editor_settings).bind(pm));
+		}
 		add_child(settings_panel);
 	}
 	settings_panel->open();
-}
-
-void LagoonicVibeHome::_on_classic_pm_pressed() {
-	if (classic_pm_control) {
-		classic_pm_control->show();
-	}
-	if (auto_hide_on_classic_pm) {
-		hide();
-	}
-	emit_signal("classic_pm_requested");
 }
 
 void LagoonicVibeHome::_on_open_folder_pressed() {
@@ -825,11 +1387,32 @@ void LagoonicVibeHome::_open_project_in_editor(const String &p_project_dir) {
 	}
 
 	_register_project_in_config(p_project_dir);
-	emit_signal("project_open_requested", p_project_dir);
 
 	if (immersing) {
 		return;
 	}
+
+	// Proyectos que necesitan los avisos del gestor clasico (version antigua o
+	// nueva, migracion 3.x -> 4.x, funciones no soportadas o un cierre fallido
+	// en el ultimo arranque): se abren con su flujo, que ofrece convertir,
+	// hacer copia de seguridad o entrar en modo recuperacion.
+	if (pm_list != nullptr) {
+		const String norm = p_project_dir.simplify_path();
+		for (const ProjectList::Item &item : LagoonicPMBridge::get_items(pm_list)) {
+			if (item.path != norm) {
+				continue;
+			}
+			if (item.version != ProjectSettings::CONFIG_VERSION || !item.unsupported_features.is_empty() || item.recovery_mode) {
+				if (_select_for_action(norm)) {
+					emit_signal("project_open_requested", p_project_dir);
+					LagoonicPMBridge::open_selected(pm);
+				}
+				return;
+			}
+			break;
+		}
+	}
+	emit_signal("project_open_requested", p_project_dir);
 	if (!LagoonicVibeTheme::animations_enabled() || !is_inside_tree()) {
 		_launch_editor(p_project_dir);
 		return;
@@ -952,6 +1535,14 @@ void LagoonicVibeHome::_run_project(const String &p_project_dir) {
 
 	emit_signal("project_run_requested", p_project_dir);
 
+	// Con el gestor clasico: su flujo avisa si falta la escena principal.
+	if (pm_list != nullptr) {
+		if (_select_for_action(p_project_dir.simplify_path())) {
+			LagoonicPMBridge::run_selected(pm);
+		}
+		return;
+	}
+
 	List<String> args;
 	for (const String &a : Main::get_forwardable_cli_arguments(Main::CLI_SCOPE_PROJECT)) {
 		args.push_back(a);
@@ -989,21 +1580,10 @@ Control *LagoonicVibeHome::get_classic_pm_control() const {
 	return classic_pm_control;
 }
 
-void LagoonicVibeHome::set_auto_hide_on_classic_pm(bool p_auto_hide) {
-	auto_hide_on_classic_pm = p_auto_hide;
-}
-
-bool LagoonicVibeHome::is_auto_hide_on_classic_pm() const {
-	return auto_hide_on_classic_pm;
-}
-
 void LagoonicVibeHome::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("refresh_projects"), &LagoonicVibeHome::refresh_projects);
 	ClassDB::bind_method(D_METHOD("create_vibe_project", "prompt_text"), &LagoonicVibeHome::create_vibe_project);
-	ClassDB::bind_method(D_METHOD("set_auto_hide_on_classic_pm", "auto_hide"), &LagoonicVibeHome::set_auto_hide_on_classic_pm);
-	ClassDB::bind_method(D_METHOD("is_auto_hide_on_classic_pm"), &LagoonicVibeHome::is_auto_hide_on_classic_pm);
 
-	ADD_SIGNAL(MethodInfo("classic_pm_requested"));
 	ADD_SIGNAL(MethodInfo("project_created", PropertyInfo(Variant::STRING, "project_dir"), PropertyInfo(Variant::STRING, "initial_prompt")));
 	ADD_SIGNAL(MethodInfo("project_open_requested", PropertyInfo(Variant::STRING, "project_dir")));
 	ADD_SIGNAL(MethodInfo("project_run_requested", PropertyInfo(Variant::STRING, "project_dir")));

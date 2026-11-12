@@ -371,6 +371,13 @@ void LagoonicAgentDock::hook_push_agent_event(const Dictionary &p_event) {
 	const String type = String(p_event.get("type", ""));
 	if (type == "message") {
 		const Dictionary message = p_event.get("message", Dictionary());
+		if (bool(p_event.get("history", false))) {
+			chat_view->add_history_message(message);
+			return;
+		}
+		if (String(message.get("role", "assistant")) == "user") {
+			return; // El chat ya pinta el mensaje del usuario al enviarlo.
+		}
 		chat_view->upsert_assistant_message(
 				String(message.get("id", "")),
 				String(message.get("text", "")));
@@ -384,11 +391,15 @@ void LagoonicAgentDock::hook_push_agent_event(const Dictionary &p_event) {
 					_lagoonic_tool_state(String(tool.get("state", "running"))),
 					String(tool.get("detail", "")));
 		}
+		if (message.has("timeline")) {
+			chat_view->set_assistant_timeline(String(message.get("id", "")), message.get("timeline", Array()));
+		}
 	} else if (type == "todos") {
 		LagoonicCrewView *crew = chat_view->get_crew_view();
 		if (crew != nullptr) {
 			crew->set_tasks(p_event.get("todos", Array()));
 		}
+		chat_view->set_todos(p_event.get("todos", Array()));
 	} else if (type == "permission") {
 		const Dictionary request = p_event.get("request", Dictionary());
 		chat_view->show_permission_card(
@@ -397,7 +408,11 @@ void LagoonicAgentDock::hook_push_agent_event(const Dictionary &p_event) {
 				String(request.get("title", "")),
 				String(request.get("detail", "")));
 	} else if (type == "busy") {
-		chat_view->set_busy(bool(p_event.get("busy", false)));
+		if (bool(p_event.get("busy", false))) {
+			chat_view->set_busy(true);
+		} else {
+			chat_view->notify_turn_finished();
+		}
 	} else if (type == "changes") {
 		const Array changes = p_event.get("changes", Array());
 		PackedStringArray paths;
@@ -416,8 +431,54 @@ void LagoonicAgentDock::hook_push_agent_event(const Dictionary &p_event) {
 		}
 	} else if (type == "error") {
 		chat_view->show_error(String(p_event.get("message", TTRC("Error desconocido."))));
-		chat_view->set_busy(false);
+		chat_view->notify_turn_finished();
 	}
+}
+
+bool LagoonicAgentDock::handle_session_event(const Ref<LagoonicRuntimeHost> &p_host, const StringName &p_event, const Variant &p_a, const String &p_cwd, const Dictionary &p_secret_env, const String &p_model) {
+	if (p_host.is_null() || chat_view == nullptr) {
+		return false;
+	}
+	const bool is_session_event = p_event == SNAME("sessions_requested") || p_event == SNAME("session_selected") ||
+			p_event == SNAME("new_session_requested") || p_event == SNAME("session_delete_requested") ||
+			p_event == SNAME("session_rename_requested");
+	if (!is_session_event) {
+		return false;
+	}
+	if (!p_host->is_server_up() && p_host->ensure_server(p_cwd, p_model, p_secret_env) != OK) {
+		chat_view->show_error(String::utf8("No se pudo iniciar el agente para cargar los chats."));
+		return true;
+	}
+	if (p_event == SNAME("new_session_requested")) {
+		const String sid = p_host->create_session(String());
+		if (!sid.is_empty()) {
+			chat_view->clear_messages();
+			chat_view->set_current_session(sid);
+		}
+	} else if (p_event == SNAME("session_selected")) {
+		const String sid = p_a;
+		p_host->select_session(sid);
+		chat_view->clear_messages();
+		chat_view->set_current_session(sid);
+		const Array events = p_host->load_history(sid);
+		for (int i = 0; i < events.size(); i++) {
+			hook_push_agent_event(events[i]);
+		}
+	} else if (p_event == SNAME("session_rename_requested")) {
+		const Array args = p_a;
+		if (args.size() == 2 && !p_host->rename_session(String(args[0]), String(args[1]))) {
+			chat_view->show_error(String::utf8("No se pudo renombrar el chat."));
+		}
+	} else if (p_event == SNAME("session_delete_requested")) {
+		const String sid = p_a;
+		const bool was_current = sid == chat_view->get_current_session();
+		if (p_host->delete_session(sid) && was_current) {
+			chat_view->clear_messages();
+			chat_view->set_current_session(String());
+		}
+	}
+	chat_view->set_sessions(p_host->list_sessions());
+	return true;
 }
 
 void LagoonicAgentDock::hook_set_connection(bool p_connected) {
@@ -475,6 +536,9 @@ void LagoonicAgentDock::_bind_methods() {
 	ADD_SIGNAL(MethodInfo("revert_requested", PropertyInfo(Variant::STRING, "message_id")));
 	ADD_SIGNAL(MethodInfo("new_session_requested"));
 	ADD_SIGNAL(MethodInfo("session_selected", PropertyInfo(Variant::STRING, "session_id")));
+	ADD_SIGNAL(MethodInfo("sessions_requested"));
+	ADD_SIGNAL(MethodInfo("session_delete_requested", PropertyInfo(Variant::STRING, "session_id")));
+	ADD_SIGNAL(MethodInfo("session_rename_requested", PropertyInfo(Variant::ARRAY, "id_and_title")));
 	ADD_SIGNAL(MethodInfo("boss_changed", PropertyInfo(Variant::STRING, "agent_id")));
 	ADD_SIGNAL(MethodInfo("model_changed", PropertyInfo(Variant::STRING, "model_ref")));
 	ADD_SIGNAL(MethodInfo("mode_changed", PropertyInfo(Variant::INT, "mode")));
@@ -503,6 +567,9 @@ LagoonicAgentDock::LagoonicAgentDock() {
 	signal_argc[SNAME("revert_requested")] = 1;
 	signal_argc[SNAME("new_session_requested")] = 0;
 	signal_argc[SNAME("session_selected")] = 1;
+	signal_argc[SNAME("sessions_requested")] = 0;
+	signal_argc[SNAME("session_delete_requested")] = 1;
+	signal_argc[SNAME("session_rename_requested")] = 1;
 	signal_argc[SNAME("boss_changed")] = 1;
 	signal_argc[SNAME("model_changed")] = 1;
 	signal_argc[SNAME("mode_changed")] = 1;

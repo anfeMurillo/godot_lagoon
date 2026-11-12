@@ -30,6 +30,8 @@
 
 #include "lagoonic_opencode_client.h"
 
+#include "lagoonic_opencode_v2.h"
+
 #include "core/io/json.h"
 #include "core/object/class_db.h"
 #include "core/os/os.h"
@@ -152,11 +154,12 @@ void LagoonicOpenCodeClient::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("lagoonic_health"), &LagoonicOpenCodeClient::lagoonic_health);
 	ClassDB::bind_method(D_METHOD("lagoonic_version"), &LagoonicOpenCodeClient::lagoonic_version);
+	ClassDB::bind_method(D_METHOD("lagoonic_is_api_v2"), &LagoonicOpenCodeClient::lagoonic_is_api_v2);
 	ClassDB::bind_method(D_METHOD("lagoonic_list_sessions", "directory"), &LagoonicOpenCodeClient::lagoonic_list_sessions);
 	ClassDB::bind_method(D_METHOD("lagoonic_create_session", "directory", "title"), &LagoonicOpenCodeClient::lagoonic_create_session, DEFVAL(String()));
 	ClassDB::bind_method(D_METHOD("lagoonic_list_messages", "session_id", "directory"), &LagoonicOpenCodeClient::lagoonic_list_messages);
 	ClassDB::bind_method(D_METHOD("lagoonic_list_providers", "directory"), &LagoonicOpenCodeClient::lagoonic_list_providers);
-	ClassDB::bind_method(D_METHOD("lagoonic_prompt_parts_async", "session_id", "directory", "parts", "provider_id", "model_id", "agent"), &LagoonicOpenCodeClient::lagoonic_prompt_parts_async, DEFVAL(String()));
+	ClassDB::bind_method(D_METHOD("lagoonic_prompt_parts_async", "session_id", "directory", "parts", "provider_id", "model_id", "agent", "variant"), &LagoonicOpenCodeClient::lagoonic_prompt_parts_async, DEFVAL(String()), DEFVAL(String()));
 
 	ClassDB::bind_method(D_METHOD("lagoonic_respond_permission", "session_id", "directory", "permission_id", "reply"), &LagoonicOpenCodeClient::lagoonic_respond_permission);
 	ClassDB::bind_method(D_METHOD("lagoonic_abort", "session_id", "directory"), &LagoonicOpenCodeClient::lagoonic_abort);
@@ -187,6 +190,11 @@ void LagoonicOpenCodeClient::lagoonic_setup(const String &p_base_url, const Stri
 		lagoonic_base_url = "http://127.0.0.1:4096";
 	}
 	lagoonic_password = p_password;
+	// A new server may speak another API version: probe again.
+	MutexLock lock(lagoonic_api_mutex);
+	lagoonic_api = 0;
+	lagoonic_v2_model.clear();
+	lagoonic_v2_agent.clear();
 }
 
 void LagoonicOpenCodeClient::lagoonic_set_auth_mode(const String &p_mode) {
@@ -216,6 +224,61 @@ String LagoonicOpenCodeClient::_lagoonic_auth_header() const {
 
 String LagoonicOpenCodeClient::_lagoonic_with_directory(const String &p_path, const String &p_directory) {
 	return p_path + "?directory=" + _lagoonic_encode_query(p_directory);
+}
+
+String LagoonicOpenCodeClient::_lagoonic_v2_path(const String &p_path, const String &p_directory, const String &p_extra_query) {
+	String out = p_path;
+	String query;
+	if (!p_directory.is_empty()) {
+		query = "location%5Bdirectory%5D=" + _lagoonic_encode_query(p_directory);
+	}
+	if (!p_extra_query.is_empty()) {
+		query += (query.is_empty() ? String() : String("&")) + p_extra_query;
+	}
+	return query.is_empty() ? out : out + "?" + query;
+}
+
+Variant LagoonicOpenCodeClient::_lagoonic_v2_data(const String &p_body) {
+	if (p_body.strip_edges().is_empty()) {
+		return Variant();
+	}
+	const Variant parsed = JSON::parse_string(p_body);
+	if (parsed.get_type() == Variant::DICTIONARY && Dictionary(parsed).has("data")) {
+		return Dictionary(parsed).get("data", Variant());
+	}
+	return parsed;
+}
+
+bool LagoonicOpenCodeClient::lagoonic_is_api_v2() {
+	{
+		MutexLock lock(lagoonic_api_mutex);
+		if (lagoonic_api != 0) {
+			return lagoonic_api == 2;
+		}
+	}
+	const String forced = OS::get_singleton()->get_environment("LAGOONIC_OPENCODE_API").strip_edges().to_lower();
+	int detected = 0;
+	if (forced == "v1" || forced == "v2") {
+		detected = (forced == "v2") ? 2 : 1;
+	} else {
+		const LagoonicHttpResult r = _lagoonic_http_request(HTTPClient::METHOD_GET, "/api/info");
+		if (r.ok) {
+			const Variant parsed = JSON::parse_string(r.body);
+			const String version = (parsed.get_type() == Variant::DICTIONARY) ? _lagoonic_dict_string(Dictionary(parsed), "version") : String();
+			// 2.x serves its web app (HTML) on unknown routes, so only JSON
+			// with a version counts.
+			detected = (!version.is_empty() && !version.begins_with("1.")) ? 2 : 1;
+		} else if (r.code > 0) {
+			detected = 1; // The server answered, but has no 2.x route.
+		}
+		// No answer at all: the server is not up yet; probe again next call.
+	}
+	if (detected == 0) {
+		return false;
+	}
+	MutexLock lock(lagoonic_api_mutex);
+	lagoonic_api = detected;
+	return detected == 2;
 }
 
 LagoonicOpenCodeClient::LagoonicHttpResult LagoonicOpenCodeClient::_lagoonic_http_request(HTTPClient::Method p_method, const String &p_path_query, const String &p_body, bool p_is_sse) {
@@ -329,6 +392,9 @@ LagoonicOpenCodeClient::LagoonicHttpResult LagoonicOpenCodeClient::_lagoonic_htt
 }
 
 bool LagoonicOpenCodeClient::lagoonic_health() {
+	if (lagoonic_is_api_v2()) {
+		return !lagoonic_version().is_empty();
+	}
 	const LagoonicHttpResult r = _lagoonic_http_request(HTTPClient::METHOD_GET, "/global/health");
 	if (!r.ok) {
 		return false;
@@ -342,6 +408,11 @@ bool LagoonicOpenCodeClient::lagoonic_health() {
 }
 
 String LagoonicOpenCodeClient::lagoonic_version() {
+	if (lagoonic_is_api_v2()) {
+		const LagoonicHttpResult info = _lagoonic_http_request(HTTPClient::METHOD_GET, "/api/info");
+		const Variant parsed = info.ok ? JSON::parse_string(info.body) : Variant();
+		return parsed.get_type() == Variant::DICTIONARY ? _lagoonic_dict_string(Dictionary(parsed), "version") : String();
+	}
 	const LagoonicHttpResult r = _lagoonic_http_request(HTTPClient::METHOD_GET, "/global/health");
 	if (!r.ok) {
 		return String();
@@ -355,12 +426,24 @@ String LagoonicOpenCodeClient::lagoonic_version() {
 
 Array LagoonicOpenCodeClient::lagoonic_list_sessions(const String &p_directory) {
 	Array out;
-	const LagoonicHttpResult r = _lagoonic_http_request(HTTPClient::METHOD_GET, _lagoonic_with_directory("/session", p_directory));
+	const bool v2 = lagoonic_is_api_v2();
+	const LagoonicHttpResult r = v2
+			? _lagoonic_http_request(HTTPClient::METHOD_GET, _lagoonic_v2_path("/api/session", p_directory, "directory=" + _lagoonic_encode_query(p_directory.trim_suffix("/")) + "&limit=200&order=desc"))
+			: _lagoonic_http_request(HTTPClient::METHOD_GET, _lagoonic_with_directory("/session", p_directory.trim_suffix("/")));
 	if (!r.ok) {
+		WARN_PRINT(vformat("Lagoonic: listar sesiones fallo (HTTP %d): %s", r.code, r.body.left(200)));
 		return out;
 	}
-	const Variant parsed = JSON::parse_string(r.body);
+	Variant parsed = v2 ? _lagoonic_v2_data(r.body) : JSON::parse_string(r.body);
+	if (parsed.get_type() == Variant::DICTIONARY) {
+		// Algunas versiones 2.x paginan: {items|sessions: [...], cursor}.
+		const Dictionary d = parsed;
+		parsed = d.has("items") ? d["items"] : d.get("sessions", Variant());
+	}
 	if (parsed.get_type() != Variant::ARRAY) {
+		if (v2) {
+			WARN_PRINT("Lagoonic: GET /api/session no devolvio una lista: " + r.body.left(200));
+		}
 		return out;
 	}
 	for (int i = 0; i < Array(parsed).size(); i++) {
@@ -371,6 +454,14 @@ Array LagoonicOpenCodeClient::lagoonic_list_sessions(const String &p_directory) 
 		const Dictionary info = entry;
 		const String id = _lagoonic_dict_string(info, "id");
 		if (id.is_empty()) {
+			continue;
+		}
+		// Solo los chats de este proyecto (por si el servidor no filtra).
+		String session_dir = _lagoonic_dict_string(info, "directory");
+		if (session_dir.is_empty() && info.get("location", Variant()).get_type() == Variant::DICTIONARY) {
+			session_dir = _lagoonic_dict_string(Dictionary(info["location"]), "directory");
+		}
+		if (!session_dir.is_empty() && !p_directory.is_empty() && session_dir.trim_suffix("/") != p_directory.trim_suffix("/")) {
 			continue;
 		}
 		Dictionary row;
@@ -394,11 +485,20 @@ String LagoonicOpenCodeClient::lagoonic_create_session(const String &p_directory
 	if (!p_title.strip_edges().is_empty()) {
 		payload["title"] = p_title;
 	}
-	const LagoonicHttpResult r = _lagoonic_http_request(HTTPClient::METHOD_POST, _lagoonic_with_directory("/session", p_directory), JSON::stringify(payload));
+	const bool v2 = lagoonic_is_api_v2();
+	if (v2) {
+		// 2.x places a new session by `location` in the body, not the query.
+		Dictionary location;
+		location["directory"] = p_directory;
+		payload["location"] = location;
+	}
+	const LagoonicHttpResult r = v2
+			? _lagoonic_http_request(HTTPClient::METHOD_POST, _lagoonic_v2_path("/api/session", p_directory), JSON::stringify(payload))
+			: _lagoonic_http_request(HTTPClient::METHOD_POST, _lagoonic_with_directory("/session", p_directory), JSON::stringify(payload));
 	if (!r.ok) {
 		return String();
 	}
-	const Variant parsed = JSON::parse_string(r.body);
+	const Variant parsed = v2 ? _lagoonic_v2_data(r.body) : JSON::parse_string(r.body);
 	if (parsed.get_type() != Variant::DICTIONARY) {
 		return String();
 	}
@@ -407,6 +507,32 @@ String LagoonicOpenCodeClient::lagoonic_create_session(const String &p_directory
 
 Array LagoonicOpenCodeClient::lagoonic_list_messages(const String &p_session_id, const String &p_directory) {
 	Array out;
+	if (lagoonic_is_api_v2()) {
+		// Oldest first, 200 per page, bounded at 100 pages.
+		Array raw;
+		String extra = "order=asc&limit=200";
+		for (int page = 0; page < 100; page++) {
+			const LagoonicHttpResult r = _lagoonic_http_request(HTTPClient::METHOD_GET, _lagoonic_v2_path("/api/session/" + _lagoonic_encode_query(p_session_id) + "/message", p_directory, extra));
+			if (!r.ok) {
+				break;
+			}
+			const Variant parsed = JSON::parse_string(r.body);
+			if (parsed.get_type() != Variant::DICTIONARY) {
+				break;
+			}
+			const Dictionary root = parsed;
+			const Variant items_v = root.get("data", Variant());
+			const Array items = items_v.get_type() == Variant::ARRAY ? Array(items_v) : Array();
+			raw.append_array(items);
+			const Variant cursor_v = root.get("cursor", Variant());
+			const String next = cursor_v.get_type() == Variant::DICTIONARY ? _lagoonic_dict_string(Dictionary(cursor_v), "next") : String();
+			if (items.size() < 200 || next.is_empty()) {
+				break;
+			}
+			extra = "cursor=" + _lagoonic_encode_query(next) + "&limit=200";
+		}
+		return lagoonic_v2_fold_messages(p_session_id, raw);
+	}
 	const LagoonicHttpResult r = _lagoonic_http_request(HTTPClient::METHOD_GET, _lagoonic_with_directory("/session/" + _lagoonic_encode_query(p_session_id) + "/message", p_directory));
 	if (!r.ok) {
 		return out;
@@ -476,6 +602,9 @@ Array LagoonicOpenCodeClient::lagoonic_list_messages(const String &p_session_id,
 
 Array LagoonicOpenCodeClient::lagoonic_list_providers(const String &p_directory) {
 	Array out;
+	if (lagoonic_is_api_v2()) {
+		return _lagoonic_v2_list_providers(p_directory);
+	}
 	const LagoonicHttpResult r = _lagoonic_http_request(HTTPClient::METHOD_GET, _lagoonic_with_directory("/provider", p_directory));
 	if (!r.ok) {
 		return out;
@@ -537,7 +666,7 @@ Array LagoonicOpenCodeClient::lagoonic_list_providers(const String &p_directory)
 	return out;
 }
 
-Dictionary LagoonicOpenCodeClient::lagoonic_prompt_parts_async(const String &p_session_id, const String &p_directory, const Array &p_parts, const String &p_provider_id, const String &p_model_id, const String &p_agent) {
+Dictionary LagoonicOpenCodeClient::lagoonic_prompt_parts_async(const String &p_session_id, const String &p_directory, const Array &p_parts, const String &p_provider_id, const String &p_model_id, const String &p_agent, const String &p_variant) {
 	Dictionary result;
 	result["ok"] = false;
 	result["session_id"] = p_session_id;
@@ -553,10 +682,49 @@ Dictionary LagoonicOpenCodeClient::lagoonic_prompt_parts_async(const String &p_s
 	if (!p_agent.strip_edges().is_empty()) {
 		payload["agent"] = p_agent; // "build" or "plan".
 	}
+	if (!p_variant.strip_edges().is_empty()) {
+		payload["variant"] = p_variant; // Esfuerzo de razonamiento del modelo.
+	}
 	const String body = JSON::stringify(payload);
 
+	const bool v2 = lagoonic_is_api_v2();
+	const String v2_body = v2 ? JSON::stringify(lagoonic_v2_prompt_body(p_parts)) : String();
 	auto send_once = [&](const String &p_sid) -> LagoonicHttpResult {
-		return _lagoonic_http_request(HTTPClient::METHOD_POST, _lagoonic_with_directory("/session/" + _lagoonic_encode_query(p_sid) + "/prompt_async", p_directory), body);
+		if (!v2) {
+			return _lagoonic_http_request(HTTPClient::METHOD_POST, _lagoonic_with_directory("/session/" + _lagoonic_encode_query(p_sid) + "/prompt_async", p_directory), body);
+		}
+		// 2.x prompts carry no model or agent: select them first, only when
+		// they change, then send {text, files}.
+		const String base = "/api/session/" + _lagoonic_encode_query(p_sid);
+		if (!p_provider_id.is_empty() && !p_model_id.is_empty()) {
+			const String key = p_provider_id + "/" + p_model_id + "#" + p_variant.strip_edges();
+			if (!lagoonic_v2_model.has(p_sid) || lagoonic_v2_model[p_sid] != key) {
+				Dictionary ref;
+				ref["id"] = p_model_id;
+				ref["providerID"] = p_provider_id;
+				if (!p_variant.strip_edges().is_empty()) {
+					ref["variant"] = p_variant.strip_edges();
+				}
+				Dictionary select;
+				select["model"] = ref;
+				const LagoonicHttpResult m = _lagoonic_http_request(HTTPClient::METHOD_POST, _lagoonic_v2_path(base + "/model", p_directory), JSON::stringify(select));
+				if (!m.ok) {
+					return m;
+				}
+				lagoonic_v2_model[p_sid] = key;
+			}
+		}
+		const String agent = p_agent.strip_edges();
+		if (!agent.is_empty() && (!lagoonic_v2_agent.has(p_sid) || lagoonic_v2_agent[p_sid] != agent)) {
+			Dictionary select;
+			select["agent"] = agent;
+			const LagoonicHttpResult a = _lagoonic_http_request(HTTPClient::METHOD_POST, _lagoonic_v2_path(base + "/agent", p_directory), JSON::stringify(select));
+			if (!a.ok) {
+				return a;
+			}
+			lagoonic_v2_agent[p_sid] = agent;
+		}
+		return _lagoonic_http_request(HTTPClient::METHOD_POST, _lagoonic_v2_path(base + "/prompt", p_directory), v2_body);
 	};
 
 	LagoonicHttpResult r = send_once(p_session_id);
@@ -591,12 +759,19 @@ bool LagoonicOpenCodeClient::lagoonic_respond_permission(const String &p_session
 		reply = "reject";
 	}
 	Dictionary payload;
+	if (lagoonic_is_api_v2()) {
+		payload["decision"] = reply;
+		return _lagoonic_http_request(HTTPClient::METHOD_POST, _lagoonic_v2_path("/api/session/" + _lagoonic_encode_query(p_session_id) + "/permission/" + _lagoonic_encode_query(p_permission_id) + "/reply", p_directory), JSON::stringify(payload)).ok;
+	}
 	payload["response"] = reply;
 	const LagoonicHttpResult r = _lagoonic_http_request(HTTPClient::METHOD_POST, _lagoonic_with_directory("/session/" + _lagoonic_encode_query(p_session_id) + "/permissions/" + _lagoonic_encode_query(p_permission_id), p_directory), JSON::stringify(payload));
 	return r.ok;
 }
 
 bool LagoonicOpenCodeClient::lagoonic_abort(const String &p_session_id, const String &p_directory) {
+	if (lagoonic_is_api_v2()) {
+		return _lagoonic_http_request(HTTPClient::METHOD_POST, _lagoonic_v2_path("/api/session/" + _lagoonic_encode_query(p_session_id) + "/interrupt", p_directory)).ok;
+	}
 	const LagoonicHttpResult r = _lagoonic_http_request(HTTPClient::METHOD_POST, _lagoonic_with_directory("/session/" + _lagoonic_encode_query(p_session_id) + "/abort", p_directory));
 	return r.ok;
 }
@@ -604,17 +779,25 @@ bool LagoonicOpenCodeClient::lagoonic_abort(const String &p_session_id, const St
 bool LagoonicOpenCodeClient::lagoonic_revert(const String &p_session_id, const String &p_directory, const String &p_message_id) {
 	Dictionary payload;
 	payload["messageID"] = p_message_id;
+	if (lagoonic_is_api_v2()) {
+		// Staged revert: restores the files; the next prompt commits it.
+		payload["files"] = true;
+		return _lagoonic_http_request(HTTPClient::METHOD_POST, _lagoonic_v2_path("/api/session/" + _lagoonic_encode_query(p_session_id) + "/revert/stage", p_directory), JSON::stringify(payload)).ok;
+	}
 	const LagoonicHttpResult r = _lagoonic_http_request(HTTPClient::METHOD_POST, _lagoonic_with_directory("/session/" + _lagoonic_encode_query(p_session_id) + "/revert", p_directory), JSON::stringify(payload));
 	return r.ok;
 }
 
 Array LagoonicOpenCodeClient::lagoonic_diff_full(const String &p_session_id, const String &p_directory) {
 	Array out;
-	const LagoonicHttpResult r = _lagoonic_http_request(HTTPClient::METHOD_GET, _lagoonic_with_directory("/session/" + _lagoonic_encode_query(p_session_id) + "/diff", p_directory));
+	const bool v2 = lagoonic_is_api_v2();
+	const LagoonicHttpResult r = v2
+			? _lagoonic_http_request(HTTPClient::METHOD_GET, _lagoonic_v2_path("/api/session/" + _lagoonic_encode_query(p_session_id) + "/diff", p_directory))
+			: _lagoonic_http_request(HTTPClient::METHOD_GET, _lagoonic_with_directory("/session/" + _lagoonic_encode_query(p_session_id) + "/diff", p_directory));
 	if (!r.ok) {
 		return out;
 	}
-	const Variant parsed = JSON::parse_string(r.body);
+	const Variant parsed = v2 ? _lagoonic_v2_data(r.body) : JSON::parse_string(r.body);
 	if (parsed.get_type() != Variant::ARRAY) {
 		return out;
 	}
@@ -662,9 +845,119 @@ Array LagoonicOpenCodeClient::lagoonic_diff(const String &p_session_id, const St
 	return out;
 }
 
+bool LagoonicOpenCodeClient::lagoonic_rename_session(const String &p_directory, const String &p_session_id, const String &p_title) {
+	Dictionary payload;
+	payload["title"] = p_title;
+	const String path = lagoonic_is_api_v2()
+			? _lagoonic_v2_path("/api/session/" + _lagoonic_encode_query(p_session_id), p_directory)
+			: _lagoonic_with_directory("/session/" + _lagoonic_encode_query(p_session_id), p_directory);
+	return _lagoonic_http_request(HTTPClient::METHOD_PATCH, path, JSON::stringify(payload)).ok;
+}
+
 bool LagoonicOpenCodeClient::lagoonic_delete_session(const String &p_directory, const String &p_session_id) {
+	if (lagoonic_is_api_v2()) {
+		lagoonic_v2_model.erase(p_session_id);
+		lagoonic_v2_agent.erase(p_session_id);
+		return _lagoonic_http_request(HTTPClient::METHOD_DELETE, _lagoonic_v2_path("/api/session/" + _lagoonic_encode_query(p_session_id), p_directory)).ok;
+	}
 	const LagoonicHttpResult r = _lagoonic_http_request(HTTPClient::METHOD_DELETE, _lagoonic_with_directory("/session/" + _lagoonic_encode_query(p_session_id), p_directory));
 	return r.ok;
+}
+
+// 2.x splits the 1.x `/provider` catalog: active providers come from
+// /api/provider, their models from /api/model, key variables from
+// /api/integration (methods [{type: "env", names}]).
+Array LagoonicOpenCodeClient::_lagoonic_v2_list_providers(const String &p_directory) {
+	Array out;
+	const LagoonicHttpResult pr = _lagoonic_http_request(HTTPClient::METHOD_GET, _lagoonic_v2_path("/api/provider", p_directory));
+	if (!pr.ok) {
+		return out;
+	}
+	const LagoonicHttpResult mr = _lagoonic_http_request(HTTPClient::METHOD_GET, _lagoonic_v2_path("/api/model", p_directory));
+	const LagoonicHttpResult ir = _lagoonic_http_request(HTTPClient::METHOD_GET, _lagoonic_v2_path("/api/integration", p_directory));
+
+	Dictionary env_by_integration;
+	const Variant integrations = ir.ok ? _lagoonic_v2_data(ir.body) : Variant();
+	if (integrations.get_type() == Variant::ARRAY) {
+		for (int i = 0; i < Array(integrations).size(); i++) {
+			if (Array(integrations)[i].get_type() != Variant::DICTIONARY) {
+				continue;
+			}
+			const Dictionary integration = Array(integrations)[i];
+			Array names;
+			const Variant methods = integration.get("methods", Variant());
+			if (methods.get_type() == Variant::ARRAY) {
+				for (int j = 0; j < Array(methods).size(); j++) {
+					if (Array(methods)[j].get_type() != Variant::DICTIONARY) {
+						continue;
+					}
+					const Dictionary method = Array(methods)[j];
+					const Variant method_names = method.get("names", Variant());
+					if (_lagoonic_dict_string(method, "type") == "env" && method_names.get_type() == Variant::ARRAY) {
+						names.append_array(Array(method_names));
+					}
+				}
+			}
+			env_by_integration[_lagoonic_dict_string(integration, "id")] = names;
+		}
+	}
+
+	Dictionary models_by_provider;
+	const Variant models = mr.ok ? _lagoonic_v2_data(mr.body) : Variant();
+	if (models.get_type() == Variant::ARRAY) {
+		for (int i = 0; i < Array(models).size(); i++) {
+			if (Array(models)[i].get_type() != Variant::DICTIONARY) {
+				continue;
+			}
+			const Dictionary m = Array(models)[i];
+			const String provider_id = _lagoonic_dict_string(m, "providerID");
+			String id = _lagoonic_dict_string(m, "modelID");
+			if (id.is_empty()) {
+				id = _lagoonic_dict_string(m, "id");
+			}
+			const String type = _lagoonic_dict_string(m, "type");
+			const Variant enabled = m.get("enabled", Variant());
+			if (provider_id.is_empty() || id.is_empty() || (!type.is_empty() && type != "chat") ||
+					(enabled.get_type() == Variant::BOOL && !bool(enabled)) || _lagoonic_dict_string(m, "status") == "deprecated") {
+				continue;
+			}
+			Dictionary row;
+			row["provider_id"] = provider_id;
+			row["id"] = id;
+			const String name = _lagoonic_dict_string(m, "name");
+			row["name"] = name.is_empty() ? id : name;
+			Array list = models_by_provider.get(provider_id, Array());
+			list.push_back(row);
+			models_by_provider[provider_id] = list;
+		}
+	}
+
+	const Variant providers = _lagoonic_v2_data(pr.body);
+	if (providers.get_type() != Variant::ARRAY) {
+		return out;
+	}
+	for (int i = 0; i < Array(providers).size(); i++) {
+		if (Array(providers)[i].get_type() != Variant::DICTIONARY) {
+			continue;
+		}
+		const Dictionary provider = Array(providers)[i];
+		const String id = _lagoonic_dict_string(provider, "id");
+		if (id.is_empty() || _lagoonic_dict_string(provider, "activation") == "disabled") {
+			continue;
+		}
+		String integration_id = _lagoonic_dict_string(provider, "integrationID");
+		if (integration_id.is_empty()) {
+			integration_id = id;
+		}
+		Dictionary row;
+		row["id"] = id;
+		const String name = _lagoonic_dict_string(provider, "name");
+		row["name"] = name.is_empty() ? id : name;
+		row["env"] = env_by_integration.get(integration_id, Array());
+		row["models"] = models_by_provider.get(id, Array());
+		out.push_back(row);
+	}
+	return out;
 }
 
 bool LagoonicOpenCodeClient::lagoonic_is_not_found_error(const String &p_message) const {
@@ -758,9 +1051,29 @@ void LagoonicOpenCodeClient::_lagoonic_sse_loop() {
 	bool use_tls = false;
 	String prefix;
 	_lagoonic_split_base_url(lagoonic_base_url, host, port, use_tls, prefix);
-	const String target = prefix + _lagoonic_with_directory("/event", directory);
+	String target = prefix + _lagoonic_with_directory("/event", directory);
+	bool v2 = false;
+	bool api_known = false;
+	LagoonicV2FrameTranslator translator;
 
 	while (!_lagoonic_should_stop()) {
+		if (!api_known) {
+			{
+				MutexLock lock(lagoonic_api_mutex);
+				api_known = lagoonic_api != 0;
+			}
+			// Probing here is safe: it only reads the base URL and password.
+			v2 = lagoonic_is_api_v2();
+			{
+				MutexLock lock(lagoonic_api_mutex);
+				api_known = lagoonic_api != 0;
+			}
+			if (!api_known) {
+				_lagoonic_sleep_interruptible(LAGOONIC_SSE_RETRY_MS, this);
+				continue;
+			}
+			target = prefix + (v2 ? _lagoonic_v2_path("/api/event", directory) : _lagoonic_with_directory("/event", directory));
+		}
 		Ref<HTTPClient> cli(HTTPClient::create());
 		if (cli.is_null()) {
 			_lagoonic_sleep_interruptible(LAGOONIC_SSE_RETRY_MS, this);
@@ -850,7 +1163,13 @@ void LagoonicOpenCodeClient::_lagoonic_sse_loop() {
 						payload = payload.strip_edges();
 						if (!payload.is_empty()) {
 							const Variant parsed = JSON::parse_string(payload);
-							if (parsed.get_type() == Variant::DICTIONARY) {
+							if (parsed.get_type() == Variant::DICTIONARY && v2) {
+								// 2.x envelope {id, type, data} -> 1.x frames.
+								const Array frames = translator.translate(Dictionary(parsed));
+								for (int fi = 0; fi < frames.size(); fi++) {
+									call_deferred(StringName("_lagoonic_emit_frame"), frames[fi]);
+								}
+							} else if (parsed.get_type() == Variant::DICTIONARY) {
 								const Dictionary root = parsed;
 								if (Variant(root.get("type", Variant())).get_type() == Variant::STRING) {
 									Dictionary frame;

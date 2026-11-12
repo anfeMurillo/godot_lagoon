@@ -76,10 +76,13 @@
 
 #include "core/object/ref_counted.h"
 #include "core/os/mutex.h"
+#include "core/os/thread.h"
+#include "core/templates/safe_refcount.h"
 #include "core/string/ustring.h"
 #include "core/variant/array.h"
 #include "core/variant/dictionary.h"
 
+#include "lagoonic_acp_runner.h"
 #include "lagoonic_crew_orchestrator.h"
 #include "lagoonic_event_mapper.h"
 #include "lagoonic_opencode_client.h"
@@ -107,6 +110,27 @@ class LagoonicRuntimeHost : public RefCounted {
 	String opencode_bin = "opencode"; // Resolved via PATH by OS::create_process.
 	Dictionary last_secret_env; // Provider/asset keys; values never logged.
 	String crew_boss_id = "opencode";
+
+	// Boss turns of a non-OpenCode chat agent (Claude Code, Codex, ...):
+	// one ACP adapter process per turn on acp_thread; its events reach the
+	// main thread through deferred signal connections.
+	Ref<LagoonicAcpRunner> acp_runner;
+	Thread acp_thread;
+	SafeFlag acp_busy;
+	String acp_bin;
+	PackedStringArray acp_args;
+	Dictionary acp_env;
+	Array acp_mcp_servers;
+	String acp_cwd;
+	String acp_prompt;
+	String acp_session;
+	bool acp_auto_approve = false;
+
+	Error _send_acp(const String &p_boss_id, const String &p_session_id, const String &p_text, int p_mode);
+	static void _acp_thread_main(void *p_userdata);
+	void _on_acp_event(const Dictionary &p_event);
+	void _on_acp_permission(const Dictionary &p_request);
+	void _on_acp_finished(const Dictionary &p_result);
 	Array crew_workers; // Array of {id, name} Dictionaries (set_crew cache).
 
 	// (Re)attaches client + mapper + signals to the running supervisor.
@@ -140,7 +164,8 @@ public:
 	// Sends one user turn (creates a session when p_session_id and the
 	// current one are both blank). Lazily restarts a dead server first.
 	// p_mode: 0 = Auto, 1 = Ask, 2 = Plan. p_model: "provider/model" or "".
-	Error send_prompt(const String &p_session_id, const String &p_text, int p_mode, const String &p_model);
+	// p_variant: esfuerzo del modelo ("" = el normal).
+	Error send_prompt(const String &p_session_id, const String &p_text, int p_mode, const String &p_model, const String &p_variant = String());
 	// Aborts boss + worker turns (OpenCode abort + crew cancel).
 	Error abort();
 	// permission_replied(id, reply): 0 = once, 1 = always, 2 = reject.
@@ -149,6 +174,18 @@ public:
 	// Creates a server session, selects it, returns its id ("" on error).
 	String create_session(const String &p_title = String());
 	void select_session(const String &p_session_id);
+	// Chats del proyecto, mas recientes primero: [{id, title, updated_at}].
+	// Excluye las sesiones efimeras de los workers del equipo.
+	Array list_sessions();
+	// Borra una sesion del servidor; si era la actual, queda sin sesion.
+	bool delete_session(const String &p_session_id);
+	bool rename_session(const String &p_session_id, const String &p_title);
+	// Archivos que cambio el chat actual: [{path, additions, deletions}].
+	Array get_changes();
+	// Historial de una sesion como eventos "message" (mismo formato que
+	// runtime_event): usuario {role:"user"} y asistente con texto,
+	// herramientas y duracion ("worked_ms").
+	Array load_history(const String &p_session_id);
 	// (Re)configures the crew: boss agent id + Array of {id, name}.
 	void set_crew(const String &p_boss_id, const Array &p_workers);
 	// Keeps cached workers, switches boss only (boss_changed event).
@@ -163,6 +200,10 @@ public:
 	bool poll_connection();
 	String get_session() const;
 	String get_project_dir() const;
+	// Project folder without starting OpenCode (ACP bosses do not need it).
+	void set_project_dir(const String &p_project_dir);
+	// Boss that answers the chat ("opencode" or a chat agent id).
+	String get_crew_boss() const;
 	Ref<LagoonicOpenCodeClient> get_client() const { return client; }
 	Ref<LagoonicCrewOrchestrator> get_crew() const { return crew; }
 	// Exposed for the crew runner (same module): serializes blocking

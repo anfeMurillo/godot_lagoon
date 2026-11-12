@@ -44,6 +44,9 @@ public:
 	// "proveedor/modelo" o vacio (= el del agente).
 	static String get_model();
 	static void set_model(const String &p_model_ref);
+	// Variante de esfuerzo del modelo ("" = la normal).
+	static String get_effort();
+	static void set_effort(const String &p_variant);
 
 	static bool has_provider_key(const String &p_provider_id);
 	static Error set_provider_key(const String &p_provider_id, const String &p_value);

@@ -105,6 +105,7 @@
 //   poll_tick() .................... oportunidad de sondeo del dock
 
 #include "lagoonic_chat_view.h"
+#include "../runtime/lagoonic_runtime_host.h"
 
 #include "core/templates/hash_map.h"
 
@@ -204,6 +205,10 @@ public:
 	void hook_set_bridge(Object *p_bridge) { bridge = p_bridge; }
 	void hook_push_agent_event(const Dictionary &p_event);
 	void hook_set_connection(bool p_connected);
+	// Gestion de chats compartida por el dock clasico y Vibe Coding:
+	// sessions_requested / session_selected / new_session_requested /
+	// session_delete_requested. Devuelve true si el evento era de sesiones.
+	bool handle_session_event(const Ref<LagoonicRuntimeHost> &p_host, const StringName &p_event, const Variant &p_a, const String &p_cwd, const Dictionary &p_secret_env, const String &p_model);
 
 	void refresh_icons();
 

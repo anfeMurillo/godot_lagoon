@@ -31,6 +31,8 @@
 
 #include "lagoonic_config_writer.h"
 
+#include "lagoonic_mcp_locator.h"
+
 #include "core/error/error_macros.h"
 #include "core/io/dir_access.h"
 #include "core/io/file_access.h"
@@ -57,7 +59,8 @@ void LagoonicConfigWriter::_bind_methods() {
 PackedStringArray LagoonicConfigWriter::disabled_providers() const {
 	PackedStringArray out;
 	out.push_back("claude-agent"); // Runs the Claude Code binary underneath (ARCH §4.3).
-	out.push_back("opencode"); // Zen; Go uses OPENCODE_API_KEY instead (§4.4).
+	// `opencode` (Zen) stays enabled since 2026-11-11: the model picker offers
+	// its free models, and the chat must be able to run them (ARCH §4.3).
 	return out;
 }
 
@@ -209,7 +212,16 @@ String LagoonicConfigWriter::build_config(const Dictionary &p_input) const {
 		Array mcp_cmd = p_input["mcp_command"];
 		command = mcp_cmd;
 	} else {
-		command.push_back("lagoonic-mcp");
+		// The server packaged with the editor (or a source checkout); as a last
+		// resort the bare name, for a server installed later on the PATH.
+		const Vector<String> located = LagoonicMcpLocator::command();
+		for (const String &part : located) {
+			command.push_back(part);
+		}
+		if (located.is_empty()) {
+			WARN_PRINT("Lagoonic: lagoonic-mcp was not found, so the agent has no Godot tools.");
+			command.push_back("lagoonic-mcp");
+		}
 		command.push_back("--project");
 		command.push_back("{env:LAGOONIC_PROJECT_DIR}");
 	}

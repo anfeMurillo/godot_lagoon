@@ -5,11 +5,13 @@
 #include "lagoonic_agent_settings.h"
 
 #include "lagoonic_chat_view.h"
+#include "lagoonic_model_catalog.h"
 
 #include "../runtime/lagoonic_coding_agents.h"
 #include "../runtime/lagoonic_vault.h"
 
 #include "core/io/config_file.h"
+#include "core/object/callable_mp.h"
 #include "editor/file_system/editor_paths.h"
 
 const LagoonicAgentSettings::Provider LagoonicAgentSettings::PROVIDERS[PROVIDER_COUNT] = {
@@ -108,6 +110,14 @@ void LagoonicAgentSettings::set_model(const String &p_model_ref) {
 	_write("model", p_model_ref.strip_edges());
 }
 
+String LagoonicAgentSettings::get_effort() {
+	return String(_read("effort", "")).strip_edges();
+}
+
+void LagoonicAgentSettings::set_effort(const String &p_variant) {
+	_write("effort", p_variant.strip_edges());
+}
+
 bool LagoonicAgentSettings::has_provider_key(const String &p_provider_id) {
 	const Provider *p = get_provider(p_provider_id);
 	return p != nullptr && _vault()->has(p->env);
@@ -189,4 +199,13 @@ void LagoonicAgentSettings::apply_to_chat(LagoonicChatView *p_chat) {
 	p_chat->set_mode(get_mode());
 	p_chat->set_boss_options(PackedStringArray());
 	p_chat->set_boss_agent(get_boss());
+	p_chat->set_current_model(get_model());
+	p_chat->set_effort(get_effort());
+	// Lista de modelos: la guardada al instante y la fresca en segundo plano.
+	String default_ref;
+	const Array models = LagoonicModelCatalog::cached(default_ref);
+	if (!models.is_empty()) {
+		p_chat->set_models(models, default_ref);
+	}
+	LagoonicModelCatalog::refresh(callable_mp(p_chat, &LagoonicChatView::set_models));
 }

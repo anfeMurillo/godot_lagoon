@@ -32,6 +32,7 @@
 
 #include "lagoonic_agent_dock.h"
 #include "lagoonic_agent_settings.h"
+#include "lagoonic_model_catalog.h"
 #include "lagoonic_vibe_theme.h"
 #include "lagoonic_water_caustics.h"
 #include "lagoonic_lily_veil.h"
@@ -59,6 +60,11 @@
 #include "scene/gui/label.h"
 #include "scene/gui/margin_container.h"
 #include "scene/main/scene_tree.h"
+#include "editor/settings/editor_settings.h"
+#include "lagoonic_bento.h"
+#include "lagoonic_bento_panels.h"
+#include "scene/gui/popup_menu.h"
+#include "servers/display/display_server.h"
 
 static const char *LAGOONIC_INITIAL_PROMPT_RES_PATH = "res://.lagoonic/initial_prompt.txt";
 
@@ -67,6 +73,7 @@ void LagoonicVibeWorkspace::_ensure_runtime_host() {
 		return;
 	}
 	runtime_host.instantiate();
+	runtime_host->set_opencode_bin(LagoonicModelCatalog::opencode_binary());
 	runtime_host->connect(SNAME("runtime_event"), callable_mp(this, &LagoonicVibeWorkspace::_on_runtime_event));
 	runtime_host->connect(SNAME("runtime_status"), callable_mp(this, &LagoonicVibeWorkspace::_on_runtime_status));
 }
@@ -146,6 +153,153 @@ void LagoonicVibeWorkspace::_refresh_icons() {
 	if (agent_dock != nullptr) {
 		agent_dock->refresh_icons();
 	}
+	if (add_panel_button != nullptr && is_inside_tree()) {
+		add_panel_button->set_button_icon(get_editor_theme_icon(SNAME("Add")));
+	}
+}
+
+// ---------------------------------------------------------------- Bento
+
+struct LagoonicBentoType {
+	const char *id;
+	const char *title;
+	const char *icon;
+	const char *hint;
+};
+
+static const LagoonicBentoType LAGOONIC_BENTOS[] = {
+	{ "plan", "Plan", "CheckBox", "Los pasos que sigue el agente" },
+	{ "changes", "Cambios", "Edit", "Archivos que ha tocado este chat" },
+	{ "files", "Archivos", "Folder", "Explora tu proyecto y menciona archivos" },
+	{ "context", "Contexto", "Performance", "Modelo, mensajes y tiempo de este chat" },
+};
+
+void LagoonicVibeWorkspace::_update_chat_width() {
+	if (chat_center == nullptr) {
+		return;
+	}
+	const float width = chat_center->get_size().x;
+	const int pad = int(MAX(18.0f * EDSCALE, (width - CENTER_COLUMN_MAX_WIDTH * EDSCALE) * 0.5f));
+	chat_center->add_theme_constant_override(SNAME("margin_left"), pad);
+	chat_center->add_theme_constant_override(SNAME("margin_right"), pad);
+	chat_center->add_theme_constant_override(SNAME("margin_top"), int(10 * EDSCALE));
+	chat_center->add_theme_constant_override(SNAME("margin_bottom"), int(16 * EDSCALE));
+}
+
+void LagoonicVibeWorkspace::_update_title_margins() {
+	if (top_bar_margin == nullptr || DisplayServer::get_singleton() == nullptr || get_window() == nullptr) {
+		return;
+	}
+	// Con la barra de titulo integrada (macOS), deja sitio a los semaforos.
+	const Vector3i safe = DisplayServer::get_singleton()->window_get_safe_title_margins(get_window()->get_window_id());
+	top_bar_margin->add_theme_constant_override(SNAME("margin_left"), safe.x > 0 ? safe.x + 8 : 16);
+	top_bar_margin->add_theme_constant_override(SNAME("margin_right"), safe.y > 0 ? safe.y + 8 : 16);
+}
+
+void LagoonicVibeWorkspace::_on_add_panel_pressed() {
+	add_panel_menu->clear();
+	for (const LagoonicBentoType &t : LAGOONIC_BENTOS) {
+		if (bento_board->get_side(t.id) != nullptr) {
+			continue;
+		}
+		add_panel_menu->add_icon_item(get_editor_theme_icon(StringName(t.icon)), String::utf8(t.title));
+		const int idx = add_panel_menu->get_item_count() - 1;
+		add_panel_menu->set_item_metadata(idx, String(t.id));
+		add_panel_menu->set_item_tooltip(idx, String::utf8(t.hint));
+	}
+	if (add_panel_menu->get_item_count() == 0) {
+		add_panel_menu->add_item(String::utf8("Ya están todos abiertos"));
+		add_panel_menu->set_item_disabled(0, true);
+	}
+	const Rect2 r = add_panel_button->get_screen_rect();
+	add_panel_menu->set_position(Point2i(r.position.x, r.position.y + r.size.y + 4));
+	add_panel_menu->reset_size();
+	add_panel_menu->popup();
+}
+
+void LagoonicVibeWorkspace::_on_add_panel_selected(int p_index) {
+	const Variant meta = add_panel_menu->get_item_metadata(p_index);
+	if (meta.get_type() == Variant::STRING) {
+		_open_bento(meta);
+	}
+}
+
+Array LagoonicVibeWorkspace::_get_changes() {
+	_ensure_runtime_host();
+	return runtime_host.is_valid() ? runtime_host->get_changes() : Array();
+}
+
+void LagoonicVibeWorkspace::_open_bento(const String &p_id, bool p_save) {
+	if (bento_board == nullptr || agent_dock == nullptr || bento_board->get_side(p_id) != nullptr) {
+		return;
+	}
+	const LagoonicBentoType *type = nullptr;
+	for (const LagoonicBentoType &t : LAGOONIC_BENTOS) {
+		if (p_id == t.id) {
+			type = &t;
+		}
+	}
+	if (type == nullptr) {
+		return;
+	}
+	LagoonicChatView *chat = agent_dock->get_chat_view();
+	LagoonicBento *bento = memnew(LagoonicBento);
+	bento->set_bento_id(p_id);
+	bento->set_title(String::utf8(type->title));
+	bento->set_icon(StringName(type->icon));
+	bento->set_close_callback(callable_mp(this, &LagoonicVibeWorkspace::_close_bento));
+	bento->set_theme(agent_dock->get_theme());
+	if (p_id == "plan") {
+		LagoonicPlanPanel *panel = memnew(LagoonicPlanPanel);
+		panel->setup(chat);
+		bento->set_content(panel);
+		chat->set_plan_card_suppressed(true);
+	} else if (p_id == "changes") {
+		LagoonicChangesPanel *panel = memnew(LagoonicChangesPanel);
+		panel->setup(chat, callable_mp(this, &LagoonicVibeWorkspace::_get_changes));
+		bento->set_content(panel);
+	} else if (p_id == "files") {
+		LagoonicFilesPanel *panel = memnew(LagoonicFilesPanel);
+		panel->setup(chat);
+		bento->set_content(panel);
+	} else if (p_id == "context") {
+		LagoonicContextPanel *panel = memnew(LagoonicContextPanel);
+		panel->setup(chat);
+		bento->set_content(panel);
+	}
+	bento_board->add_side(bento);
+	bento->apply_palette();
+	if (p_save) {
+		_save_bentos();
+	}
+}
+
+void LagoonicVibeWorkspace::_close_bento(const String &p_id) {
+	if (bento_board == nullptr) {
+		return;
+	}
+	bento_board->remove_side(p_id);
+	if (p_id == "plan" && agent_dock != nullptr) {
+		agent_dock->get_chat_view()->set_plan_card_suppressed(false);
+	}
+	_save_bentos();
+}
+
+void LagoonicVibeWorkspace::_save_bentos() {
+	if (EditorSettings::get_singleton() != nullptr && bento_board != nullptr) {
+		EditorSettings::get_singleton()->set_project_metadata("lagoonic", "bentos", bento_board->get_side_ids());
+		EditorSettings::get_singleton()->save_project_metadata(); // Al momento, no solo al cerrar.
+	}
+}
+
+void LagoonicVibeWorkspace::_restore_bentos() {
+	if (EditorSettings::get_singleton() == nullptr) {
+		return;
+	}
+	const PackedStringArray ids = EditorSettings::get_singleton()->get_project_metadata("lagoonic", "bentos", PackedStringArray());
+	for (const String &id : ids) {
+		_open_bento(id, false);
+	}
 }
 
 void LagoonicVibeWorkspace::_consume_initial_prompt() {
@@ -218,7 +372,12 @@ void LagoonicVibeWorkspace::_on_play_pressed() {
 void LagoonicVibeWorkspace::_apply_palette() {
 	const LagoonicVibeTheme::Palette p = LagoonicVibeTheme::current();
 	if (background_style.is_valid()) {
-		background_style->set_bg_color(p.bg);
+		// Fondo un poco mas oscuro que las tarjetas Bento para que destaquen.
+		background_style->set_bg_color(p.light ? p.bg.darkened(0.06f) : p.bg.lerp(Color(0, 0, 0), 0.38f));
+	}
+	if (chat_title_label != nullptr) {
+		chat_title_label->add_theme_color_override(SceneStringName(font_color), p.text);
+		chat_title_label->add_theme_color_override(SNAME("font_shadow_color"), Color(p.bg, 0.8f));
 	}
 	if (play_button_style.is_valid()) {
 		play_button_style->set_bg_color(p.accent);
@@ -258,6 +417,19 @@ void LagoonicVibeWorkspace::_apply_palette() {
 	}
 	if (water_caustics != nullptr) {
 		water_caustics->set_tint(Color(p.accent, 0.85f));
+	}
+	if (bento_board != nullptr) {
+		bento_board->apply_palette();
+	}
+	if (agent_dock != nullptr && agent_dock->get_chat_view() != nullptr) {
+		agent_dock->get_chat_view()->set_fade_color(LagoonicBento::card_color());
+	}
+	if (add_panel_button != nullptr) {
+		add_panel_button->add_theme_color_override(SNAME("font_color"), p.text_muted.lerp(p.text, 0.5f));
+		add_panel_button->add_theme_color_override(SNAME("font_hover_color"), p.text);
+		for (const char *n : { "icon_normal_color", "icon_hover_color", "icon_pressed_color" }) {
+			add_panel_button->add_theme_color_override(n, p.text_muted.lerp(p.text, 0.5f));
+		}
 	}
 	if (agent_dock != nullptr) {
 		}
@@ -483,9 +655,17 @@ void LagoonicVibeWorkspace::_on_runtime_event(const Dictionary &p_event) {
 	if (agent_dock != nullptr) {
 		agent_dock->hook_push_agent_event(p_event);
 	}
+	// Al terminar un turno el servidor ya puso titulo al chat: refresca.
+	if (String(p_event.get("type", "")) == "busy" && !bool(p_event.get("busy", true)) && runtime_host.is_valid() && agent_dock != nullptr && agent_dock->get_chat_view() != nullptr) {
+		agent_dock->get_chat_view()->set_sessions(runtime_host->list_sessions());
+	}
 }
 
 void LagoonicVibeWorkspace::_on_runtime_status(const String &p_status) {
+	if (p_status.begins_with("session:") && agent_dock != nullptr && agent_dock->get_chat_view() != nullptr) {
+		// El host creo o cambio la sesion (p. ej. al primer envio).
+		agent_dock->get_chat_view()->set_current_session(p_status.substr(8));
+	}
 	(void)p_status;
 	if (agent_dock != nullptr) {
 		// Mantiene la entrada del chat habilitada para que el primer envío
@@ -509,15 +689,28 @@ void LagoonicVibeWorkspace::_on_agent_event(const StringName &p_event, const Var
 		if (model.is_empty()) {
 			model = LagoonicAgentSettings::get_model(); // Configuracion > Agentes.
 		}
-		if (runtime_host->ensure_server(cwd, model, LagoonicAgentSettings::secret_env()) == OK) {
+		// Configuracion > Equipo is the source of truth for the boss; the
+		// chat picker writes there too (boss_changed below).
+		const String boss = LagoonicAgentSettings::get_boss();
+		if (chat != nullptr) {
+			chat->set_boss_agent(boss);
+		}
+		runtime_host->set_crew_boss(boss);
+		if (boss != "opencode") {
+			// Claude Code, Codex... answer through their ACP adapter: no
+			// OpenCode server needed for this turn.
+			runtime_host->set_project_dir(cwd);
+			if (runtime_host->send_prompt(session, String(p_a), mode, model) != OK && chat != nullptr) {
+				chat->set_busy(false);
+			}
+		} else if (runtime_host->ensure_server(cwd, model, LagoonicAgentSettings::secret_env()) == OK) {
 			if (!crew_applied) {
 				// Configuracion > Equipo: necesita la carpeta del proyecto, que
 				// el host conoce tras ensure_server().
-				const String boss = (chat != nullptr) ? chat->get_boss_agent() : LagoonicAgentSettings::get_boss();
 				runtime_host->set_crew(boss, LagoonicAgentSettings::crew_workers());
 				crew_applied = true;
 			}
-			runtime_host->send_prompt(session, String(p_a), mode, model);
+			runtime_host->send_prompt(session, String(p_a), mode, model, (chat != nullptr) ? chat->get_effort() : LagoonicAgentSettings::get_effort());
 		} else if (chat != nullptr) {
 			chat->set_busy(false);
 		}
@@ -527,14 +720,16 @@ void LagoonicVibeWorkspace::_on_agent_event(const StringName &p_event, const Var
 		runtime_host->respond_permission(String(p_a), int(p_b));
 	} else if (p_event == SNAME("revert_requested")) {
 		runtime_host->revert_message(String(p_a));
-	} else if (p_event == SNAME("new_session_requested")) {
-		const String sid = runtime_host->create_session(String());
-		if (!sid.is_empty() && chat != nullptr) {
-			chat->set_current_session(sid);
-		}
-	} else if (p_event == SNAME("session_selected")) {
-		runtime_host->select_session(String(p_a));
+	} else if (agent_dock != nullptr && agent_dock->handle_session_event(runtime_host, p_event, p_a, cwd, LagoonicAgentSettings::secret_env(), (chat != nullptr && !chat->get_current_model().is_empty()) ? chat->get_current_model() : LagoonicAgentSettings::get_model())) {
+		// Chats del proyecto: nuevo, cambiar, borrar, listar.
+	} else if (p_event == SNAME("mode_changed")) {
+		LagoonicAgentSettings::set_mode(int(p_a)); // El chat recuerda la ultima eleccion.
+	} else if (p_event == SNAME("model_changed")) {
+		LagoonicAgentSettings::set_model(String(p_a));
+	} else if (p_event == SNAME("effort_changed")) {
+		LagoonicAgentSettings::set_effort(String(p_a));
 	} else if (p_event == SNAME("boss_changed")) {
+		LagoonicAgentSettings::set_boss(String(p_a)); // Same choice as Configuracion > Equipo.
 		runtime_host->set_crew_boss(String(p_a));
 	} else if (p_event == SNAME("worker_toggled")) {
 		runtime_host->set_crew_worker(String(p_a), bool(p_b));
@@ -564,7 +759,10 @@ void LagoonicVibeWorkspace::_notification(int p_notification) {
 			set_process_internal(true);
 			set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
 			_ensure_return_pill();
+			_restore_bentos();
 			_apply_palette();
+			_update_title_margins();
+			connect(SceneStringName(resized), callable_mp(this, &LagoonicVibeWorkspace::_update_title_margins));
 			callable_mp(this, &LagoonicVibeWorkspace::_play_intro).call_deferred();
 			call_deferred(SNAME("_consume_initial_prompt"));
 		} break;
@@ -644,31 +842,27 @@ LagoonicVibeWorkspace::LagoonicVibeWorkspace() {
 	root_vb->add_theme_constant_override(SNAME("separation"), 0);
 	add_child(root_vb);
 
-	// --- Cabecera superior con LagoonicWaterCaustics (120 px) y barra superpuesta ---
+	// --- Barra superior fina (como la de OpenCode): Proyectos, titulo,
+	// anadir panel, Jugar y Abrir editor. Se puede arrastrar la ventana.
 	Control *header_band = memnew(Control);
-	header_band->set_custom_minimum_size(Size2(0, WATER_HEADER_HEIGHT));
+	header_band->set_custom_minimum_size(Size2(0, TOP_BAR_HEIGHT * EDSCALE));
 	header_band->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	root_vb->add_child(header_band);
 	header_band->connect(SceneStringName(gui_input), callable_mp_static(&LagoonicWaterCaustics::handle_window_drag).bind(header_band));
 
-	water_caustics = memnew(LagoonicWaterCaustics);
-	water_caustics->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
-	water_caustics->set_custom_minimum_size(Size2(0, WATER_HEADER_HEIGHT));
-	water_caustics->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
-	header_band->add_child(water_caustics);
-
 	MarginContainer *header_margin = memnew(MarginContainer);
+	top_bar_margin = header_margin;
 	header_margin->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
-	header_margin->add_theme_constant_override(SNAME("margin_left"), 24);
-	header_margin->add_theme_constant_override(SNAME("margin_right"), 24);
-	header_margin->add_theme_constant_override(SNAME("margin_top"), 18);
-	header_margin->add_theme_constant_override(SNAME("margin_bottom"), 18);
+	header_margin->add_theme_constant_override(SNAME("margin_left"), 16);
+	header_margin->add_theme_constant_override(SNAME("margin_right"), 16);
+	header_margin->add_theme_constant_override(SNAME("margin_top"), 8);
+	header_margin->add_theme_constant_override(SNAME("margin_bottom"), 6);
 	header_band->add_child(header_margin);
 
 	HBoxContainer *header_bar = memnew(HBoxContainer);
 	header_bar->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	header_bar->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
-	header_bar->add_theme_constant_override(SNAME("separation"), 12);
+	header_bar->add_theme_constant_override(SNAME("separation"), 8);
 	header_margin->add_child(header_bar);
 
 	// Izquierda: "← Proyectos" + título del proyecto actual.
@@ -685,11 +879,8 @@ LagoonicVibeWorkspace::LagoonicVibeWorkspace() {
 	header_bar->add_child(projects_button);
 
 	project_title_label = memnew(Label);
-	project_title_label->add_theme_font_size_override(SceneStringName(font_size), 20);
+	project_title_label->add_theme_font_size_override(SceneStringName(font_size), 17);
 	project_title_label->add_theme_color_override(SNAME("font_color"), Color(0.96f, 0.99f, 1.0f));
-	project_title_label->add_theme_color_override(SNAME("font_shadow_color"), Color(0.0f, 0.08f, 0.14f, 0.75f));
-	project_title_label->add_theme_constant_override(SNAME("shadow_offset_x"), 0);
-	project_title_label->add_theme_constant_override(SNAME("shadow_offset_y"), 1);
 	// Centrado sobre todo el ancho (capa encima de la barra), no entre botones.
 	project_title_label->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
 	project_title_label->set_vertical_alignment(VERTICAL_ALIGNMENT_CENTER);
@@ -699,9 +890,24 @@ LagoonicVibeWorkspace::LagoonicVibeWorkspace() {
 
 	Control *header_spacer = memnew(Control);
 	header_spacer->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	header_spacer->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
 	header_bar->add_child(header_spacer);
 
-	// Derecha: "▶ Jugar", "■ Parar", "Abrir Editor de Godot".
+	// Derecha: "+ Panel", "▶ Jugar", "Abrir editor".
+	add_panel_button = memnew(Button);
+	add_panel_button->set_text(TTRC("Panel"));
+	add_panel_button->set_tooltip_text(String::utf8("Añade un panel junto al chat: plan, cambios, archivos o contexto."));
+	add_panel_button->add_theme_style_override(SNAME("normal"), ghost_button_style);
+	add_panel_button->add_theme_style_override(SceneStringName(hover), ghost_button_hover_style);
+	add_panel_button->add_theme_style_override(SceneStringName(pressed), ghost_button_hover_style);
+	add_panel_button->add_theme_style_override(SNAME("focus"), memnew(StyleBoxEmpty));
+	add_panel_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeWorkspace::_on_add_panel_pressed));
+	header_bar->add_child(add_panel_button);
+
+	add_panel_menu = memnew(PopupMenu);
+	add_panel_menu->connect(SNAME("index_pressed"), callable_mp(this, &LagoonicVibeWorkspace::_on_add_panel_selected));
+	add_child(add_panel_menu);
+
 	play_button = memnew(Button);
 	play_button->set_text(String::utf8("▶  Jugar"));
 	play_button->set_tooltip_text(TTRC("Prueba el juego. Vuelve a pulsar para detenerlo."));
@@ -715,7 +921,6 @@ LagoonicVibeWorkspace::LagoonicVibeWorkspace() {
 	play_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeWorkspace::_on_play_pressed));
 	header_bar->add_child(play_button);
 
-
 	open_editor_button = memnew(Button);
 	open_editor_button->set_text(TTRC("Abrir editor"));
 	open_editor_button->set_tooltip_text(TTRC(String::utf8("Muestra el editor clásico de Godot con una píldora flotante para volver a Vibe Coding.")));
@@ -728,43 +933,58 @@ LagoonicVibeWorkspace::LagoonicVibeWorkspace() {
 	open_editor_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeWorkspace::_on_open_editor_pressed));
 	header_bar->add_child(open_editor_button);
 
-	// --- Cuerpo central (centrado, ancho máx ~920 px) con LagoonicAgentDock ---
+	// --- Tablero Bento ---
 	MarginContainer *body_margin = memnew(MarginContainer);
 	body_margin->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	body_margin->set_v_size_flags(Control::SIZE_EXPAND_FILL);
-	body_margin->add_theme_constant_override(SNAME("margin_left"), 20);
-	body_margin->add_theme_constant_override(SNAME("margin_right"), 20);
-	body_margin->add_theme_constant_override(SNAME("margin_top"), 16);
-	body_margin->add_theme_constant_override(SNAME("margin_bottom"), 20);
+	body_margin->add_theme_constant_override(SNAME("margin_left"), int(12 * EDSCALE));
+	body_margin->add_theme_constant_override(SNAME("margin_right"), int(12 * EDSCALE));
+	body_margin->add_theme_constant_override(SNAME("margin_top"), 0);
+	body_margin->add_theme_constant_override(SNAME("margin_bottom"), int(12 * EDSCALE));
 	root_vb->add_child(body_margin);
 
-	HBoxContainer *center_hb = memnew(HBoxContainer);
-	center_hb->set_h_size_flags(Control::SIZE_EXPAND_FILL);
-	center_hb->set_v_size_flags(Control::SIZE_EXPAND_FILL);
-	body_margin->add_child(center_hb);
+	bento_board = memnew(LagoonicBentoBoard);
+	body_margin->add_child(bento_board);
 
-	Control *left_spacer = memnew(Control);
-	left_spacer->set_h_size_flags(Control::SIZE_EXPAND_FILL);
-	center_hb->add_child(left_spacer);
+	// Tarjeta principal: el chat, con el agua de Lagoonic en su cabecera.
+	chat_bento = memnew(LagoonicBento);
+	chat_bento->set_bento_id("chat");
+	chat_bento->set_closable(false);
+	HBoxContainer *chat_header = chat_bento->enable_water_header(CHAT_WATER_HEIGHT);
+	chat_header->get_parent()->connect(SceneStringName(gui_input), callable_mp_static(&LagoonicWaterCaustics::handle_window_drag).bind(Object::cast_to<Control>(chat_header->get_parent())));
+	water_caustics = chat_bento->get_water();
+	bento_board->set_main(chat_bento);
 
-	VBoxContainer *center_column = memnew(VBoxContainer);
-	center_column->set_custom_minimum_size(Size2(CENTER_COLUMN_MAX_WIDTH, 0));
-	center_column->set_h_size_flags(Control::SIZE_SHRINK_CENTER);
-	center_column->set_v_size_flags(Control::SIZE_EXPAND_FILL);
-	center_hb->add_child(center_column);
+	// El chat queda en una columna centrada de ancho maximo dentro de la
+	// tarjeta (se estrecha sola si hay paneles al lado).
+	chat_center = memnew(MarginContainer);
+	chat_center->connect(SceneStringName(resized), callable_mp(this, &LagoonicVibeWorkspace::_update_chat_width));
+	chat_bento->set_content(chat_center);
+	chat_bento->set_content_margins(0, 0);
 
 	agent_dock = memnew(LagoonicAgentDock);
 	agent_dock->set_theme(LagoonicVibeTheme::build());
 	agent_dock->set_minimal(true);
 	agent_dock->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	agent_dock->set_v_size_flags(Control::SIZE_EXPAND_FILL);
-	center_column->add_child(agent_dock);
+	chat_center->add_child(agent_dock);
 	agent_dock->set_event_handler(callable_mp(this, &LagoonicVibeWorkspace::_on_agent_event));
 	LagoonicAgentSettings::apply_to_chat(agent_dock->get_chat_view());
 
-	Control *right_spacer = memnew(Control);
-	right_spacer->set_h_size_flags(Control::SIZE_EXPAND_FILL);
-	center_hb->add_child(right_spacer);
+	// La barra del chat (titulo + Chats + nuevo) pasa a la cabecera de agua.
+	if (HBoxContainer *session_bar = agent_dock->get_chat_view()->get_session_bar()) {
+		session_bar->get_parent()->remove_child(session_bar);
+		session_bar->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+		session_bar->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+		session_bar->set_theme(agent_dock->get_theme());
+		chat_header->add_child(session_bar);
+		// Titulo del chat sobre el agua: mas grande y claro.
+		chat_title_label = Object::cast_to<Label>(session_bar->get_child(0));
+		if (chat_title_label != nullptr) {
+			chat_title_label->add_theme_font_size_override(SceneStringName(font_size), int(16 * EDSCALE));
+			chat_title_label->add_theme_constant_override(SNAME("shadow_offset_y"), 1);
+		}
+	}
 
 	_ensure_runtime_host();
 	agent_dock->hook_set_connection(true);

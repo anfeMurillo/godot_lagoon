@@ -77,6 +77,8 @@ class TextEdit;
 class Timer;
 class InputEvent;
 class TextureRect;
+class AcceptDialog;
+class ConfirmationDialog;
 
 class LagoonicChatView : public VBoxContainer {
 	GDCLASS(LagoonicChatView, VBoxContainer);
@@ -106,10 +108,24 @@ private:
 	OptionButton *boss_option = nullptr;
 	OptionButton *model_option = nullptr;
 	OptionButton *mode_option = nullptr;
+	OptionButton *effort_option = nullptr; // Variantes de razonamiento del modelo.
+	HBoxContainer *composer_controls = nullptr;
+	HashMap<String, PackedStringArray> model_variants; // ref -> variantes.
+	String preferred_model; // Se aplica cuando llega la lista de modelos.
+	String preferred_effort;
+	void _rebuild_effort_options();
+	static String _effort_label(const String &p_variant);
+	void _on_effort_selected(int p_index);
 
 	LagoonicCrewView *crew_view = nullptr;
 
 	ScrollContainer *messages_scroll = nullptr;
+	// Degradado del color de la tarjeta sobre los mensajes de arriba: se
+	// desvanecen al pasar bajo la cabecera (solo dentro de una tarjeta Bento).
+	Control *fade_overlay = nullptr;
+	Ref<class GradientTexture2D> fade_texture;
+	Color fade_color = Color(0, 0, 0, 0);
+	void _draw_fade();
 	VBoxContainer *messages_box = nullptr;
 
 	HBoxContainer *changes_bar = nullptr;
@@ -146,8 +162,104 @@ private:
 	HashMap<StringName, int> signal_argc;
 
 	PackedStringArray session_ids;
+	Vector<Callable> listeners;
+	void _notify_listeners(const StringName &p_what);
+	bool plan_card_suppressed = false;
+	int user_message_count = 0;
+	HashMap<String, uint64_t> worked_ms; // msg_id -> tiempo trabajado.
+	Array sessions_data; // [{id, title, updated_at}] para el dialogo de chats.
+	String current_session_id;
+
+	// --- Barra de chat (modo Vibe Coding) + dialogo "Chats del proyecto" ---
+	HBoxContainer *session_bar = nullptr;
+	Label *session_title_label = nullptr;
+	Button *chats_button = nullptr;
+	Button *bar_new_button = nullptr;
+	PanelContainer *chats_panel = nullptr; // Panel dentro del chat, no ventana.
+	VBoxContainer *chats_list = nullptr;
+	Label *chats_busy_note = nullptr;
+	String pending_delete_id;
+	String pending_rename_id;
+	void _on_chat_rename_pressed(const String &p_session_id);
+	void _on_rename_submitted(const String &p_text);
+	class LineEdit *rename_edit = nullptr;
+	void _on_chats_pressed();
+	void _rebuild_chats_list();
+	void _on_chat_row_pressed(const String &p_session_id);
+	void _on_chat_delete_pressed(const String &p_session_id);
+	void _on_delete_confirmed();
+	void _on_delete_cancelled();
+	void _close_chats();
+	void _update_session_title();
+
+	// --- Tarjeta de plan sobre la caja de texto ---
+	PanelContainer *plan_card = nullptr;
+	Label *plan_title = nullptr;
+	Label *plan_current = nullptr;
+	Button *plan_toggle = nullptr;
+	VBoxContainer *plan_list = nullptr;
+	Array plan_todos;
+	void _rebuild_plan();
+	void _on_plan_toggle();
+
+	// --- Boton "Lo ultimo" y autodesplazamiento ---
+	Button *latest_button = nullptr;
+	bool stick_to_bottom = true;
+	void _on_scroll_changed(double p_value);
+	void _update_latest_button();
+	void _on_latest_pressed();
+
+	// --- Actividad del turno ---
+	uint64_t turn_start_msec = 0;
+	String turn_message_id; // Ultimo mensaje del asistente del turno.
+	String last_activity_label;
+	HashMap<String, Label *> worked_labels; // msg_id -> "Trabajo durante".
+	HashMap<String, Button *> activity_headers; // msg_id -> "N pasos".
+	HashMap<String, int> activity_counts;
+	HashMap<String, String> tool_raw_details; // Solo interno (rutas de medios); nunca se muestra.
+	HashMap<String, String> tool_phrases; // Frase sencilla que ve el usuario.
+	HashMap<String, Button *> tool_buttons; // Clave "msg_id|tool_id".
+	HashMap<String, String> tool_raw_labels; // Clave "msg_id|tool_id".
+	static void _on_meta_clicked(const Variant &p_meta);
+	void _on_activity_toggle(const String &p_msg_id);
+	void _refresh_tool_icon(const String &p_key, int p_state);
+	StringName _tool_icon_name(const String &p_label) const;
+	static String _format_duration(uint64_t p_msec);
+	void _finish_turn(uint64_t p_worked_ms = 0);
+	void _set_worked(const String &p_msg_id, uint64_t p_msec);
+
+	// --- Archivos del agente (como AgentOutputCards de movil) ---
+	HashMap<String, String> assistant_texts; // msg_id -> texto crudo.
+	HashMap<String, VBoxContainer *> media_boxes; // msg_id -> tarjetas.
+	PackedStringArray turn_message_ids; // Mensajes del turno en curso.
+	enum MediaKind {
+		MEDIA_NONE,
+		MEDIA_IMAGE,
+		MEDIA_AUDIO,
+		MEDIA_MODEL,
+		MEDIA_VIDEO,
+		MEDIA_FILE,
+	};
+	static MediaKind _media_kind(const String &p_path);
+	String _resolve_media(const String &p_token) const;
+	void _attach_outputs(const String &p_msg_id, const PackedStringArray &p_source_ids);
+	void _add_media_card(VBoxContainer *p_box, const String &p_res_path);
+	void _on_media_open(const String &p_res_path);
+	void _on_media_show(const String &p_res_path);
+	void _on_media_play(const String &p_res_path, ObjectID p_button);
+	void _on_media_preview(const String &p_path, const Ref<Texture2D> &p_preview, const Ref<Texture2D> &p_small, ObjectID p_rect);
+	class AudioStreamPlayer *media_player = nullptr;
+	ObjectID media_play_button;
 	HashMap<String, VBoxContainer *> message_boxes;
-	HashMap<String, RichTextLabel *> assistant_labels;
+	HashMap<String, class LagoonicMarkdownView *> assistant_bodies;
+	// Narracion intermedia del agente ("Voy a revisar..."): va a la
+	// actividad como en movil. Clave "msg_id|text|part_id".
+	void _update_activity_header(const String &p_msg_id);
+	// "Shell · ps aux | grep …" -> "Revisando el rendimiento" (como
+	// ToolNarration de movil): el usuario nunca ve comandos ni rutas.
+	static String _narrate_tool(const String &p_label, const String &p_detail);
+	// Pasos seguidos con la misma frase se muestran como una sola fila.
+	void _collapse_repeats(const String &p_msg_id);
 	HashMap<String, VBoxContainer *> tools_boxes;
 	HashMap<String, HBoxContainer *> tool_rows; // Clave "msg_id|tool_id".
 	HashMap<String, Label *> tool_dots; // Clave "msg_id|tool_id".
@@ -159,6 +271,7 @@ private:
 	VBoxContainer *_ensure_message_box(const String &p_msg_id, bool p_assistant);
 	void _scroll_to_bottom();
 	static String _escape_brackets(const String &p_text);
+	static String _inline_markdown(const String &p_line);
 	static String _tool_key(const String &p_msg_id, const String &p_tool_id);
 	static Color _tool_color(ToolState p_state);
 
@@ -208,13 +321,49 @@ public:
 	void set_mode(int p_mode);
 	int get_mode() const;
 
+	// Lista de modelos: Array de {ref "proveedor/modelo", name, provider,
+	// provider_name, variants: PackedStringArray}. p_default_ref es el que
+	// el agente usa si no se elige ninguno.
+	void set_models(const Array &p_models, const String &p_default_ref);
+	// Variante de esfuerzo ("" = la normal del modelo).
+	void set_effort(const String &p_variant);
+	String get_effort() const;
+
 	void add_user_message(const String &p_text);
 	void upsert_assistant_message(const String &p_msg_id, const String &p_text);
+	// Orden real {kind: text|tool, id, text?}: el texto seguido de pasos pasa
+	// a la actividad y la burbuja muestra solo la respuesta final.
+	void set_assistant_timeline(const String &p_msg_id, const Array &p_timeline);
 	void append_tool_row(const String &p_msg_id, const String &p_tool_id, const String &p_label, int p_state, const String &p_detail);
 	void update_tool_state(const String &p_msg_id, const String &p_tool_id, int p_state, const String &p_detail);
 
 	void show_permission_card(const String &p_request_id, const String &p_session_id, const String &p_title, const String &p_detail);
 	void close_permission_card(const String &p_request_id);
+
+	// Plan del agente: Array de {id, text, state} (pending, in_progress,
+	// completed, cancelled). Vacio = oculta la tarjeta.
+	void set_todos(const Array &p_todos);
+	Array get_todos() const { return plan_todos; }
+	// Paneles Bento: avisos "todos", "turn_finished", "session", "cleared".
+	void add_listener(const Callable &p_callback) { listeners.push_back(p_callback); }
+	// Con el panel Plan abierto, la tarjeta de plan sobre la caja sobra.
+	void set_plan_card_suppressed(bool p_suppressed);
+	// Datos del panel Contexto: chat, modelo, modo, mensajes, pasos, tiempo.
+	Dictionary get_context_info() const;
+	// Escribe en la caja de texto (p. ej. "@res://player.png ").
+	void insert_in_composer(const String &p_text);
+	HBoxContainer *get_session_bar() const { return session_bar; }
+	// Color del fondo sobre el que esta el chat (alfa 0 = sin desvanecido).
+	void set_fade_color(const Color &p_color);
+	// Tarjeta de archivo (imagen, 3D, audio...) como las del chat.
+	void add_media_card_to(VBoxContainer *p_box, const String &p_res_path) { _add_media_card(p_box, p_res_path); }
+	// Mensaje del historial (al cambiar de chat): sin tocar el estado de
+	// trabajo; p_worked_ms > 0 pone "Trabajo durante".
+	void add_history_message(const Dictionary &p_message);
+	// Llamar cuando el runtime avisa de que el turno termino (busy=false).
+	void notify_turn_finished();
+	// Markdown del agente -> BBCode de RichTextLabel (publico para tests).
+	static String markdown_to_bbcode(const String &p_markdown);
 
 	void set_changes(const PackedStringArray &p_paths, int p_additions, int p_deletions);
 	void clear_changes();

@@ -24,6 +24,12 @@ class EditorFileDialog;
 class HBoxContainer;
 class InputEvent;
 class Label;
+class LineEdit;
+class OptionButton;
+class PopupMenu;
+class ProjectList;
+class ProjectManager;
+class LagoonicAboutDialog;
 class LagoonicWaterCaustics;
 class LagoonicSettingsPanel;
 class LagoonicLilyVeil;
@@ -44,9 +50,10 @@ public:
 
 private:
 	LagoonicWaterCaustics *water_caustics = nullptr;
-	Button *classic_pm_button = nullptr;
 	Button *settings_button = nullptr;
+	Button *about_button = nullptr;
 	LagoonicSettingsPanel *settings_panel = nullptr;
+	LagoonicAboutDialog *about_dialog = nullptr;
 	ScrollContainer *main_scroll = nullptr;
 	Control *center_column = nullptr;
 
@@ -58,6 +65,22 @@ private:
 	Button *new_game_button = nullptr;
 	Label *status_label = nullptr;
 
+	// Acciones del gestor clasico, integradas en el inicio.
+	Button *create_project_button = nullptr;
+	Button *import_project_button = nullptr;
+	Button *scan_button = nullptr;
+	Button *templates_button = nullptr;
+	LineEdit *search_edit = nullptr;
+	OptionButton *sort_option = nullptr;
+	Button *remove_missing_button = nullptr;
+	PopupMenu *card_menu = nullptr;
+	String card_menu_path;
+
+	// Vista de plantillas (AssetLib del gestor clasico, reubicada aqui).
+	VBoxContainer *templates_view = nullptr;
+	Button *templates_back_button = nullptr;
+	Control *asset_library = nullptr;
+
 	Label *projects_header_label = nullptr;
 	Label *projects_count_label = nullptr;
 	VBoxContainer *projects_list_vbox = nullptr;
@@ -66,7 +89,11 @@ private:
 
 	EditorFileDialog *open_folder_dialog = nullptr;
 	Control *classic_pm_control = nullptr;
-	bool auto_hide_on_classic_pm = true;
+	ProjectManager *pm = nullptr;
+	ProjectList *pm_list = nullptr;
+	bool classic_connected = false;
+	bool refresh_queued = false;
+	HashSet<String> missing_paths;
 
 	Vector<ProjectEntry> projects;
 	Vector<PanelContainer *> project_cards;
@@ -80,6 +107,7 @@ private:
 	Ref<StyleBoxFlat> primary_btn_pressed;
 	Ref<StyleBoxFlat> subtle_btn_normal;
 	Ref<StyleBoxFlat> subtle_btn_hover;
+	Ref<StyleBoxFlat> flat_btn_normal;
 
 	void _build_ui();
 	void _update_theme_styles();
@@ -89,7 +117,29 @@ private:
 	static String _read_project_name(const String &p_project_dir);
 	void _register_project_in_config(const String &p_project_dir);
 
-	void _on_classic_pm_pressed();
+	void _connect_classic();
+	void _queue_refresh();
+	void _flush_refresh();
+	void _scan_lagoonic_folder();
+	bool _select_for_action(const String &p_project_dir);
+	void _style_subtle(Button *p_button) const;
+	void _style_primary(Button *p_button) const;
+	void _style_flat(Button *p_button) const;
+	void _rebuild_project_cards();
+
+	void _on_create_project_pressed();
+	void _on_import_project_pressed();
+	void _on_scan_pressed();
+	void _on_about_pressed();
+	void _on_remove_missing_pressed();
+	void _show_templates(bool p_show);
+	void _on_search_changed(const String &p_text);
+	void _on_sort_selected(int p_index);
+	void _on_tag_pressed(const String &p_tag);
+	void _on_favorite_pressed(const String &p_project_dir, bool p_favorite);
+	void _on_card_menu_pressed(const String &p_project_dir, Button *p_button);
+	void _on_card_menu_id(int p_id);
+
 	void _on_settings_pressed();
 	void _on_palette_changed();
 	void _on_open_folder_pressed();
@@ -111,6 +161,7 @@ private:
 
 protected:
 	void _notification(int p_what);
+	virtual void shortcut_input(const Ref<InputEvent> &p_event) override;
 	static void _bind_methods();
 
 public:
@@ -119,9 +170,6 @@ public:
 
 	void set_classic_pm_control(Control *p_control);
 	Control *get_classic_pm_control() const;
-
-	void set_auto_hide_on_classic_pm(bool p_auto_hide);
-	bool is_auto_hide_on_classic_pm() const;
 
 	LagoonicVibeHome();
 	~LagoonicVibeHome() override = default;

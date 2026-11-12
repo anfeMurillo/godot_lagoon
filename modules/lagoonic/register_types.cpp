@@ -45,6 +45,7 @@
 #include "runtime/lagoonic_vault.h"
 
 #ifdef TOOLS_ENABLED
+#include "editor/lagoonic_about_dialog.h"
 #include "editor/lagoonic_agent_dock.h"
 #include "editor/lagoonic_bridge_plugin.h"
 #include "editor/lagoonic_chat_view.h"
@@ -53,7 +54,9 @@
 #include "editor/lagoonic_lily_veil.h"
 #include "editor/lagoonic_settings_panel.h"
 #include "editor/lagoonic_style_box_tab.h"
+#include "editor/lagoonic_swatch_picker.h"
 #include "editor/lagoonic_vibe_home.h"
+#include "editor/lagoonic_model_catalog.h"
 #include "editor/lagoonic_vibe_theme.h"
 #include "editor/lagoonic_vibe_workspace.h"
 #include "editor/lagoonic_water_caustics.h"
@@ -180,7 +183,9 @@ void initialize_lagoonic_module(ModuleInitializationLevel p_level) {
 		GDREGISTER_CLASS(LagoonicThemeNotifier);
 		GDREGISTER_CLASS(LagoonicStyleBoxTab);
 		GDREGISTER_CLASS(LagoonicLilyVeil);
+		GDREGISTER_CLASS(LagoonicSwatchPicker);
 		GDREGISTER_CLASS(LagoonicSettingsPanel);
+		GDREGISTER_CLASS(LagoonicAboutDialog);
 		GDREGISTER_CLASS(LagoonicVibeHome);
 		GDREGISTER_CLASS(LagoonicVibeWorkspace);
 		GDREGISTER_VIRTUAL_CLASS(LagoonicBridgePlugin);
@@ -196,6 +201,7 @@ void initialize_lagoonic_module(ModuleInitializationLevel p_level) {
 void uninitialize_lagoonic_module(ModuleInitializationLevel p_level) {
 #ifdef TOOLS_ENABLED
 	if (p_level == MODULE_INITIALIZATION_LEVEL_EDITOR) {
+		LagoonicModelCatalog::shutdown();
 		LagoonicVibeTheme::free_notifier();
 	}
 #else

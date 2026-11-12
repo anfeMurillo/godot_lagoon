@@ -5,6 +5,7 @@
 #include "lagoonic_settings_panel.h"
 
 #include "lagoonic_agent_settings.h"
+#include "lagoonic_swatch_picker.h"
 #include "lagoonic_vibe_theme.h"
 
 #include "../runtime/lagoonic_coding_agents.h"
@@ -20,7 +21,6 @@
 #include "scene/gui/center_container.h"
 #include "scene/gui/check_box.h"
 #include "scene/gui/check_button.h"
-#include "scene/gui/color_picker.h"
 #include "scene/gui/color_rect.h"
 #include "scene/gui/grid_container.h"
 #include "scene/gui/label.h"
@@ -37,6 +37,33 @@
 namespace {
 
 const char *LANGUAGE_SETTING = "interface/editor/localization/editor_language";
+const char *STYLE_SETTING = "interface/theme/style";
+const char *SCALE_SETTING = "interface/editor/appearance/display_scale";
+const char *NETWORK_SETTING = "network/connection/network_mode";
+const char *UPDATES_SETTING = "network/connection/check_for_updates";
+const char *NAMING_SETTING = "project_manager/directory_naming_convention";
+
+constexpr int SCALE_CUSTOM = 7; // "Custom" en el enum de Godot.
+
+// Opciones en el mismo orden que los enums de EditorSettings.
+const char *SCALE_LABELS[] = { "75 %", "100 %", "125 %", "150 %", "175 %", "200 %" };
+const char *UPDATE_LABELS[] = { "No buscar", "Automático", "Última versión preliminar", "Última versión estable", "Último parche" };
+const char *NAMING_LABELS[] = { "Tal cual (sin convención)", "kebab-case", "snake_case", "camelCase", "PascalCase", "Title Case" };
+
+Variant _editor_get(const char *p_key, const Variant &p_default) {
+	EditorSettings *es = EditorSettings::get_singleton();
+	return (es != nullptr && es->has_setting(p_key)) ? es->get_setting(p_key) : p_default;
+}
+
+void _editor_set(const char *p_key, const Variant &p_value) {
+	EditorSettings *es = EditorSettings::get_singleton();
+	if (es == nullptr || (es->has_setting(p_key) && es->get_setting(p_key) == p_value)) {
+		return;
+	}
+	es->set_setting(p_key, p_value);
+	es->notify_changes();
+	es->save();
+}
 
 struct AccentChip {
 	const char *name;
@@ -213,7 +240,7 @@ void LagoonicSettingsPanel::_build() {
 	body->add_child(nav);
 	Ref<ButtonGroup> group;
 	group.instantiate();
-	const char *nav_names[SECTION_COUNT] = { "Temas", "Agentes", "Equipo", "Idioma" };
+	const char *nav_names[SECTION_COUNT] = { "Temas", "Agentes", "Equipo", "Editor", "Idioma" };
 	for (int i = 0; i < SECTION_COUNT; i++) {
 		Button *b = memnew(Button);
 		b->set_text(String::utf8(nav_names[i]));
@@ -244,10 +271,12 @@ void LagoonicSettingsPanel::_build() {
 	sections[SECTION_THEMES] = _build_themes();
 	sections[SECTION_AGENTS] = _build_agents();
 	sections[SECTION_CREW] = _build_crew();
+	sections[SECTION_EDITOR] = _build_editor();
 	sections[SECTION_LANGUAGE] = _build_language();
 	for (int i = 0; i < SECTION_COUNT; i++) {
 		pages->add_child(sections[i]);
 	}
+	_build_color_editor();
 	_show_section(SECTION_THEMES);
 }
 
@@ -260,6 +289,8 @@ void LagoonicSettingsPanel::_show_section(int p_section) {
 		_refresh_agents();
 	} else if (p_section == SECTION_CREW) {
 		_refresh_crew();
+	} else if (p_section == SECTION_EDITOR) {
+		_sync_editor();
 	} else if (p_section == SECTION_LANGUAGE) {
 		_sync_language();
 	}
@@ -271,60 +302,43 @@ void LagoonicSettingsPanel::_show_section(int p_section) {
 
 VBoxContainer *LagoonicSettingsPanel::_build_themes() {
 	VBoxContainer *content = _section_box();
-	content->add_child(_muted(String::utf8("Elige los colores de Lagoonic. Se aplican al inicio, al chat y al editor.")));
+	content->add_child(_muted(String::utf8("Elige los colores de Lagoonic o crea tu propia combinación. Se aplican al inicio, al chat y al editor.")));
 
-	GridContainer *grid = memnew(GridContainer);
-	grid->set_columns(4);
-	grid->add_theme_constant_override(SNAME("h_separation"), 10 * EDSCALE);
-	grid->add_theme_constant_override(SNAME("v_separation"), 10 * EDSCALE);
-	content->add_child(grid);
+	theme_grid = memnew(GridContainer);
+	theme_grid->set_columns(4);
+	theme_grid->add_theme_constant_override(SNAME("h_separation"), 10 * EDSCALE);
+	theme_grid->add_theme_constant_override(SNAME("v_separation"), 10 * EDSCALE);
+	content->add_child(theme_grid);
 
-	const Vector<LagoonicVibeTheme::Palette> &presets = LagoonicVibeTheme::presets();
-	for (int i = 0; i < presets.size(); i++) {
-		Button *b = memnew(Button);
-		b->set_custom_minimum_size(Size2(128, 92) * EDSCALE);
-		b->set_h_size_flags(Control::SIZE_EXPAND_FILL);
-		b->set_focus_mode(Control::FOCUS_NONE);
-		b->set_tooltip_text(presets[i].name);
-		b->connect(SceneStringName(pressed), callable_mp(this, &LagoonicSettingsPanel::_on_preset_pressed).bind(i));
-		grid->add_child(b);
-		preset_buttons.push_back(b);
-
-		VBoxContainer *inner = memnew(VBoxContainer);
-		inner->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
-		inner->set_offset(SIDE_LEFT, 7 * EDSCALE);
-		inner->set_offset(SIDE_TOP, 7 * EDSCALE);
-		inner->set_offset(SIDE_RIGHT, -7 * EDSCALE);
-		inner->set_offset(SIDE_BOTTOM, -5 * EDSCALE);
-		inner->add_theme_constant_override(SNAME("separation"), 4 * EDSCALE);
-		_ignore_mouse(inner);
-		b->add_child(inner);
-
-		Control *swatch = memnew(Control);
-		swatch->set_v_size_flags(Control::SIZE_EXPAND_FILL);
-		_ignore_mouse(swatch);
-		swatch->connect(SceneStringName(draw), callable_mp(this, &LagoonicSettingsPanel::_draw_swatch).bind(swatch, i));
-		inner->add_child(swatch);
-
-		Label *name = memnew(Label);
-		name->set_text(presets[i].name);
-		name->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
-		_ignore_mouse(name);
-		inner->add_child(name);
-	}
+	// Acciones del tema propio activo.
+	custom_row = memnew(HBoxContainer);
+	custom_row->add_theme_constant_override(SNAME("separation"), 8 * EDSCALE);
+	content->add_child(custom_row);
+	custom_label = _muted(String());
+	custom_label->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+	custom_row->add_child(custom_label);
+	Button *edit_custom = memnew(Button);
+	edit_custom->set_text(String::utf8("Editar"));
+	edit_custom->set_theme_type_variation(LagoonicVibeTheme::GHOST_BUTTON);
+	edit_custom->connect(SceneStringName(pressed), callable_mp(this, &LagoonicSettingsPanel::_on_edit_custom_pressed));
+	custom_row->add_child(edit_custom);
+	Button *delete_custom = memnew(Button);
+	delete_custom->set_text(String::utf8("Eliminar"));
+	delete_custom->set_theme_type_variation(LagoonicVibeTheme::GHOST_BUTTON);
+	delete_custom->connect(SceneStringName(pressed), callable_mp(this, &LagoonicSettingsPanel::_on_delete_custom_pressed));
+	custom_row->add_child(delete_custom);
 
 	content->add_child(memnew(HSeparator));
 
-	HBoxContainer *accent_row = _setting_row(content, TTRC("Color de acento"), String::utf8("Botones, agua y detalles. Elige uno o crea el tuyo."));
+	HBoxContainer *accent_row = _setting_row(content, TTRC("Color de acento"), String::utf8("Botones, agua y detalles. Cambia solo el acento del tema elegido."));
 	accent_reset = _right(accent_row, memnew(Button));
 	accent_reset->set_text(TTRC("Usar el del tema"));
 	accent_reset->set_theme_type_variation(LagoonicVibeTheme::GHOST_BUTTON);
 	accent_reset->connect(SceneStringName(pressed), callable_mp(this, &LagoonicSettingsPanel::_on_accent_reset));
-	accent_picker = _right(accent_row, memnew(ColorPickerButton));
-	accent_picker->set_custom_minimum_size(Size2(56, 32) * EDSCALE);
-	accent_picker->set_tooltip_text(TTRC("Otro color"));
-	accent_picker->set_edit_alpha(false);
-	accent_picker->connect(SNAME("color_changed"), callable_mp(this, &LagoonicSettingsPanel::_on_accent_changed));
+	Button *accent_other = _right(accent_row, memnew(Button));
+	accent_other->set_text(String::utf8("Otro color..."));
+	accent_other->set_theme_type_variation(LagoonicVibeTheme::GHOST_BUTTON);
+	accent_other->connect(SceneStringName(pressed), callable_mp(this, &LagoonicSettingsPanel::_open_color_editor).bind(EDITOR_ACCENT));
 
 	HBoxContainer *chips = memnew(HBoxContainer);
 	chips->add_theme_constant_override(SNAME("separation"), 8 * EDSCALE);
@@ -346,7 +360,78 @@ VBoxContainer *LagoonicSettingsPanel::_build_themes() {
 	animations_toggle = _right(anim_row, memnew(CheckButton));
 	animations_toggle->set_focus_mode(Control::FOCUS_NONE);
 	animations_toggle->connect(SceneStringName(toggled), callable_mp(this, &LagoonicSettingsPanel::_on_animations_toggled));
+
+	HBoxContainer *style_row = _setting_row(content, String::utf8("Estilo del editor"), String::utf8("Moderno: paneles redondeados y con aire. Clásico: el aspecto compacto de Godot 4.0-4.5."));
+	style_option = _right(style_row, memnew(OptionButton), 200);
+	style_option->add_item(String::utf8("Moderno"));
+	style_option->set_item_metadata(0, "Modern");
+	style_option->add_item(String::utf8("Clásico"));
+	style_option->set_item_metadata(1, "Classic");
+	style_option->connect(SNAME("item_selected"), callable_mp(this, &LagoonicSettingsPanel::_on_style_selected));
 	return content;
+}
+
+void LagoonicSettingsPanel::_on_style_selected(int p_index) {
+	_editor_set(STYLE_SETTING, style_option->get_item_metadata(p_index));
+}
+
+void LagoonicSettingsPanel::_rebuild_theme_grid() {
+	for (Button *b : preset_buttons) {
+		theme_grid->remove_child(b);
+		b->queue_free(); // Diferido: puede ser el boton que se acaba de pulsar.
+	}
+	preset_buttons.clear();
+	grid_palettes = LagoonicVibeTheme::all_palettes();
+
+	for (int i = 0; i <= grid_palettes.size(); i++) {
+		const bool is_new = i == grid_palettes.size();
+		Button *b = memnew(Button);
+		b->set_custom_minimum_size(Size2(128, 92) * EDSCALE);
+		b->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+		b->set_focus_mode(Control::FOCUS_NONE);
+		b->set_tooltip_text(is_new ? String::utf8("Crea un tema con tus dos colores: principal (fondo) y secundario (acento)") : grid_palettes[i].name);
+		if (is_new) {
+			b->connect(SceneStringName(pressed), callable_mp(this, &LagoonicSettingsPanel::_open_color_editor).bind(EDITOR_NEW_THEME));
+		} else {
+			b->connect(SceneStringName(pressed), callable_mp(this, &LagoonicSettingsPanel::_on_preset_pressed).bind(i));
+		}
+		theme_grid->add_child(b);
+		preset_buttons.push_back(b);
+
+		VBoxContainer *inner = memnew(VBoxContainer);
+		inner->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
+		inner->set_offset(SIDE_LEFT, 7 * EDSCALE);
+		inner->set_offset(SIDE_TOP, 7 * EDSCALE);
+		inner->set_offset(SIDE_RIGHT, -7 * EDSCALE);
+		inner->set_offset(SIDE_BOTTOM, -5 * EDSCALE);
+		inner->add_theme_constant_override(SNAME("separation"), 4 * EDSCALE);
+		_ignore_mouse(inner);
+		b->add_child(inner);
+
+		if (is_new) {
+			Label *plus = memnew(Label);
+			plus->set_text("+");
+			plus->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
+			plus->set_vertical_alignment(VERTICAL_ALIGNMENT_CENTER);
+			plus->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+			plus->add_theme_font_size_override(SceneStringName(font_size), 28 * EDSCALE);
+			_ignore_mouse(plus);
+			inner->add_child(plus);
+		} else {
+			Control *swatch = memnew(Control);
+			swatch->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+			_ignore_mouse(swatch);
+			swatch->connect(SceneStringName(draw), callable_mp(this, &LagoonicSettingsPanel::_draw_swatch).bind(swatch, i));
+			inner->add_child(swatch);
+		}
+
+		Label *name = memnew(Label);
+		name->set_text(is_new ? String::utf8("Crear tema") : grid_palettes[i].name);
+		name->set_horizontal_alignment(is_new ? HORIZONTAL_ALIGNMENT_CENTER : HORIZONTAL_ALIGNMENT_LEFT);
+		name->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
+		_ignore_mouse(name);
+		inner->add_child(name);
+	}
 }
 
 void LagoonicSettingsPanel::_on_animations_toggled(bool p_on) {
@@ -355,33 +440,46 @@ void LagoonicSettingsPanel::_on_animations_toggled(bool p_on) {
 	}
 }
 
-void LagoonicSettingsPanel::_draw_swatch(Control *p_swatch, int p_index) {
-	const Vector<LagoonicVibeTheme::Palette> &presets = LagoonicVibeTheme::presets();
-	if (p_swatch == nullptr || p_index < 0 || p_index >= presets.size()) {
-		return;
-	}
-	const LagoonicVibeTheme::Palette &p = presets[p_index];
-	const Size2 s = p_swatch->get_size();
+void LagoonicSettingsPanel::_paint_palette(Control *p_canvas, const LagoonicVibeTheme::Palette &p) {
+	const Size2 s = p_canvas->get_size();
 	const float u = EDSCALE;
 	// Miniatura: fondo, tarjeta con lineas de texto y boton de acento.
-	p_swatch->draw_style_box(_rounded(p.bg, 8, p.border, 1), Rect2(Point2(), s));
+	p_canvas->draw_style_box(_rounded(p.bg, 8, p.border, 1), Rect2(Point2(), s));
 	const Rect2 card(Point2(8, 8) * u, Size2(s.x * 0.62f, s.y - 16 * u));
-	p_swatch->draw_style_box(_rounded(p.surface, 6), card);
-	p_swatch->draw_style_box(_rounded(p.text, 2), Rect2(card.position + Point2(7, 8) * u, Size2(card.size.x * 0.6f, 4 * u)));
-	p_swatch->draw_style_box(_rounded(p.text_muted, 2), Rect2(card.position + Point2(7, 17) * u, Size2(card.size.x * 0.75f, 3 * u)));
-	p_swatch->draw_style_box(_rounded(Color(p.text_muted, 0.6f), 2), Rect2(card.position + Point2(7, 25) * u, Size2(card.size.x * 0.45f, 3 * u)));
+	p_canvas->draw_style_box(_rounded(p.surface, 6), card);
+	p_canvas->draw_style_box(_rounded(p.text, 2), Rect2(card.position + Point2(7, 8) * u, Size2(card.size.x * 0.6f, 4 * u)));
+	p_canvas->draw_style_box(_rounded(p.text_muted, 2), Rect2(card.position + Point2(7, 17) * u, Size2(card.size.x * 0.75f, 3 * u)));
+	p_canvas->draw_style_box(_rounded(Color(p.text_muted, 0.6f), 2), Rect2(card.position + Point2(7, 25) * u, Size2(card.size.x * 0.45f, 3 * u)));
 	const Size2 pill = Size2(28, 12) * u;
-	p_swatch->draw_style_box(_rounded(p.accent, 6), Rect2(Point2(s.x - pill.x - 8 * u, s.y - pill.y - 8 * u), pill));
+	p_canvas->draw_style_box(_rounded(p.accent, 6), Rect2(Point2(s.x - pill.x - 8 * u, s.y - pill.y - 8 * u), pill));
+}
+
+void LagoonicSettingsPanel::_draw_swatch(Control *p_swatch, int p_index) {
+	if (p_swatch == nullptr || p_index < 0 || p_index >= grid_palettes.size()) {
+		return;
+	}
+	_paint_palette(p_swatch, grid_palettes[p_index]);
 }
 
 void LagoonicSettingsPanel::_sync_from_palette() {
 	set_theme(LagoonicVibeTheme::build());
 	const LagoonicVibeTheme::Palette cur = LagoonicVibeTheme::current();
 	const String active = LagoonicVibeTheme::get_preset_id();
-	const Vector<LagoonicVibeTheme::Palette> &presets = LagoonicVibeTheme::presets();
+
+	// Se rehace la rejilla si cambio la lista (tema propio creado o eliminado).
+	const Vector<LagoonicVibeTheme::Palette> all = LagoonicVibeTheme::all_palettes();
+	bool same = all.size() == grid_palettes.size();
+	for (int i = 0; same && i < all.size(); i++) {
+		same = all[i].id == grid_palettes[i].id && all[i].name == grid_palettes[i].name && all[i].bg == grid_palettes[i].bg && all[i].accent == grid_palettes[i].accent;
+	}
+	if (!same) {
+		_rebuild_theme_grid();
+	}
+
 	for (int i = 0; i < preset_buttons.size(); i++) {
-		const bool selected = presets[i].id == active;
-		Ref<StyleBoxFlat> normal = _rounded(cur.surface, 12, selected ? cur.accent : cur.border, selected ? 2 : 1);
+		const bool is_new = i >= grid_palettes.size();
+		const bool selected = !is_new && grid_palettes[i].id == active;
+		Ref<StyleBoxFlat> normal = _rounded(is_new ? Color(cur.surface, 0.0f) : cur.surface, 12, selected ? cur.accent : cur.border, selected ? 2 : 1);
 		Ref<StyleBoxFlat> hover = _rounded(cur.surface_hover, 12, selected ? cur.accent : Color(cur.accent, 0.6f), selected ? 2 : 1);
 		Button *b = preset_buttons[i];
 		b->add_theme_style_override(SNAME("normal"), normal);
@@ -390,6 +488,15 @@ void LagoonicSettingsPanel::_sync_from_palette() {
 		b->add_theme_style_override(SNAME("focus"), memnew(StyleBoxEmpty));
 		b->queue_redraw();
 	}
+
+	String custom_name;
+	Color main, secondary;
+	const bool custom_theme = LagoonicVibeTheme::get_custom(active, custom_name, main, secondary);
+	custom_row->set_visible(custom_theme);
+	if (custom_theme) {
+		custom_label->set_text(vformat(String::utf8("Tu tema «%s»"), custom_name));
+	}
+
 	const bool custom = LagoonicVibeTheme::has_custom_accent();
 	for (int i = 0; i < accent_chips.size(); i++) {
 		const Color c = ACCENT_CHIPS[i].color;
@@ -400,14 +507,21 @@ void LagoonicSettingsPanel::_sync_from_palette() {
 		chip->add_theme_style_override(SNAME("pressed"), _rounded(c, 14, cur.text, 3));
 		chip->add_theme_style_override(SNAME("focus"), memnew(StyleBoxEmpty));
 	}
-	if (accent_picker != nullptr) {
-		accent_picker->set_pick_color(cur.accent);
-	}
 	if (accent_reset != nullptr) {
 		accent_reset->set_visible(custom);
 	}
 	if (animations_toggle != nullptr) {
 		animations_toggle->set_pressed_no_signal(LagoonicVibeTheme::animations_enabled());
+	}
+	if (style_option != nullptr) {
+		style_option->select(String(_editor_get(STYLE_SETTING, "Modern")) == "Classic" ? 1 : 0);
+	}
+	if (editor_card != nullptr) {
+		editor_card->add_theme_style_override(SceneStringName(panel), _rounded(cur.surface, 16, cur.border, 1));
+		editor_preview->queue_redraw();
+		for (Control *dot : editor_slot_dots) {
+			dot->queue_redraw();
+		}
 	}
 	for (int i = 0; i < provider_rows.size(); i++) {
 		_refresh_provider_row(i);
@@ -415,9 +529,8 @@ void LagoonicSettingsPanel::_sync_from_palette() {
 }
 
 void LagoonicSettingsPanel::_on_preset_pressed(int p_index) {
-	const Vector<LagoonicVibeTheme::Palette> &presets = LagoonicVibeTheme::presets();
-	if (p_index >= 0 && p_index < presets.size()) {
-		LagoonicVibeTheme::set_preset(presets[p_index].id);
+	if (p_index >= 0 && p_index < grid_palettes.size()) {
+		LagoonicVibeTheme::set_preset(grid_palettes[p_index].id);
 	}
 }
 
@@ -427,12 +540,203 @@ void LagoonicSettingsPanel::_on_accent_chip_pressed(int p_index) {
 	}
 }
 
-void LagoonicSettingsPanel::_on_accent_changed(const Color &p_color) {
-	LagoonicVibeTheme::set_custom_accent(p_color);
-}
-
 void LagoonicSettingsPanel::_on_accent_reset() {
 	LagoonicVibeTheme::clear_custom_accent();
+}
+
+void LagoonicSettingsPanel::_on_edit_custom_pressed() {
+	_open_color_editor(EDITOR_EDIT_THEME);
+}
+
+void LagoonicSettingsPanel::_on_delete_custom_pressed() {
+	const String id = LagoonicVibeTheme::get_preset_id();
+	if (LagoonicVibeTheme::is_custom(id)) {
+		LagoonicVibeTheme::delete_custom(id);
+	}
+}
+
+// Editor de color: tema propio (principal + secundario) o solo el acento.
+
+void LagoonicSettingsPanel::_build_color_editor() {
+	editor_layer = memnew(Control);
+	editor_layer->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
+	editor_layer->set_visible(false);
+	add_child(editor_layer);
+
+	ColorRect *dim = memnew(ColorRect);
+	dim->set_color(Color(0, 0, 0, 0.35f));
+	dim->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
+	editor_layer->add_child(dim);
+
+	CenterContainer *center = memnew(CenterContainer);
+	center->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
+	_ignore_mouse(center);
+	editor_layer->add_child(center);
+
+	editor_card = memnew(PanelContainer);
+	center->add_child(editor_card);
+
+	MarginContainer *margin = memnew(MarginContainer);
+	for (const char *side : { "margin_left", "margin_right", "margin_top", "margin_bottom" }) {
+		margin->add_theme_constant_override(side, 22 * EDSCALE);
+	}
+	editor_card->add_child(margin);
+
+	VBoxContainer *root = memnew(VBoxContainer);
+	root->add_theme_constant_override(SNAME("separation"), 16 * EDSCALE);
+	margin->add_child(root);
+
+	editor_title = memnew(Label);
+	editor_title->set_theme_type_variation(LagoonicVibeTheme::TITLE_LABEL);
+	root->add_child(editor_title);
+
+	// Nombre + vista previa del tema.
+	editor_theme_box = memnew(HBoxContainer);
+	editor_theme_box->add_theme_constant_override(SNAME("separation"), 16 * EDSCALE);
+	root->add_child(editor_theme_box);
+
+	editor_preview = memnew(Control);
+	editor_preview->set_custom_minimum_size(Size2(150, 96) * EDSCALE);
+	editor_preview->connect(SceneStringName(draw), callable_mp(this, &LagoonicSettingsPanel::_draw_editor_preview));
+	editor_theme_box->add_child(editor_preview);
+
+	VBoxContainer *fields = memnew(VBoxContainer);
+	fields->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	fields->add_theme_constant_override(SNAME("separation"), 8 * EDSCALE);
+	editor_theme_box->add_child(fields);
+
+	editor_name = memnew(LineEdit);
+	editor_name->set_placeholder(String::utf8("Nombre del tema"));
+	editor_name->set_max_length(32);
+	fields->add_child(editor_name);
+
+	HBoxContainer *slots = memnew(HBoxContainer);
+	slots->add_theme_constant_override(SNAME("separation"), 8 * EDSCALE);
+	fields->add_child(slots);
+	const char *slot_names[2] = { "Principal", "Secundario" };
+	const char *slot_hints[2] = { "Color de fondo: define si el tema es claro u oscuro", "Color de acento: botones, agua y detalles" };
+	for (int i = 0; i < 2; i++) {
+		Button *slot = memnew(Button);
+		slot->set_tooltip_text(String::utf8(slot_hints[i]));
+		slot->set_toggle_mode(true);
+		slot->set_theme_type_variation(LagoonicVibeTheme::CHIP_BUTTON);
+		slot->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+		slot->set_custom_minimum_size(Size2(150, 38) * EDSCALE);
+		slot->set_focus_mode(Control::FOCUS_NONE);
+		slot->connect(SceneStringName(pressed), callable_mp(this, &LagoonicSettingsPanel::_select_slot).bind(i));
+		slots->add_child(slot);
+		editor_slots.push_back(slot);
+
+		// Contenido propio: punto de color + nombre, centrados y sin solaparse.
+		CenterContainer *center_content = memnew(CenterContainer);
+		center_content->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
+		_ignore_mouse(center_content);
+		slot->add_child(center_content);
+		HBoxContainer *content_row = memnew(HBoxContainer);
+		content_row->add_theme_constant_override(SNAME("separation"), 8 * EDSCALE);
+		_ignore_mouse(content_row);
+		center_content->add_child(content_row);
+		Control *dot = memnew(Control);
+		dot->set_custom_minimum_size(Size2(14, 14) * EDSCALE);
+		dot->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+		_ignore_mouse(dot);
+		dot->connect(SceneStringName(draw), callable_mp(this, &LagoonicSettingsPanel::_draw_slot_dot).bind(i));
+		content_row->add_child(dot);
+		editor_slot_dots.push_back(dot);
+		Label *slot_label = memnew(Label);
+		slot_label->set_text(String::utf8(slot_names[i]));
+		_ignore_mouse(slot_label);
+		content_row->add_child(slot_label);
+	}
+
+	editor_picker = memnew(LagoonicSwatchPicker);
+	editor_picker->connect(SNAME("color_changed"), callable_mp(this, &LagoonicSettingsPanel::_on_editor_color_changed));
+	root->add_child(editor_picker);
+
+	HBoxContainer *actions = memnew(HBoxContainer);
+	actions->set_alignment(BoxContainer::ALIGNMENT_END);
+	actions->add_theme_constant_override(SNAME("separation"), 8 * EDSCALE);
+	root->add_child(actions);
+	Button *cancel = memnew(Button);
+	cancel->set_text(TTRC("Cancelar"));
+	cancel->set_theme_type_variation(LagoonicVibeTheme::GHOST_BUTTON);
+	cancel->connect(SceneStringName(pressed), callable_mp(this, &LagoonicSettingsPanel::_close_color_editor));
+	actions->add_child(cancel);
+	editor_save = memnew(Button);
+	editor_save->set_theme_type_variation(LagoonicVibeTheme::SEND_BUTTON);
+	editor_save->connect(SceneStringName(pressed), callable_mp(this, &LagoonicSettingsPanel::_on_editor_save));
+	actions->add_child(editor_save);
+}
+
+void LagoonicSettingsPanel::_open_color_editor(int p_mode) {
+	editor_mode = p_mode;
+	editor_theme_id = String();
+	const LagoonicVibeTheme::Palette cur = LagoonicVibeTheme::current();
+	if (p_mode == EDITOR_EDIT_THEME) {
+		editor_theme_id = LagoonicVibeTheme::get_preset_id();
+		String name;
+		if (!LagoonicVibeTheme::get_custom(editor_theme_id, name, editor_colors[0], editor_colors[1])) {
+			return;
+		}
+		editor_name->set_text(name);
+	} else {
+		// Se parte del tema actual: es facil ajustar solo lo que no gusta.
+		editor_colors[0] = cur.light ? cur.bg : cur.surface;
+		editor_colors[1] = cur.accent;
+		editor_name->set_text(String());
+	}
+	const bool accent_only = p_mode == EDITOR_ACCENT;
+	editor_title->set_text(accent_only ? String::utf8("Color de acento") : (p_mode == EDITOR_EDIT_THEME ? String::utf8("Editar tema") : String::utf8("Crear tema")));
+	editor_save->set_text(accent_only ? String::utf8("Aplicar") : String::utf8("Guardar tema"));
+	editor_theme_box->set_visible(!accent_only);
+	_select_slot(accent_only ? 1 : 0);
+	_sync_from_palette();
+	editor_layer->show();
+	editor_layer->move_to_front();
+	if (!accent_only) {
+		editor_name->grab_focus();
+	}
+}
+
+void LagoonicSettingsPanel::_close_color_editor() {
+	editor_layer->hide();
+}
+
+void LagoonicSettingsPanel::_select_slot(int p_slot) {
+	editor_slot = CLAMP(p_slot, 0, 1);
+	for (int i = 0; i < editor_slots.size(); i++) {
+		editor_slots[i]->set_pressed_no_signal(i == editor_slot);
+	}
+	editor_picker->set_color(editor_colors[editor_slot]);
+}
+
+void LagoonicSettingsPanel::_on_editor_color_changed(const Color &p_color) {
+	editor_colors[editor_slot] = p_color;
+	editor_preview->queue_redraw();
+	for (Control *dot : editor_slot_dots) {
+		dot->queue_redraw();
+	}
+}
+
+void LagoonicSettingsPanel::_draw_slot_dot(int p_slot) {
+	if (p_slot < 0 || p_slot >= editor_slot_dots.size()) {
+		return;
+	}
+	Control *dot = editor_slot_dots[p_slot];
+	dot->draw_style_box(_rounded(editor_colors[p_slot], 7, Color(LagoonicVibeTheme::current().text, 0.3f), 1), Rect2(Point2(), dot->get_size()));
+}
+
+void LagoonicSettingsPanel::_draw_editor_preview() {
+	_paint_palette(editor_preview, LagoonicVibeTheme::palette_from_colors(String(), String(), editor_colors[0], editor_colors[1]));
+}
+
+void LagoonicSettingsPanel::_on_editor_save() {
+	if (editor_mode == EDITOR_ACCENT) {
+		LagoonicVibeTheme::set_custom_accent(editor_colors[1]);
+	} else {
+		(void)LagoonicVibeTheme::save_custom(editor_theme_id, editor_name->get_text(), editor_colors[0], editor_colors[1]); // Queda activo.
+	}
+	_close_color_editor();
 }
 
 // ---------------------------------------------------------------------------
@@ -744,6 +1048,121 @@ void LagoonicSettingsPanel::_on_crew_worker_toggled(bool p_on, int p_index) {
 }
 
 // ---------------------------------------------------------------------------
+// Editor
+// ---------------------------------------------------------------------------
+
+VBoxContainer *LagoonicSettingsPanel::_build_editor() {
+	VBoxContainer *content = _section_box();
+	content->add_child(_muted(String::utf8("Preferencias del editor de Godot que usa Lagoonic.")));
+
+	HBoxContainer *scale_row = _setting_row(content, String::utf8("Tamaño de la interfaz"), String::utf8("Agranda o reduce textos y botones. Se aplica al reiniciar."));
+	scale_option = _right(scale_row, memnew(OptionButton), 250);
+	scale_option->add_item(vformat(String::utf8("Automático (%d %%)"), (int)Math::round(EditorSettings::get_auto_display_scale() * 100)), 0);
+	for (int i = 0; i < 6; i++) {
+		scale_option->add_item(String::utf8(SCALE_LABELS[i]), i + 1);
+	}
+	scale_option->connect(SNAME("item_selected"), callable_mp(this, &LagoonicSettingsPanel::_on_scale_selected));
+
+	HBoxContainer *restart = memnew(HBoxContainer);
+	restart->add_theme_constant_override(SNAME("separation"), 10 * EDSCALE);
+	restart->set_visible(false);
+	content->add_child(restart);
+	restart->add_child(_muted(String::utf8("El nuevo tamaño se verá al reiniciar Lagoonic.")));
+	Button *restart_button = memnew(Button);
+	restart_button->set_text(TTRC("Reiniciar ahora"));
+	restart_button->set_theme_type_variation(LagoonicVibeTheme::SEND_BUTTON);
+	restart_button->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+	restart_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicSettingsPanel::_on_restart_pressed));
+	restart->add_child(restart_button);
+	editor_restart_row = restart;
+
+	content->add_child(memnew(HSeparator));
+
+	HBoxContainer *network_row = _setting_row(content, String::utf8("Conexión a internet"), String::utf8("Sin conexión, el editor no descarga plantillas ni busca actualizaciones."));
+	network_option = _right(network_row, memnew(OptionButton), 250);
+	network_option->add_item(String::utf8("Sin conexión"), 0);
+	network_option->add_item(String::utf8("En línea"), 1);
+	network_option->connect(SNAME("item_selected"), callable_mp(this, &LagoonicSettingsPanel::_on_network_selected));
+
+	HBoxContainer *updates_row = _setting_row(content, String::utf8("Buscar actualizaciones"), String::utf8("Avisa en el inicio cuando sale una versión nueva de Godot Engine."));
+	updates_option = _right(updates_row, memnew(OptionButton), 250);
+	for (int i = 0; i < 5; i++) {
+		updates_option->add_item(String::utf8(UPDATE_LABELS[i]), i);
+	}
+	updates_option->connect(SNAME("item_selected"), callable_mp(this, &LagoonicSettingsPanel::_on_updates_selected));
+
+	content->add_child(memnew(HSeparator));
+
+	HBoxContainer *naming_row = _setting_row(content, String::utf8("Nombre de carpetas nuevas"), String::utf8("Cómo se nombra la carpeta al crear un proyecto con «Crear proyecto...»."));
+	naming_option = _right(naming_row, memnew(OptionButton), 250);
+	for (int i = 0; i < 6; i++) {
+		naming_option->add_item(String::utf8(NAMING_LABELS[i]), i);
+	}
+	naming_option->connect(SNAME("item_selected"), callable_mp(this, &LagoonicSettingsPanel::_on_naming_selected));
+
+	content->add_child(memnew(HSeparator));
+
+	HBoxContainer *all_row = _setting_row(content, String::utf8("Todos los ajustes"), String::utf8("Atajos, editores de código, rendimiento y el resto de opciones avanzadas de Godot."));
+	all_settings_button = _right(all_row, memnew(Button));
+	all_settings_button->set_text(String::utf8("Abrir ajustes avanzados..."));
+	all_settings_button->set_theme_type_variation(LagoonicVibeTheme::GHOST_BUTTON);
+	all_settings_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicSettingsPanel::_on_all_settings_pressed));
+	all_row->set_visible(false);
+	return content;
+}
+
+void LagoonicSettingsPanel::_sync_editor() {
+	const int scale = _editor_get(SCALE_SETTING, 0);
+	if (scale_at_open < 0) {
+		scale_at_open = scale; // Escala con la que arranco el proceso.
+	}
+	if (scale == SCALE_CUSTOM) {
+		if (scale_option->get_item_index(SCALE_CUSTOM) < 0) {
+			const float custom = _editor_get("interface/editor/appearance/custom_display_scale", 1.0);
+			scale_option->add_item(vformat(String::utf8("Personalizado (%d %%)"), (int)Math::round(custom * 100)), SCALE_CUSTOM);
+		}
+	}
+	scale_option->select(MAX(scale_option->get_item_index(scale), 0));
+	editor_restart_row->set_visible(scale != scale_at_open);
+
+	const int network = _editor_get(NETWORK_SETTING, 0);
+	network_option->select(network_option->get_item_index(network));
+	updates_option->select(MAX(updates_option->get_item_index((int)_editor_get(UPDATES_SETTING, 1)), 0));
+	updates_option->set_disabled(network == 0);
+	naming_option->select(MAX(naming_option->get_item_index((int)_editor_get(NAMING_SETTING, 1)), 0));
+	all_settings_button->get_parent_control()->set_visible(all_settings_callback.is_valid());
+}
+
+void LagoonicSettingsPanel::_on_scale_selected(int p_index) {
+	_editor_set(SCALE_SETTING, scale_option->get_item_id(p_index));
+	_sync_editor();
+}
+
+void LagoonicSettingsPanel::_on_network_selected(int p_index) {
+	_editor_set(NETWORK_SETTING, network_option->get_item_id(p_index));
+	_sync_editor();
+}
+
+void LagoonicSettingsPanel::_on_updates_selected(int p_index) {
+	_editor_set(UPDATES_SETTING, updates_option->get_item_id(p_index));
+}
+
+void LagoonicSettingsPanel::_on_naming_selected(int p_index) {
+	_editor_set(NAMING_SETTING, naming_option->get_item_id(p_index));
+}
+
+void LagoonicSettingsPanel::_on_all_settings_pressed() {
+	if (all_settings_callback.is_valid()) {
+		close();
+		all_settings_callback.call();
+	}
+}
+
+void LagoonicSettingsPanel::set_all_settings_callback(const Callable &p_callback) {
+	all_settings_callback = p_callback;
+}
+
+// ---------------------------------------------------------------------------
 // Idioma
 // ---------------------------------------------------------------------------
 
@@ -850,6 +1269,9 @@ void LagoonicSettingsPanel::open() {
 }
 
 void LagoonicSettingsPanel::close() {
+	if (editor_layer != nullptr && editor_layer->is_visible()) {
+		_close_color_editor();
+	}
 	if (model_edit != nullptr && model_edit->has_focus()) {
 		_save_model();
 	}

@@ -1,9 +1,9 @@
 short_name = "godot"
-name = "Godot Engine"
+name = "Lagoonic Engine"
 major = 4
 minor = 7
 patch = 2
 status = "stable"
-module_config = ""
+module_config = ".lagoonic.1"
 website = "https://godotengine.org"
 docs = "4.7"

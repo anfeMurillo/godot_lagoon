@@ -34,6 +34,8 @@
 #include "lagoonic_vibe_workspace.h"
 #include "lagoonic_vibe_theme.h"
 
+#include "../runtime/lagoonic_mcp_locator.h"
+
 #include "core/error/error_macros.h"
 #include "core/io/dir_access.h"
 #include "core/io/file_access.h"
@@ -53,6 +55,7 @@
 #include "core/version.h"
 #include "editor/editor_data.h"
 #include "editor/editor_interface.h"
+#include "editor/editor_node.h"
 #include "editor/file_system/editor_file_system.h"
 #include "editor/script/script_editor_plugin.h"
 #include "scene/main/node.h"
@@ -78,6 +81,7 @@ void LagoonicBridgePlugin::_notification(int p_what) {
 		case NOTIFICATION_ENTER_TREE: {
 			set_process(true);
 			_ensure_dock();
+			_install_addon();
 			_start_server();
 		} break;
 		case NOTIFICATION_EXIT_TREE: {
@@ -133,6 +137,62 @@ void LagoonicBridgePlugin::_start_server() {
 	_write_editor_json();
 }
 
+static const char *LAGOONIC_ADDON_CFG = "res://addons/lagoonic/plugin.cfg";
+
+void LagoonicBridgePlugin::_install_addon() {
+	// Only for an editor someone is using. Runs without a window (--import,
+	// --export-* from scripts and from lagoonic-mcp itself) leave the project
+	// alone, unless LAGOONIC_ADDON_INSTALL=1 asks for it (tests).
+	if (EditorNode::is_cmdline_mode() && OS::get_singleton()->get_environment("LAGOONIC_ADDON_INSTALL") != "1") {
+		return;
+	}
+	for (const String &arg : OS::get_singleton()->get_cmdline_args()) {
+		if (arg.begins_with("--export")) {
+			return;
+		}
+	}
+	// Before the first scan, so an updated plugin is the one that loads.
+	addon_pending = LagoonicMcpLocator::install_addon(ProjectSettings::get_singleton()->get_resource_path());
+}
+
+void LagoonicBridgePlugin::_enable_addon_when_ready() {
+	if (!addon_pending) {
+		return;
+	}
+	EditorNode *editor = EditorNode::get_singleton();
+	if (editor == nullptr || !editor->is_editor_ready()) {
+		return;
+	}
+	addon_pending = false;
+	if (editor->is_addon_plugin_enabled(LAGOONIC_ADDON_CFG)) {
+		return;
+	}
+	// Already listed in project.godot: the editor is still loading it.
+	if (ProjectSettings::get_singleton()->has_setting("editor_plugins/enabled")) {
+		const PackedStringArray listed = GLOBAL_GET("editor_plugins/enabled");
+		if (listed.has(LAGOONIC_ADDON_CFG)) {
+			return;
+		}
+	}
+	editor->set_addon_plugin_enabled(LAGOONIC_ADDON_CFG, true, true);
+}
+
+// The GDScript plugin writes the same file with its own port once it loads.
+bool LagoonicBridgePlugin::_editor_json_is_ours() const {
+	const String path = "res://.lagoonic/editor.json";
+	if (!FileAccess::exists(path)) {
+		return true;
+	}
+	const Variant parsed = JSON::parse_string(FileAccess::get_file_as_string(path));
+	if (parsed.get_type() != Variant::DICTIONARY) {
+		return true;
+	}
+	const Dictionary info = parsed;
+	const int their_pid = info.get("pid", 0);
+	const int their_port = info.get("port", 0);
+	return their_pid != OS::get_singleton()->get_process_id() || their_port == port;
+}
+
 void LagoonicBridgePlugin::_stop_server() {
 	if (!running && clients.is_empty() && server.is_null()) {
 		return;
@@ -147,8 +207,8 @@ void LagoonicBridgePlugin::_stop_server() {
 		server.unref();
 	}
 	running = false;
+	_remove_editor_json(); // Needs the port to know the file is ours.
 	port = 0;
-	_remove_editor_json();
 }
 
 void LagoonicBridgePlugin::_ensure_dock() {
@@ -198,6 +258,7 @@ void LagoonicBridgePlugin::_free_dock() {
 }
 
 void LagoonicBridgePlugin::_poll() {
+	_enable_addon_when_ready();
 	if (!running) {
 		return;
 	}
@@ -546,6 +607,9 @@ void LagoonicBridgePlugin::_write_editor_json() const {
 }
 
 void LagoonicBridgePlugin::_remove_editor_json() const {
+	if (!_editor_json_is_ours()) {
+		return;
+	}
 	Ref<DirAccess> da = DirAccess::open("res://");
 	if (da.is_valid()) {
 		da->remove(".lagoonic/editor.json");

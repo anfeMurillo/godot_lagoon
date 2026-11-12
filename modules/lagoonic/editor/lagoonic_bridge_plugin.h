@@ -96,6 +96,13 @@ private:
 	void _notification(int p_what);
 
 	void _start_server();
+	// The GDScript plugin (protocol 2: exec, live edits with undo) shipped with
+	// lagoonic-mcp. Copied into the project when the editor opens it and
+	// enabled once the editor is ready; this C++ bridge stays as the fallback.
+	bool addon_pending = false;
+	void _install_addon();
+	void _enable_addon_when_ready();
+	bool _editor_json_is_ours() const;
 	void _stop_server();
 	void _ensure_dock();
 	void _free_dock();
