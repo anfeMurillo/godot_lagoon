@@ -32,6 +32,7 @@ class LagoonicSettingsPanel : public Control {
 	enum Section {
 		SECTION_THEMES,
 		SECTION_AGENTS,
+		SECTION_OPENCODE,
 		SECTION_CREW,
 		SECTION_EDITOR,
 		SECTION_LANGUAGE,
@@ -121,6 +122,7 @@ class LagoonicSettingsPanel : public Control {
 	void _build();
 	VBoxContainer *_build_themes();
 	VBoxContainer *_build_agents();
+	VBoxContainer *_build_opencode();
 	VBoxContainer *_build_crew();
 	VBoxContainer *_build_editor();
 	VBoxContainer *_build_language();

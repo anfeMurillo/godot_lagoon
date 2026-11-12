@@ -240,7 +240,7 @@ void LagoonicSettingsPanel::_build() {
 	body->add_child(nav);
 	Ref<ButtonGroup> group;
 	group.instantiate();
-	const char *nav_names[SECTION_COUNT] = { "Temas", "Agentes", "Equipo", "Editor", "Idioma" };
+	const char *nav_names[SECTION_COUNT] = { "Temas", "Agentes", "OpenCode", "Equipo", "Editor", "Idioma" };
 	for (int i = 0; i < SECTION_COUNT; i++) {
 		Button *b = memnew(Button);
 		b->set_text(String::utf8(nav_names[i]));
@@ -270,6 +270,7 @@ void LagoonicSettingsPanel::_build() {
 
 	sections[SECTION_THEMES] = _build_themes();
 	sections[SECTION_AGENTS] = _build_agents();
+	sections[SECTION_OPENCODE] = _build_opencode();
 	sections[SECTION_CREW] = _build_crew();
 	sections[SECTION_EDITOR] = _build_editor();
 	sections[SECTION_LANGUAGE] = _build_language();
@@ -285,7 +286,7 @@ void LagoonicSettingsPanel::_show_section(int p_section) {
 		sections[i]->set_visible(i == p_section);
 		nav_buttons[i]->set_pressed_no_signal(i == p_section);
 	}
-	if (p_section == SECTION_AGENTS) {
+	if (p_section == SECTION_AGENTS || p_section == SECTION_OPENCODE) {
 		_refresh_agents();
 	} else if (p_section == SECTION_CREW) {
 		_refresh_crew();
@@ -780,7 +781,14 @@ VBoxContainer *LagoonicSettingsPanel::_build_agents() {
 	mode_option->add_item(TTRC("Solo planificar"), LagoonicAgentSettings::MODE_PLAN);
 	mode_option->connect(SNAME("item_selected"), callable_mp(this, &LagoonicSettingsPanel::_on_mode_selected));
 
-	HBoxContainer *model_row = _setting_row(content, TTRC("Modelo"), String::utf8("Opcional, solo para OpenCode. Déjalo vacío para usar el recomendado."));
+	return content;
+}
+
+VBoxContainer *LagoonicSettingsPanel::_build_opencode() {
+	VBoxContainer *content = _section_box();
+	content->add_child(_muted(String::utf8("Ajustes del OpenCode interno de Lagoonic: el motor que responde cuando el agente principal es OpenCode. Claude Code, Codex y los demás usan su propia cuenta y no necesitan nada de esto.")));
+
+	HBoxContainer *model_row = _setting_row(content, TTRC("Modelo"), String::utf8("Opcional. Déjalo vacío para usar el recomendado."));
 	model_edit = _right(model_row, memnew(LineEdit), 250);
 	model_edit->set_placeholder(TTRC("proveedor/modelo"));
 	model_edit->connect(SNAME("text_submitted"), callable_mp(this, &LagoonicSettingsPanel::_on_model_submitted));
@@ -791,7 +799,7 @@ VBoxContainer *LagoonicSettingsPanel::_build_agents() {
 	Label *keys_title = memnew(Label);
 	keys_title->set_text(TTRC("Claves de proveedores"));
 	content->add_child(keys_title);
-	content->add_child(_muted(String::utf8("Solo si usas tu propia cuenta. Se guardan cifradas en este equipo y solo las recibe el agente.")));
+	content->add_child(_muted(String::utf8("Solo si usas tu propia cuenta. Se guardan cifradas en este equipo y solo las recibe OpenCode.")));
 
 	for (int i = 0; i < LagoonicAgentSettings::PROVIDER_COUNT; i++) {
 		const LagoonicAgentSettings::Provider &p = LagoonicAgentSettings::PROVIDERS[i];
