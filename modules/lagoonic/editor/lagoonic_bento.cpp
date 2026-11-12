@@ -35,6 +35,7 @@
 #include "lagoonic_water_caustics.h"
 
 #include "core/object/callable_mp.h"
+#include "core/object/class_db.h"
 #include "editor/themes/editor_scale.h"
 #include "scene/gui/box_container.h"
 #include "scene/gui/button.h"
@@ -42,6 +43,8 @@
 #include "scene/gui/margin_container.h"
 #include "scene/gui/texture_rect.h"
 #include "scene/resources/style_box_flat.h"
+#include "scene/gui/panel_container.h"
+#include "scene/main/viewport.h"
 
 // ---------------------------------------------------------------- tarjeta
 
@@ -95,6 +98,75 @@ HBoxContainer *LagoonicBento::enable_water_header(float p_height) {
 	return header_actions;
 }
 
+LagoonicBentoBoard *LagoonicBento::_board() const {
+	for (Node *n = get_parent(); n != nullptr; n = n->get_parent()) {
+		if (LagoonicBentoBoard *board = Object::cast_to<LagoonicBentoBoard>(n)) {
+			return board;
+		}
+	}
+	return nullptr;
+}
+
+String LagoonicBento::get_title() const {
+	return title_label->get_text();
+}
+
+Variant LagoonicBento::_make_drag_data() {
+	LagoonicBentoBoard *board = _board();
+	if (board == nullptr || !board->get_expanded().is_empty()) {
+		return Variant();
+	}
+	const LagoonicVibeTheme::Palette p = LagoonicVibeTheme::current();
+	PanelContainer *preview = memnew(PanelContainer);
+	Ref<StyleBoxFlat> sb;
+	sb.instantiate();
+	sb->set_bg_color(Color(card_color(), 0.95f));
+	sb->set_border_color(p.accent);
+	sb->set_border_width_all(1);
+	sb->set_corner_radius_all(int(10 * EDSCALE));
+	sb->set_content_margin_individual(14 * EDSCALE, 8 * EDSCALE, 14 * EDSCALE, 8 * EDSCALE);
+	preview->add_theme_style_override(SceneStringName(panel), sb);
+	Label *l = memnew(Label);
+	l->set_text(get_title().is_empty() ? String("Chat") : get_title());
+	preview->add_child(l);
+	set_drag_preview(preview);
+	Dictionary d;
+	d["type"] = "lagoonic_bento";
+	d["id"] = bento_id;
+	return d;
+}
+
+Variant LagoonicBento::get_drag_data(const Point2 &p_point) {
+	// Desde la cabecera, ademas del asa.
+	if (p_point.y > header_band->get_size().y) {
+		return Variant();
+	}
+	return _make_drag_data();
+}
+
+void LagoonicBento::set_expandable(bool p_expandable) {
+	expand_button->set_visible(p_expandable);
+}
+
+void LagoonicBento::set_expanded_look(bool p_expanded) {
+	if (p_expanded) {
+		expand_button->set_text(String::utf8("← Volver"));
+		expand_button->set_button_icon(Ref<Texture2D>());
+		expand_button->set_tooltip_text(String::utf8("Vuelve a ver todos los paneles."));
+	} else {
+		expand_button->set_text(String());
+		expand_button->set_tooltip_text(String::utf8("Amplía este panel a toda la pantalla."));
+		_refresh_icons();
+	}
+	drag_handle->set_visible(!p_expanded);
+}
+
+void LagoonicBento::_on_expand_pressed() {
+	if (LagoonicBentoBoard *board = _board()) {
+		board->toggle_expanded(bento_id);
+	}
+}
+
 void LagoonicBento::_on_close_pressed() {
 	if (close_callback.is_valid()) {
 		close_callback.call(bento_id);
@@ -108,6 +180,10 @@ void LagoonicBento::_refresh_icons() {
 	icon_rect->set_texture(icon_name == StringName() ? Ref<Texture2D>() : get_editor_theme_icon(icon_name));
 	icon_rect->set_visible(water == nullptr && icon_name != StringName());
 	close_button->set_button_icon(get_editor_theme_icon(SNAME("Close")));
+	drag_handle->set_button_icon(get_editor_theme_icon(SNAME("TripleBar")));
+	if (expand_button->get_text().is_empty()) {
+		expand_button->set_button_icon(get_editor_theme_icon(SNAME("DistractionFree")));
+	}
 }
 
 Color LagoonicBento::card_color() {
@@ -124,7 +200,10 @@ void LagoonicBento::apply_palette() {
 	icon_rect->set_modulate(Color(p.text_muted, 1.0f));
 	for (const char *n : { "icon_normal_color", "icon_hover_color", "icon_pressed_color" }) {
 		close_button->add_theme_color_override(n, p.text_muted);
+		drag_handle->add_theme_color_override(n, p.text_muted);
+		expand_button->add_theme_color_override(n, p.text_muted);
 	}
+	expand_button->add_theme_color_override(SceneStringName(font_color), p.text_muted.lerp(p.text, 0.5f));
 	if (water != nullptr) {
 		water->set_tint(Color(p.accent, 0.85f));
 	}
@@ -173,6 +252,16 @@ LagoonicBento::LagoonicBento() {
 	header->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
 	header_margin->add_child(header);
 
+	// Asa para arrastrar la tarjeta a otro sitio del tablero.
+	drag_handle = memnew(Button);
+	drag_handle->set_flat(true);
+	drag_handle->set_focus_mode(Control::FOCUS_NONE);
+	drag_handle->set_tooltip_text(String::utf8("Arrastra para mover el panel: suéltalo arriba, abajo o a un lado de otro panel."));
+	drag_handle->set_default_cursor_shape(Control::CURSOR_DRAG);
+	drag_handle->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+	drag_handle->set_drag_forwarding(callable_mp(this, &LagoonicBento::_handle_drag), Callable(), Callable());
+	header->add_child(drag_handle);
+
 	icon_rect = memnew(TextureRect);
 	icon_rect->set_stretch_mode(TextureRect::STRETCH_KEEP_CENTERED);
 	icon_rect->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
@@ -187,6 +276,14 @@ LagoonicBento::LagoonicBento() {
 	header_actions->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	header_actions->set_alignment(BoxContainer::ALIGNMENT_END);
 	header->add_child(header_actions);
+
+	expand_button = memnew(Button);
+	expand_button->set_flat(true);
+	expand_button->set_focus_mode(Control::FOCUS_NONE);
+	expand_button->set_tooltip_text(String::utf8("Amplía este panel a toda la pantalla."));
+	expand_button->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+	expand_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicBento::_on_expand_pressed));
+	header->add_child(expand_button);
 
 	close_button = memnew(Button);
 	close_button->set_flat(true);
@@ -206,95 +303,532 @@ LagoonicBento::LagoonicBento() {
 
 // ---------------------------------------------------------------- tablero
 
-void LagoonicBentoBoard::_update_side_visibility() {
-	side_column->set_visible(side_column->get_child_count() > 0);
-}
-
-Dictionary LagoonicBentoBoard::_read_layout() const {
-	Dictionary d;
-	d["main"] = get_split_offset();
-	// La columna avisa cuantos separadores tiene de verdad ahora mismo.
-	Array side;
-	const PackedInt32Array offsets = side_column->get_split_offsets();
+static void _bento_reset_offsets(SplitContainer *p_split) {
+	PackedInt32Array offsets = p_split->get_split_offsets();
 	for (int i = 0; i < offsets.size(); i++) {
-		side.push_back(offsets[i]);
+		offsets.set(i, 0);
 	}
-	d["side"] = side;
-	return d;
+	p_split->set_split_offsets(offsets);
 }
 
-void LagoonicBentoBoard::_apply_layout(const Dictionary &p_layout) {
-	set_split_offset(int(p_layout.get("main", 0)));
-	const Array side = p_layout.get("side", Array());
-	PackedInt32Array offsets = side_column->get_split_offsets();
-	for (int i = 0; i < offsets.size(); i++) {
-		offsets.set(i, i < side.size() ? int(side[i]) : 0);
+SplitContainer *LagoonicBentoBoard::_new_column(int p_index) {
+	SplitContainer *col = memnew(SplitContainer);
+	col->set_vertical(true);
+	col->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	col->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+	col->add_theme_constant_override(SNAME("separation"), int(12 * EDSCALE));
+	col->add_theme_constant_override(SNAME("minimum_grab_thickness"), int(12 * EDSCALE));
+	add_child(col);
+	p_index = CLAMP(p_index, 0, columns.size());
+	move_child(col, p_index); // Las columnas van antes que la capa de soltar.
+	columns.insert(p_index, col);
+	return col;
+}
+
+SplitContainer *LagoonicBentoBoard::_column_of(const LagoonicBento *p_bento) const {
+	if (p_bento == nullptr) {
+		return nullptr;
 	}
-	side_column->set_split_offsets(offsets);
-	clamp_split_offset();
-}
-
-Dictionary LagoonicBentoBoard::get_layout() const {
-	return _read_layout();
-}
-
-void LagoonicBentoBoard::set_layout(const Dictionary &p_layout) {
-	_apply_layout(p_layout);
-}
-
-void LagoonicBentoBoard::set_main(LagoonicBento *p_bento) {
-	if (main_bento != nullptr) {
-		remove_child(main_bento);
-	}
-	main_bento = p_bento;
-	add_child(main_bento);
-	move_child(main_bento, 0);
-	main_bento->set_stretch_ratio(2.3f);
-}
-
-void LagoonicBentoBoard::add_side(LagoonicBento *p_bento) {
-	p_bento->set_stretch_ratio(1.0f);
-	side_column->add_child(p_bento);
-	_update_side_visibility();
-}
-
-void LagoonicBentoBoard::remove_side(const String &p_id) {
-	LagoonicBento *b = get_side(p_id);
-	if (b != nullptr) {
-		side_column->remove_child(b);
-		b->queue_free();
-	}
-	_update_side_visibility();
-}
-
-LagoonicBento *LagoonicBentoBoard::get_side(const String &p_id) const {
-	for (int i = 0; i < side_column->get_child_count(); i++) {
-		LagoonicBento *b = Object::cast_to<LagoonicBento>(side_column->get_child(i));
-		if (b != nullptr && b->get_bento_id() == p_id) {
-			return b;
+	for (SplitContainer *col : columns) {
+		if (p_bento->get_parent() == col) {
+			return col;
 		}
 	}
 	return nullptr;
 }
 
+LagoonicBento *LagoonicBentoBoard::_find(const String &p_id) const {
+	for (SplitContainer *col : columns) {
+		for (int i = 0; i < col->get_child_count(false); i++) {
+			LagoonicBento *b = Object::cast_to<LagoonicBento>(col->get_child(i, false));
+			if (b != nullptr && b->get_bento_id() == p_id) {
+				return b;
+			}
+		}
+	}
+	return nullptr;
+}
+
+void LagoonicBentoBoard::_prune_columns() {
+	for (int i = columns.size() - 1; i >= 0; i--) {
+		if (columns[i]->get_child_count(false) == 0) {
+			SplitContainer *col = columns[i];
+			columns.remove_at(i);
+			remove_child(col);
+			memdelete(col);
+		}
+	}
+	_bento_reset_offsets(this);
+}
+
+void LagoonicBentoBoard::_update_stretch() {
+	// La columna del chat se lleva mas ancho por defecto.
+	SplitContainer *chat_col = _column_of(main_bento);
+	for (SplitContainer *col : columns) {
+		col->set_stretch_ratio(col == chat_col ? 1.8f : 1.0f);
+	}
+}
+
+void LagoonicBentoBoard::_changed() {
+	_update_stretch();
+	if (order_callback.is_valid()) {
+		order_callback.call();
+	}
+}
+
+void LagoonicBentoBoard::set_main(LagoonicBento *p_bento) {
+	main_bento = p_bento;
+	if (main_bento->get_bento_id().is_empty()) {
+		main_bento->set_bento_id("chat");
+	}
+	main_bento->set_expandable(false);
+	// El chat nunca se queda tan estrecho que no se pueda leer.
+	main_bento->set_custom_minimum_size(Size2(380, 140) * EDSCALE);
+	SplitContainer *col = columns.is_empty() ? _new_column(0) : columns[0];
+	col->add_child(main_bento);
+	col->move_child(main_bento, 0);
+	_update_stretch();
+}
+
+void LagoonicBentoBoard::add_side(LagoonicBento *p_bento) {
+	SplitContainer *target = nullptr;
+	SplitContainer *chat_col = _column_of(main_bento);
+	for (int i = columns.size() - 1; i >= 0 && target == nullptr; i--) {
+		if (columns[i] != chat_col) {
+			target = columns[i];
+		}
+	}
+	if (target == nullptr) {
+		target = _new_column(columns.size());
+		_bento_reset_offsets(this);
+	}
+	target->add_child(p_bento);
+	p_bento->set_visible(expanded_id.is_empty());
+	p_bento->set_expanded_look(false);
+	_update_stretch();
+}
+
+void LagoonicBentoBoard::remove_side(const String &p_id) {
+	if (p_id == expanded_id) {
+		set_expanded(String());
+	}
+	LagoonicBento *b = get_side(p_id);
+	if (b == nullptr) {
+		return;
+	}
+	b->get_parent()->remove_child(b);
+	b->queue_free();
+	_prune_columns();
+	_update_stretch();
+}
+
+LagoonicBento *LagoonicBentoBoard::get_side(const String &p_id) const {
+	LagoonicBento *b = _find(p_id);
+	return b != main_bento ? b : nullptr;
+}
+
 PackedStringArray LagoonicBentoBoard::get_side_ids() const {
 	PackedStringArray ids;
-	for (int i = 0; i < side_column->get_child_count(); i++) {
-		LagoonicBento *b = Object::cast_to<LagoonicBento>(side_column->get_child(i));
-		if (b != nullptr) {
-			ids.push_back(b->get_bento_id());
+	for (SplitContainer *col : columns) {
+		for (int i = 0; i < col->get_child_count(false); i++) {
+			LagoonicBento *b = Object::cast_to<LagoonicBento>(col->get_child(i, false));
+			if (b != nullptr && b != main_bento) {
+				ids.push_back(b->get_bento_id());
+			}
 		}
 	}
 	return ids;
 }
 
-void LagoonicBentoBoard::apply_palette() {
-	if (main_bento != nullptr) {
-		main_bento->apply_palette();
+void LagoonicBentoBoard::move_side_first(const String &p_id) {
+	LagoonicBento *b = get_side(p_id);
+	if (b == nullptr) {
+		return;
 	}
-	for (int i = 0; i < side_column->get_child_count(); i++) {
-		if (LagoonicBento *b = Object::cast_to<LagoonicBento>(side_column->get_child(i))) {
-			b->apply_palette();
+	SplitContainer *chat_col = _column_of(main_bento);
+	for (SplitContainer *col : columns) {
+		if (col == chat_col) {
+			continue;
+		}
+		LagoonicBento *first = Object::cast_to<LagoonicBento>(col->get_child(0, false));
+		if (first != nullptr && first != b) {
+			move_card(p_id, first->get_bento_id(), DROP_BEFORE);
+		}
+		return;
+	}
+}
+
+void LagoonicBentoBoard::move_card(const String &p_id, const String &p_target, DropRegion p_region) {
+	LagoonicBento *b = _find(p_id);
+	LagoonicBento *t = _find(p_target);
+	if (drag_active || b == nullptr || t == nullptr || b == t || p_region == DROP_NONE) {
+		return;
+	}
+	SplitContainer *tcol = _column_of(t);
+	if (p_region == DROP_LEFT || p_region == DROP_RIGHT) {
+		// Una columna nueva al lado de la del destino.
+		const int ci = columns.find(tcol);
+		SplitContainer *col = _new_column(p_region == DROP_LEFT ? ci : ci + 1);
+		b->get_parent()->remove_child(b);
+		col->add_child(b);
+	} else {
+		b->get_parent()->remove_child(b);
+		const int idx = t->get_index(false) + (p_region == DROP_AFTER ? 1 : 0);
+		tcol->add_child(b);
+		tcol->move_child(b, CLAMP(idx, 0, tcol->get_child_count(false) - 1));
+		_bento_reset_offsets(tcol);
+	}
+	_prune_columns();
+	for (SplitContainer *col : columns) {
+		_bento_reset_offsets(col);
+	}
+	_changed();
+}
+
+void LagoonicBentoBoard::set_expanded(const String &p_id) {
+	expanded_id = get_side(p_id) != nullptr ? p_id : String();
+	const bool on = !expanded_id.is_empty();
+	LagoonicBento *target = on ? get_side(expanded_id) : nullptr;
+	for (SplitContainer *col : columns) {
+		col->set_visible(!on || col == _column_of(target));
+		for (int i = 0; i < col->get_child_count(false); i++) {
+			if (LagoonicBento *b = Object::cast_to<LagoonicBento>(col->get_child(i, false))) {
+				b->set_visible(!on || b == target);
+				b->set_expanded_look(b == target);
+			}
+		}
+	}
+}
+
+void LagoonicBentoBoard::fit_card_height(const String &p_id, float p_height) {
+	LagoonicBento *card = get_side(p_id);
+	SplitContainer *col = _column_of(card);
+	if (card == nullptr || col == nullptr || drag_active) {
+		return;
+	}
+	int others = 0;
+	for (int i = 0; i < col->get_child_count(false); i++) {
+		Control *c = Object::cast_to<Control>(col->get_child(i, false));
+		if (c != nullptr && c != card && c->is_visible()) {
+			c->set_stretch_ratio(1.0f);
+			others++;
+		}
+	}
+	if (others == 0) {
+		card->set_stretch_ratio(1.0f);
+		return;
+	}
+	const float sep = col->get_theme_constant(SNAME("separation")) * others;
+	const float total = MAX(col->get_size().y - sep, 1.0f);
+	const float h = CLAMP(p_height, total * 0.3f, total * 0.75f);
+	// Con los divisores en su sitio por defecto, cada tarjeta mide segun su
+	// proporcion: la del juego h, las demas se reparten lo que queda.
+	card->set_stretch_ratio(h / (total - h) * others);
+	_bento_reset_offsets(col);
+}
+
+void LagoonicBentoBoard::toggle_expanded(const String &p_id) {
+	set_expanded(expanded_id == p_id ? String() : p_id);
+}
+
+Dictionary LagoonicBentoBoard::get_layout() const {
+	Dictionary d;
+	Array cols;
+	Array col_offsets;
+	for (SplitContainer *col : columns) {
+		PackedStringArray ids;
+		for (int i = 0; i < col->get_child_count(false); i++) {
+			if (LagoonicBento *b = Object::cast_to<LagoonicBento>(col->get_child(i, false))) {
+				ids.push_back(b->get_bento_id());
+			}
+		}
+		if (ids.is_empty()) {
+			continue;
+		}
+		cols.push_back(ids);
+		col_offsets.push_back(col->get_split_offsets());
+	}
+	d["columns"] = cols;
+	d["board"] = get_split_offsets();
+	d["cols"] = col_offsets;
+	return d;
+}
+
+void LagoonicBentoBoard::set_layout(const Dictionary &p_layout) {
+	const Array wanted = p_layout.get("columns", Array());
+	if (wanted.is_empty() || main_bento == nullptr) {
+		return; // Sin orden guardado (o del formato antiguo): se queda como esta.
+	}
+	set_expanded(String());
+	// Saca todas las tarjetas y vuelve a montar las columnas.
+	HashMap<String, LagoonicBento *> cards;
+	Vector<String> order;
+	for (SplitContainer *col : columns) {
+		while (col->get_child_count(false) > 0) {
+			LagoonicBento *b = Object::cast_to<LagoonicBento>(col->get_child(0, false));
+			col->remove_child(col->get_child(0, false));
+			if (b != nullptr) {
+				cards[b->get_bento_id()] = b;
+				order.push_back(b->get_bento_id());
+			}
+		}
+	}
+	_prune_columns();
+	for (int c = 0; c < wanted.size(); c++) {
+		const PackedStringArray ids = wanted[c];
+		SplitContainer *col = nullptr;
+		for (const String &id : ids) {
+			LagoonicBento **b = cards.getptr(id);
+			if (b == nullptr) {
+				continue;
+			}
+			if (col == nullptr) {
+				col = _new_column(columns.size());
+			}
+			col->add_child(*b);
+			cards.erase(id);
+		}
+	}
+	// Lo que no estaba guardado: el chat al principio, el resto al final.
+	if (cards.has(main_bento->get_bento_id())) {
+		SplitContainer *col = columns.is_empty() ? _new_column(0) : columns[0];
+		col->add_child(main_bento);
+		col->move_child(main_bento, 0);
+		cards.erase(main_bento->get_bento_id());
+	}
+	for (const String &id : order) {
+		if (LagoonicBento **b = cards.getptr(id)) {
+			add_side(*b);
+		}
+	}
+	// Tamanos, si encajan con lo que hay ahora.
+	const PackedInt32Array board_offsets = p_layout.get("board", PackedInt32Array());
+	if (board_offsets.size() == get_split_offsets().size()) {
+		set_split_offsets(board_offsets);
+	}
+	const Array col_offsets = p_layout.get("cols", Array());
+	for (int i = 0; i < columns.size() && i < col_offsets.size(); i++) {
+		const PackedInt32Array offsets = col_offsets[i];
+		if (offsets.size() == columns[i]->get_split_offsets().size()) {
+			columns[i]->set_split_offsets(offsets);
+		}
+	}
+	_update_stretch();
+}
+
+// ---- arrastrar una tarjeta: silueta en vivo
+
+void LagoonicBentoBoard::_show_all_columns() {
+	for (SplitContainer *col : columns) {
+		col->set_visible(true);
+	}
+}
+
+void LagoonicBentoBoard::_begin_drag(const String &p_id) {
+	if (drag_active) {
+		return;
+	}
+	LagoonicBento *card = _find(p_id);
+	if (card == nullptr || !expanded_id.is_empty()) {
+		return;
+	}
+	drag_active = true;
+	drag_id = p_id;
+	drag_card = card;
+	drop_target = String();
+	drop_region = DROP_NONE;
+	placeholder_label->set_text(card->get_title().is_empty() ? String("Chat") : card->get_title());
+	// La tarjeta se aparta; si su columna se queda sin nada visible, tambien.
+	SplitContainer *col = _column_of(card);
+	card->set_visible(false);
+	bool others = false;
+	for (int i = 0; i < col->get_child_count(false); i++) {
+		Control *c = Object::cast_to<Control>(col->get_child(i, false));
+		if (c != nullptr && c->is_visible()) {
+			others = true;
+		}
+	}
+	col->set_visible(others);
+}
+
+void LagoonicBentoBoard::_detach_placeholder() {
+	if (placeholder->get_parent() != nullptr) {
+		SplitContainer *col = Object::cast_to<SplitContainer>(placeholder->get_parent());
+		col->remove_child(placeholder);
+		_bento_reset_offsets(col);
+	}
+	if (placeholder_column != nullptr) {
+		columns.erase(placeholder_column);
+		remove_child(placeholder_column);
+		memdelete(placeholder_column);
+		placeholder_column = nullptr;
+		_bento_reset_offsets(this);
+	}
+}
+
+void LagoonicBentoBoard::_place_placeholder(const String &p_target, DropRegion p_region) {
+	if (p_target == drop_target && p_region == drop_region && placeholder->get_parent() != nullptr) {
+		return;
+	}
+	LagoonicBento *t = _find(p_target);
+	if (t == nullptr || p_region == DROP_NONE) {
+		return;
+	}
+	_detach_placeholder();
+	drop_target = p_target;
+	drop_region = p_region;
+	SplitContainer *tcol = _column_of(t);
+	if (p_region == DROP_LEFT || p_region == DROP_RIGHT) {
+		const int ci = columns.find(tcol);
+		placeholder_column = _new_column(p_region == DROP_LEFT ? ci : ci + 1);
+		placeholder_column->add_child(placeholder);
+		_bento_reset_offsets(this);
+	} else {
+		const int idx = t->get_index(false) + (p_region == DROP_AFTER ? 1 : 0);
+		tcol->add_child(placeholder);
+		tcol->move_child(placeholder, CLAMP(idx, 0, tcol->get_child_count(false) - 1));
+		_bento_reset_offsets(tcol);
+	}
+}
+
+bool LagoonicBentoBoard::preview_drag(const String &p_id, const Vector2 &p_global_point) {
+	_begin_drag(p_id);
+	if (!drag_active || p_id != drag_id) {
+		return false;
+	}
+	// Encima de la propia silueta: se queda donde esta (evita que salte).
+	if (placeholder->get_parent() != nullptr && placeholder->get_global_rect().has_point(p_global_point)) {
+		return true;
+	}
+	for (SplitContainer *col : columns) {
+		if (!col->is_visible()) {
+			continue;
+		}
+		for (int i = 0; i < col->get_child_count(false); i++) {
+			LagoonicBento *b = Object::cast_to<LagoonicBento>(col->get_child(i, false));
+			if (b == nullptr || !b->is_visible() || b == drag_card) {
+				continue;
+			}
+			const Rect2 r = b->get_global_rect();
+			if (!r.has_point(p_global_point)) {
+				continue;
+			}
+			const float rx = (p_global_point.x - r.position.x) / MAX(r.size.x, 1.0f);
+			const float ry = (p_global_point.y - r.position.y) / MAX(r.size.y, 1.0f);
+			DropRegion region = ry < 0.5f ? DROP_BEFORE : DROP_AFTER;
+			if (rx < 0.2f) {
+				region = DROP_LEFT;
+			} else if (rx > 0.8f) {
+				region = DROP_RIGHT;
+			}
+			_place_placeholder(b->get_bento_id(), region);
+			return true;
+		}
+	}
+	// En un hueco entre tarjetas: se mantiene la ultima silueta.
+	return placeholder->get_parent() != nullptr;
+}
+
+void LagoonicBentoBoard::_end_drag() {
+	drag_active = false;
+	drag_id = String();
+	drag_card = nullptr;
+	drop_target = String();
+	drop_region = DROP_NONE;
+	_show_all_columns();
+	_prune_columns();
+	for (SplitContainer *col : columns) {
+		_bento_reset_offsets(col);
+	}
+	_update_stretch();
+}
+
+void LagoonicBentoBoard::commit_drag() {
+	if (!drag_active) {
+		return;
+	}
+	if (placeholder->get_parent() == nullptr || drag_card == nullptr) {
+		cancel_drag();
+		return;
+	}
+	LagoonicBento *card = drag_card;
+	SplitContainer *col = Object::cast_to<SplitContainer>(placeholder->get_parent());
+	card->get_parent()->remove_child(card);
+	const int idx = placeholder->get_index(false);
+	col->remove_child(placeholder);
+	placeholder_column = nullptr; // Ahora es una columna normal.
+	col->add_child(card);
+	col->move_child(card, CLAMP(idx, 0, col->get_child_count(false) - 1));
+	card->set_visible(true);
+	_end_drag();
+	_changed();
+}
+
+void LagoonicBentoBoard::cancel_drag() {
+	if (!drag_active) {
+		return;
+	}
+	_detach_placeholder();
+	if (drag_card != nullptr) {
+		drag_card->set_visible(true);
+	}
+	_end_drag();
+}
+
+bool LagoonicBentoBoard::_overlay_can_drop(const Point2 &p_point, const Variant &p_data) {
+	if (p_data.get_type() != Variant::DICTIONARY || String(Dictionary(p_data).get("type", "")) != "lagoonic_bento") {
+		return false;
+	}
+	return preview_drag(Dictionary(p_data).get("id", ""), drop_overlay->get_global_position() + p_point);
+}
+
+void LagoonicBentoBoard::_overlay_drop(const Point2 &p_point, const Variant &p_data) {
+	drop_overlay->set_visible(false);
+	if (drag_active) {
+		commit_drag();
+	}
+}
+
+void LagoonicBentoBoard::_notification(int p_what) {
+	switch (p_what) {
+		case NOTIFICATION_DRAG_BEGIN: {
+			const Variant d = get_viewport() != nullptr ? get_viewport()->gui_get_drag_data() : Variant();
+			if (d.get_type() == Variant::DICTIONARY && String(Dictionary(d).get("type", "")) == "lagoonic_bento" && is_visible_in_tree()) {
+				drop_overlay->set_global_position(get_global_position());
+				drop_overlay->set_size(get_size());
+				drop_overlay->set_visible(true);
+				// Apartar la tarjeta despues del evento que empezo el arrastre.
+				callable_mp(this, &LagoonicBentoBoard::_begin_drag).call_deferred(String(Dictionary(d).get("id", "")));
+			}
+		} break;
+		case NOTIFICATION_DRAG_END: {
+			drop_overlay->set_visible(false);
+			// Soltada fuera del tablero: todo vuelve a su sitio.
+			callable_mp(this, &LagoonicBentoBoard::cancel_drag).call_deferred();
+		} break;
+	}
+}
+
+void LagoonicBentoBoard::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("move_card", "id", "target", "region"), &LagoonicBentoBoard::move_card);
+	ClassDB::bind_method(D_METHOD("preview_drag", "id", "global_point"), &LagoonicBentoBoard::preview_drag);
+	ClassDB::bind_method(D_METHOD("commit_drag"), &LagoonicBentoBoard::commit_drag);
+	ClassDB::bind_method(D_METHOD("cancel_drag"), &LagoonicBentoBoard::cancel_drag);
+	ClassDB::bind_method(D_METHOD("get_layout"), &LagoonicBentoBoard::get_layout);
+	ClassDB::bind_method(D_METHOD("set_expanded", "id"), &LagoonicBentoBoard::set_expanded);
+	BIND_ENUM_CONSTANT(DROP_NONE);
+	BIND_ENUM_CONSTANT(DROP_BEFORE);
+	BIND_ENUM_CONSTANT(DROP_AFTER);
+	BIND_ENUM_CONSTANT(DROP_LEFT);
+	BIND_ENUM_CONSTANT(DROP_RIGHT);
+}
+
+void LagoonicBentoBoard::apply_palette() {
+	for (SplitContainer *col : columns) {
+		for (int i = 0; i < col->get_child_count(false); i++) {
+			if (LagoonicBento *b = Object::cast_to<LagoonicBento>(col->get_child(i, false))) {
+				b->apply_palette();
+			}
 		}
 	}
 }
@@ -306,15 +840,40 @@ LagoonicBentoBoard::LagoonicBentoBoard() {
 	add_theme_constant_override(SNAME("separation"), int(12 * EDSCALE));
 	add_theme_constant_override(SNAME("minimum_grab_thickness"), int(12 * EDSCALE));
 
-	side_column = memnew(SplitContainer);
-	side_column->set_vertical(true);
-	// Este tablero no esta en ClassDB, asi que no puede conectarse a su propia
-	// senal "dragged"; quien guarda los tamanos los compara con get_layout().
-	side_column->set_h_size_flags(Control::SIZE_EXPAND_FILL);
-	side_column->set_v_size_flags(Control::SIZE_EXPAND_FILL);
-	side_column->set_stretch_ratio(1.0f);
-	side_column->add_theme_constant_override(SNAME("separation"), int(12 * EDSCALE));
-	side_column->add_theme_constant_override(SNAME("minimum_grab_thickness"), int(12 * EDSCALE));
-	side_column->set_visible(false);
-	add_child(side_column);
+	// Capa que recibe la tarjeta arrastrada y marca donde caera. Flotante:
+	// el divisor no la reparte como otra columna.
+	drop_overlay = memnew(Control);
+	drop_overlay->set_as_top_level(true);
+	drop_overlay->set_mouse_filter(Control::MOUSE_FILTER_STOP);
+	drop_overlay->set_visible(false);
+	drop_overlay->set_drag_forwarding(Callable(), callable_mp(this, &LagoonicBentoBoard::_overlay_can_drop), callable_mp(this, &LagoonicBentoBoard::_overlay_drop));
+	add_child(drop_overlay);
+
+	// Silueta: el hueco donde caera la tarjeta que se arrastra.
+	const LagoonicVibeTheme::Palette p = LagoonicVibeTheme::current();
+	placeholder = memnew(PanelContainer);
+	placeholder->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	placeholder->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+	placeholder->set_custom_minimum_size(Size2(160, 90) * EDSCALE);
+	placeholder->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
+	Ref<StyleBoxFlat> sb;
+	sb.instantiate();
+	sb->set_bg_color(Color(p.accent, 0.10f));
+	sb->set_border_color(Color(p.accent, 0.85f));
+	sb->set_border_width_all(MAX(1, int(2 * EDSCALE)));
+	sb->set_corner_radius_all(int(16 * EDSCALE));
+	sb->set_corner_detail(10);
+	sb->set_anti_aliased(true);
+	placeholder->add_theme_style_override(SceneStringName(panel), sb);
+	placeholder_label = memnew(Label);
+	placeholder_label->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
+	placeholder_label->set_vertical_alignment(VERTICAL_ALIGNMENT_CENTER);
+	placeholder_label->add_theme_color_override(SceneStringName(font_color), Color(p.accent.lerp(Color(1, 1, 1), 0.35f), 0.9f));
+	placeholder->add_child(placeholder_label);
+}
+
+LagoonicBentoBoard::~LagoonicBentoBoard() {
+	if (placeholder != nullptr && placeholder->get_parent() == nullptr) {
+		memdelete(placeholder);
+	}
 }

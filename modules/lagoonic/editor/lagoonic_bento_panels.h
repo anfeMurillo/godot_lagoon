@@ -149,3 +149,42 @@ public:
 
 	LagoonicTeamPanel();
 };
+
+// Escena: el arbol de la escena abierta, el mismo control que usa el editor
+// clasico. Elegir un elemento lo selecciona tambien en el editor.
+class LagoonicScenePanel : public VBoxContainer {
+	GDCLASS(LagoonicScenePanel, VBoxContainer);
+
+	Label *summary = nullptr;
+	class SceneTreeEditor *tree = nullptr;
+	Timer *timer = nullptr;
+	String shown_scene = "?";
+
+	void _on_node_selected();
+	void _refresh();
+
+public:
+	LagoonicScenePanel();
+};
+
+// Propiedades: el inspector del editor para el elemento elegido. Los cambios
+// se aplican al momento y se pueden deshacer, como en el editor clasico.
+class LagoonicInspectorPanel : public VBoxContainer {
+	GDCLASS(LagoonicInspectorPanel, VBoxContainer);
+
+	HBoxContainer *target_row = nullptr;
+	class TextureRect *target_icon = nullptr;
+	Label *target_label = nullptr;
+	Label *hint = nullptr;
+	LineEdit *search = nullptr;
+	class EditorInspector *inspector = nullptr;
+	ObjectID shown;
+
+	void _on_selection_changed();
+
+protected:
+	void _notification(int p_what);
+
+public:
+	LagoonicInspectorPanel();
+};

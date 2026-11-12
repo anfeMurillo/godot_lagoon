@@ -47,6 +47,7 @@ protected:
 	void _notification(int p_what);
 
 public:
+	static void free_shared_textures();
 	void popup_about();
 
 	LagoonicAboutDialog();

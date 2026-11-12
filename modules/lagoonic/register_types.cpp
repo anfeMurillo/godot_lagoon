@@ -58,6 +58,7 @@
 #include "editor/lagoonic_vibe_home.h"
 #include "editor/lagoonic_model_catalog.h"
 #include "editor/lagoonic_vibe_theme.h"
+#include "editor/lagoonic_bento.h"
 #include "editor/lagoonic_vibe_workspace.h"
 #include "editor/lagoonic_water_caustics.h"
 #include "scene/main/scene_tree.h"
@@ -188,6 +189,7 @@ void initialize_lagoonic_module(ModuleInitializationLevel p_level) {
 		GDREGISTER_CLASS(LagoonicAboutDialog);
 		GDREGISTER_CLASS(LagoonicVibeHome);
 		GDREGISTER_CLASS(LagoonicVibeWorkspace);
+		GDREGISTER_CLASS(LagoonicBentoBoard);
 		GDREGISTER_VIRTUAL_CLASS(LagoonicBridgePlugin);
 		// SceneTree aun no existe: se instala en el primer flush diferido.
 		callable_mp_static(&_lagoonic_pm_hook_install).call_deferred();
@@ -203,6 +205,8 @@ void uninitialize_lagoonic_module(ModuleInitializationLevel p_level) {
 	if (p_level == MODULE_INITIALIZATION_LEVEL_EDITOR) {
 		LagoonicModelCatalog::shutdown();
 		LagoonicVibeTheme::free_notifier();
+		LagoonicLilyVeil::free_shared_texture();
+		LagoonicAboutDialog::free_shared_textures();
 	}
 #else
 	(void)p_level;

@@ -38,6 +38,10 @@
 #include "core/object/callable_mp.h"
 #include "core/os/time.h"
 #include "editor/docks/filesystem_dock.h"
+#include "editor/editor_data.h"
+#include "editor/editor_node.h"
+#include "editor/inspector/editor_inspector.h"
+#include "editor/scene/scene_tree_editor.h"
 #include "editor/file_system/editor_file_system.h"
 #include "editor/themes/editor_scale.h"
 #include "scene/gui/button.h"
@@ -821,4 +825,131 @@ LagoonicTeamPanel::LagoonicTeamPanel() {
 	timer->set_autostart(true);
 	timer->connect("timeout", callable_mp(this, &LagoonicTeamPanel::_refresh));
 	add_child(timer);
+}
+
+// ---------------------------------------------------------------- Escena
+
+void LagoonicScenePanel::_on_node_selected() {
+	Node *node = tree->get_selected();
+	if (node != nullptr && EditorNode::get_singleton() != nullptr) {
+		// Igual que en el editor clasico: el inspector pasa a este elemento.
+		EditorNode::get_singleton()->push_item(node);
+	}
+}
+
+void LagoonicScenePanel::_refresh() {
+	if (!is_visible_in_tree() || EditorNode::get_singleton() == nullptr) {
+		return;
+	}
+	Node *root = EditorNode::get_singleton()->get_edited_scene();
+	const String scene = root != nullptr ? root->get_scene_file_path() : String("-");
+	if (scene == shown_scene) {
+		return;
+	}
+	shown_scene = scene;
+	if (root == nullptr) {
+		summary->set_text(String::utf8("No hay ninguna escena abierta. Pídele una al agente y verás aquí sus piezas."));
+	} else {
+		summary->set_text(scene.is_empty() ? String::utf8("Escena nueva, sin guardar") : scene.get_file());
+	}
+	tree->set_visible(root != nullptr);
+}
+
+LagoonicScenePanel::LagoonicScenePanel() {
+	add_theme_constant_override(SNAME("separation"), int(8 * EDSCALE));
+	summary = _bento_muted(String());
+	add_child(summary);
+	tree = memnew(SceneTreeEditor(false, true, false));
+	tree->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+	tree->set_custom_minimum_size(Size2(0, 120 * EDSCALE));
+	if (EditorNode::get_singleton() != nullptr) {
+		tree->set_editor_selection(EditorNode::get_singleton()->get_editor_selection());
+	}
+	tree->connect(SNAME("node_selected"), callable_mp(this, &LagoonicScenePanel::_on_node_selected));
+	add_child(tree);
+	timer = memnew(Timer);
+	timer->set_wait_time(0.5);
+	timer->set_autostart(true);
+	timer->connect("timeout", callable_mp(this, &LagoonicScenePanel::_refresh));
+	add_child(timer);
+}
+
+// ---------------------------------------------------------------- Propiedades
+
+void LagoonicInspectorPanel::_on_selection_changed() {
+	Node *node = nullptr;
+	if (EditorNode::get_singleton() != nullptr) {
+		const List<Node *> selected = EditorNode::get_singleton()->get_editor_selection()->get_top_selected_node_list();
+		if (!selected.is_empty()) {
+			node = selected.front()->get();
+		}
+	}
+	const ObjectID id = node != nullptr ? node->get_instance_id() : ObjectID();
+	if (id == shown && (node != nullptr) == inspector->is_visible()) {
+		return;
+	}
+	shown = id;
+	inspector->edit(node);
+	inspector->set_visible(node != nullptr);
+	search->set_visible(node != nullptr);
+	target_row->set_visible(node != nullptr);
+	hint->set_visible(node == nullptr);
+	if (node != nullptr) {
+		target_label->set_text(String(node->get_name()) + String::utf8("  ·  ") + node->get_class());
+		target_label->set_tooltip_text(target_label->get_text());
+		const StringName type = node->get_class();
+		target_icon->set_texture(get_editor_theme_icon(has_theme_icon(type, SNAME("EditorIcons")) ? type : SNAME("Node")));
+	}
+}
+
+void LagoonicInspectorPanel::_notification(int p_what) {
+	switch (p_what) {
+		case NOTIFICATION_ENTER_TREE: {
+			if (EditorNode::get_singleton() != nullptr) {
+				EditorNode::get_singleton()->get_editor_selection()->connect(SNAME("selection_changed"), callable_mp(this, &LagoonicInspectorPanel::_on_selection_changed));
+			}
+			search->set_right_icon(get_editor_theme_icon(SNAME("Search")));
+			callable_mp(this, &LagoonicInspectorPanel::_on_selection_changed).call_deferred();
+		} break;
+		case NOTIFICATION_EXIT_TREE: {
+			if (EditorNode::get_singleton() != nullptr) {
+				EditorNode::get_singleton()->get_editor_selection()->disconnect(SNAME("selection_changed"), callable_mp(this, &LagoonicInspectorPanel::_on_selection_changed));
+			}
+		} break;
+	}
+}
+
+LagoonicInspectorPanel::LagoonicInspectorPanel() {
+	add_theme_constant_override(SNAME("separation"), int(8 * EDSCALE));
+	hint = _bento_muted(String::utf8("Elige un elemento en el panel Escena para ver y cambiar sus propiedades. Cada cambio se puede deshacer."));
+	add_child(hint);
+	target_row = memnew(HBoxContainer);
+	target_row->add_theme_constant_override(SNAME("separation"), int(8 * EDSCALE));
+	target_row->set_visible(false);
+	add_child(target_row);
+	target_icon = memnew(TextureRect);
+	target_icon->set_stretch_mode(TextureRect::STRETCH_KEEP_CENTERED);
+	target_row->add_child(target_icon);
+	target_label = memnew(Label);
+	target_label->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	target_label->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
+	target_label->set_custom_minimum_size(Size2(1, 0));
+	target_label->set_mouse_filter(Control::MOUSE_FILTER_PASS);
+	target_row->add_child(target_label);
+	search = memnew(LineEdit);
+	search->set_placeholder(String::utf8("Buscar propiedad…"));
+	search->set_clear_button_enabled(true);
+	search->set_visible(false);
+	add_child(search);
+	inspector = memnew(EditorInspector);
+	inspector->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+	inspector->set_custom_minimum_size(Size2(0, 140 * EDSCALE));
+	inspector->set_horizontal_scroll_mode(ScrollContainer::SCROLL_MODE_DISABLED);
+	inspector->set_use_doc_hints(true);
+	inspector->set_use_folding(true);
+	inspector->set_use_filter(true);
+	inspector->register_text_enter(search);
+	inspector->set_autoclear(true);
+	inspector->set_visible(false);
+	add_child(inspector);
 }

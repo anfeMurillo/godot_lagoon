@@ -29,8 +29,10 @@
 
 namespace {
 
+// Se sueltan al descargar el modulo (ver LagoonicLilyVeil::free_shared_texture).
+Ref<ImageTexture> textures[2];
+
 Ref<Texture2D> logo_texture(bool p_light_theme) {
-	static Ref<ImageTexture> textures[2];
 	Ref<ImageTexture> &tex = textures[p_light_theme ? 1 : 0];
 	if (tex.is_null()) {
 		Vector<uint8_t> bytes;
@@ -62,6 +64,12 @@ RichTextLabel *make_text(const String &p_name) {
 }
 
 } // namespace
+
+void LagoonicAboutDialog::free_shared_textures() {
+	textures[0].unref();
+	textures[1].unref();
+}
+
 
 LagoonicAboutDialog::LagoonicAboutDialog() {
 	set_title(String::utf8("Acerca de Lagoonic"));

@@ -110,6 +110,33 @@ private:
 	Array _get_changes();
 	Dictionary _get_team();
 	void _check_team_started();
+	// Tarjeta Juego: aloja la vista de juego integrada del editor.
+	MarginContainer *game_holder = nullptr;
+	Label *game_placeholder = nullptr;
+	class ScrollContainer *game_scroll = nullptr;
+	class WindowWrapper *game_wrapper = nullptr;
+	Node *game_wrapper_home = nullptr;
+	int game_wrapper_index = 0;
+	bool game_docked = false;
+	bool game_auto_opened = false;
+	bool game_floating_suppressed = false;
+	class ColorRect *game_divider = nullptr;
+	class Panel *game_panel = nullptr;
+	Control *game_toolbar = nullptr; // Barra de la vista de juego (prestada a la tarjeta).
+	class ScrollContainer *game_toolbar_scroll = nullptr; // Panel de la vista de juego, sin fondo mientras esta en la tarjeta.
+	void _set_game_floating_suppressed(bool p_suppressed);
+	void _set_game_fill(bool p_fill);
+	void _update_game_clip();
+	void _on_run_stopped();
+	void _fit_game_card();
+	float game_fit_width = 0; // Ancho para el que se ajusto la altura del juego.
+	bool game_clipped = false;
+	Rect2 game_clip_rect;
+	int game_size_mode_before = 0; // Modo de tamano del usuario (0 = no tocado).
+	void _dock_game();
+	void _undock_game();
+	void _on_game_started();
+	void _on_game_stopped();
 	void _save_layout();
 	void _restore_layout(const Dictionary &p_layout);
 	Dictionary saved_layout;

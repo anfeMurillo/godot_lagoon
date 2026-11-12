@@ -43,6 +43,7 @@
 class Button;
 class HBoxContainer;
 class Label;
+class PanelContainer;
 class LagoonicWaterCaustics;
 class MarginContainer;
 class StyleBoxFlat;
@@ -62,15 +63,25 @@ class LagoonicBento : public PanelContainer {
 	Label *title_label = nullptr;
 	HBoxContainer *header_actions = nullptr;
 	Button *close_button = nullptr;
+	Button *drag_handle = nullptr;
+	Button *expand_button = nullptr;
 	MarginContainer *content_margin = nullptr;
 	LagoonicWaterCaustics *water = nullptr;
 	Callable close_callback;
 
 	void _on_close_pressed();
+	void _on_expand_pressed();
 	void _refresh_icons();
+	Variant _make_drag_data();
+	Variant _handle_drag(const Point2 &p_point) { return _make_drag_data(); }
+	class LagoonicBentoBoard *_board() const;
 
 protected:
 	void _notification(int p_what);
+
+public:
+	// Arrastrar la tarjeta por su asa o su cabecera la cambia de sitio.
+	virtual Variant get_drag_data(const Point2 &p_point) override;
 
 public:
 	void set_bento_id(const String &p_id) { bento_id = p_id; }
@@ -78,6 +89,9 @@ public:
 	void set_title(const String &p_title);
 	void set_icon(const StringName &p_icon);
 	void set_closable(bool p_closable);
+	void set_expandable(bool p_expandable);
+	void set_expanded_look(bool p_expanded);
+	String get_title() const;
 	void set_close_callback(const Callable &p_callback) { close_callback = p_callback; }
 	void set_content(Control *p_content);
 	void set_content_margins(int p_h, int p_v);
@@ -94,28 +108,91 @@ public:
 	LagoonicBento();
 };
 
+// El tablero: columnas una al lado de otra y, en cada columna, tarjetas una
+// encima de otra. El chat es una tarjeta mas (no se cierra). Cada tarjeta
+// se arrastra por su asa y se suelta sobre otra: arriba o abajo de ella, o
+// en una columna nueva a su izquierda o derecha.
 class LagoonicBentoBoard : public SplitContainer {
 	GDCLASS(LagoonicBentoBoard, SplitContainer);
 
-	LagoonicBento *main_bento = nullptr;
-	SplitContainer *side_column = nullptr;
+public:
+	enum DropRegion {
+		DROP_NONE,
+		DROP_BEFORE,
+		DROP_AFTER,
+		DROP_LEFT,
+		DROP_RIGHT,
+	};
 
-	void _update_side_visibility();
-	Dictionary _read_layout() const;
-	void _apply_layout(const Dictionary &p_layout);
+private:
+	LagoonicBento *main_bento = nullptr;
+	Vector<SplitContainer *> columns;
+	Control *drop_overlay = nullptr;
+	Callable order_callback;
+	String expanded_id;
+
+	// Arrastre en curso: la tarjeta se aparta y una silueta ocupa el sitio
+	// donde caeria; las demas se reparten el espacio para mostrarlo.
+	bool drag_active = false;
+	String drag_id;
+	LagoonicBento *drag_card = nullptr;
+	class PanelContainer *placeholder = nullptr;
+	Label *placeholder_label = nullptr;
+	SplitContainer *placeholder_column = nullptr; // Columna nueva solo para la silueta.
+	String drop_target;
+	DropRegion drop_region = DROP_NONE;
+
+	SplitContainer *_new_column(int p_index);
+	SplitContainer *_column_of(const LagoonicBento *p_bento) const;
+	LagoonicBento *_find(const String &p_id) const; // El chat incluido.
+	void _prune_columns();
+	void _update_stretch();
+	void _changed();
+	void _begin_drag(const String &p_id);
+	void _detach_placeholder();
+	void _place_placeholder(const String &p_target, DropRegion p_region);
+	void _end_drag();
+	void _show_all_columns();
+	bool _overlay_can_drop(const Point2 &p_point, const Variant &p_data);
+	void _overlay_drop(const Point2 &p_point, const Variant &p_data);
+
+protected:
+	void _notification(int p_what);
+	static void _bind_methods();
 
 public:
 	void set_main(LagoonicBento *p_bento);
 	LagoonicBento *get_main() const { return main_bento; }
-	// Anade una tarjeta a la columna lateral (abajo del todo).
+	// Anade una tarjeta al final de la columna lateral (crea una si hace falta).
 	void add_side(LagoonicBento *p_bento);
 	void remove_side(const String &p_id);
 	LagoonicBento *get_side(const String &p_id) const;
 	PackedStringArray get_side_ids() const;
-	// Tamanos que el usuario dio a las tarjetas: {main: int, side: [int]}.
+	// La pone la primera de la primera columna sin el chat.
+	void move_side_first(const String &p_id);
+	// Mueve una tarjeta junto a otra (ver DropRegion).
+	void move_card(const String &p_id, const String &p_target, DropRegion p_region);
+	// Vista previa al arrastrar con el raton (tambien usable desde scripts):
+	// coloca la silueta para el punto global dado; true si hay sitio.
+	bool preview_drag(const String &p_id, const Vector2 &p_global_point);
+	void commit_drag(); // La tarjeta pasa al sitio de la silueta.
+	void cancel_drag(); // Todo vuelve como estaba.
+	bool is_dragging_card() const { return drag_active; }
+	void set_order_callback(const Callable &p_callback) { order_callback = p_callback; }
+	// Una tarjeta lateral ocupa todo el tablero ("" vuelve a lo normal).
+	void set_expanded(const String &p_id);
+	void toggle_expanded(const String &p_id);
+	// Da a una tarjeta la altura pedida dentro de su columna (entre el 30 % y
+	// el 75 % de la columna), repartiendo el resto entre las demas.
+	void fit_card_height(const String &p_id, float p_height);
+	String get_expanded() const { return expanded_id; }
+	// Orden y tamanos: {columns: [[ids]], board: [offsets], cols: [[offsets]]}.
 	Dictionary get_layout() const;
 	void set_layout(const Dictionary &p_layout);
 	void apply_palette();
 
 	LagoonicBentoBoard();
+	~LagoonicBentoBoard();
 };
+
+VARIANT_ENUM_CAST(LagoonicBentoBoard::DropRegion);

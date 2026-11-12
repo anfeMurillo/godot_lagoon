@@ -31,6 +31,7 @@ protected:
 	static void _bind_methods() {}
 
 public:
+	static void free_shared_texture();
 	// Estado identico al splash: todo agua y el nenufar quieto en el centro.
 	// p_clock: instante de la caustica (para continuar la del splash).
 	void cover_now(float p_pattern_band, float p_clock = 0.0f);

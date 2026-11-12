@@ -53,7 +53,10 @@
 #include "core/os/os.h"
 #include "editor/editor_interface.h"
 #include "editor/editor_node.h"
+#include "editor/editor_main_screen.h"
+#include "editor/run/editor_run_bar.h"
 #include "editor/gui/editor_title_bar.h"
+#include "editor/gui/window_wrapper.h"
 #include "editor/themes/editor_scale.h"
 #include "scene/gui/box_container.h"
 #include "scene/gui/button.h"
@@ -63,8 +66,14 @@
 #include "editor/settings/editor_settings.h"
 #include "lagoonic_bento.h"
 #include "lagoonic_bento_panels.h"
+#include "lagoonic_game_clip.h"
 #include "../runtime/lagoonic_coding_agents.h"
+#include "scene/gui/color_rect.h"
+#include "scene/gui/panel.h"
+#include "scene/gui/menu_button.h"
 #include "scene/gui/popup_menu.h"
+#include "scene/resources/theme.h"
+#include "scene/gui/scroll_container.h"
 #include "servers/display/display_server.h"
 
 static const char *LAGOONIC_INITIAL_PROMPT_RES_PATH = "res://.lagoonic/initial_prompt.txt";
@@ -174,6 +183,9 @@ static const LagoonicBentoType LAGOONIC_BENTOS[] = {
 	{ "files", "Archivos", "Folder", "Explora tu proyecto y menciona archivos" },
 	{ "context", "Contexto", "Performance", "Modelo, mensajes y tiempo de este chat" },
 	{ "team", "Equipo", "Groups", "El líder y los ayudantes que lanza, en vivo" },
+	{ "scene", "Escena", "PackedScene", "Las piezas de la escena abierta, como en el editor" },
+	{ "inspector", "Propiedades", "Tools", "Cambia a mano los valores del elemento elegido" },
+	{ "game", "Juego", "Play", "Tu juego en marcha, aquí mismo" },
 };
 
 void LagoonicVibeWorkspace::_update_chat_width() {
@@ -252,6 +264,328 @@ void LagoonicVibeWorkspace::_check_team_started() {
 	}
 }
 
+// La vista de juego integrada del editor (con su barra) vive en la pantalla
+// "Game" del editor clasico. Mientras el juego corre en modo Vibe se muda a
+// la tarjeta Juego y luego vuelve a su sitio.
+static WindowWrapper *_lagoonic_find_game_wrapper(Node *p_from) {
+	if (p_from == nullptr) {
+		return nullptr;
+	}
+	if (p_from->get_class() == "GameView") {
+		for (Node *n = p_from->get_parent(); n != nullptr; n = n->get_parent()) {
+			if (WindowWrapper *w = Object::cast_to<WindowWrapper>(n)) {
+				return w;
+			}
+		}
+		return nullptr;
+	}
+	for (int i = 0; i < p_from->get_child_count(); i++) {
+		if (WindowWrapper *w = _lagoonic_find_game_wrapper(p_from->get_child(i))) {
+			return w;
+		}
+	}
+	return nullptr;
+}
+
+// El editor clasico puede abrir el juego en una ventana flotante al jugar
+// (opcion "Ventana flotante al jugar" de la vista de juego). Esa ventana nueva
+// saca de la pantalla completa al escritorio. En modo Vibe el juego va en su
+// tarjeta: la opcion se apaga mientras dura el modo y luego se restaura.
+static PopupMenu *_lagoonic_game_window_menu(Node *p_from) {
+	static const int MAKE_FLOATING_ON_PLAY = 7; // GameView::WINDOW_MAKE_FLOATING_ON_PLAY.
+	static const int RUN_GAME_EMBEDDED = 6; // GameView::WINDOW_RUN_GAME_EMBEDDED.
+	static const int SIZE_MODE_STRETCH = 10; // GameView::WINDOW_SIZE_MODE_STRETCH.
+	if (p_from == nullptr) {
+		return nullptr;
+	}
+	if (MenuButton *mb = Object::cast_to<MenuButton>(p_from)) {
+		PopupMenu *pm = mb->get_popup();
+		// El menu de velocidad numera sus opciones 0, 1, 2... y tambien tiene
+		// los ids 6, 7 y 10: el de ventana es el que empieza por el 6.
+		if (pm->get_item_count() > 0 && pm->get_item_id(0) == RUN_GAME_EMBEDDED && pm->get_item_index(MAKE_FLOATING_ON_PLAY) >= 0 && pm->get_item_index(SIZE_MODE_STRETCH) >= 0) {
+			return pm;
+		}
+	}
+	for (int i = 0; i < p_from->get_child_count(); i++) {
+		if (PopupMenu *pm = _lagoonic_game_window_menu(p_from->get_child(i))) {
+			return pm;
+		}
+	}
+	return nullptr;
+}
+
+void LagoonicVibeWorkspace::_set_game_floating_suppressed(bool p_suppressed) {
+	if (EditorNode::get_singleton() == nullptr) {
+		return;
+	}
+	_set_game_fill(p_suppressed); // Aparte de la ventana flotante: cada una guarda lo suyo.
+	if (p_suppressed == game_floating_suppressed) {
+		return;
+	}
+	if (game_wrapper == nullptr) {
+		game_wrapper = _lagoonic_find_game_wrapper(EditorNode::get_singleton()->get_editor_main_screen()->get_control());
+	}
+	PopupMenu *pm = _lagoonic_game_window_menu(game_wrapper != nullptr ? game_wrapper->get_wrapped_control() : nullptr);
+	if (pm == nullptr) {
+		return;
+	}
+	const int idx = pm->get_item_index(7);
+	if (p_suppressed) {
+		if (!pm->is_item_checked(idx)) {
+			return; // Ya estaba apagada: nada que restaurar despues.
+		}
+		pm->emit_signal(SNAME("id_pressed"), 7);
+		game_floating_suppressed = true;
+	} else {
+		if (!pm->is_item_checked(idx)) {
+			pm->emit_signal(SNAME("id_pressed"), 7);
+		}
+		game_floating_suppressed = false;
+	}
+}
+
+// "Estirar para ajustar": el juego se redimensiona al hueco de su tarjeta en
+// vez de quedarse con su tamano fijo y dejar bandas vacias alrededor. Se
+// restaura el modo que tenia el usuario al salir del modo Vibe.
+void LagoonicVibeWorkspace::_set_game_fill(bool p_fill) {
+	static const int SIZE_FIXED = 8; // GameView::WINDOW_SIZE_MODE_FIXED.
+	static const int SIZE_KEEP_ASPECT = 9;
+	static const int SIZE_STRETCH = 10;
+	if (game_wrapper == nullptr) {
+		game_wrapper = _lagoonic_find_game_wrapper(EditorNode::get_singleton()->get_editor_main_screen()->get_control());
+	}
+	PopupMenu *pm = _lagoonic_game_window_menu(game_wrapper != nullptr ? game_wrapper->get_wrapped_control() : nullptr);
+	if (pm == nullptr) {
+		return;
+	}
+	if (p_fill) {
+		if (game_size_mode_before != 0) {
+			return;
+		}
+		int current = SIZE_FIXED;
+		for (int id : { SIZE_FIXED, SIZE_KEEP_ASPECT, SIZE_STRETCH }) {
+			const int idx = pm->get_item_index(id);
+			if (idx >= 0 && pm->is_item_checked(idx)) {
+				current = id;
+			}
+		}
+		// Si el editor se cerro estando en Vibe, el modo guardado ya es "estirar"
+		// y el del usuario esta apuntado aparte.
+		EditorSettings *es = EditorSettings::get_singleton();
+		const int saved = es != nullptr ? int(es->get_project_metadata("lagoonic", "game_size_before", 0)) : 0;
+		if (current == SIZE_STRETCH && saved >= SIZE_FIXED && saved <= SIZE_KEEP_ASPECT) {
+			current = saved;
+		}
+		game_size_mode_before = current;
+		if (es != nullptr) {
+			es->set_project_metadata("lagoonic", "game_size_before", current);
+		}
+		if (pm->is_item_checked(pm->get_item_index(SIZE_STRETCH)) == false) {
+			pm->emit_signal(SNAME("id_pressed"), SIZE_STRETCH);
+		}
+	} else if (game_size_mode_before != 0) {
+		const int before = game_size_mode_before;
+		game_size_mode_before = 0;
+		if (EditorSettings::get_singleton() != nullptr) {
+			EditorSettings::get_singleton()->set_project_metadata("lagoonic", "game_size_before", 0);
+		}
+		if (before != SIZE_STRETCH) {
+			pm->emit_signal(SNAME("id_pressed"), before);
+		}
+	}
+}
+
+static Control *_lagoonic_find_embedded_process(Node *p_from) {
+	if (p_from == nullptr) {
+		return nullptr;
+	}
+	if (Control *c = Object::cast_to<Control>(p_from)) {
+		if (String(c->get_class()).begins_with("EmbeddedProcess")) {
+			return c;
+		}
+	}
+	for (int i = 0; i < p_from->get_child_count(); i++) {
+		if (Control *c = _lagoonic_find_embedded_process(p_from->get_child(i))) {
+			return c;
+		}
+	}
+	return nullptr;
+}
+
+void LagoonicVibeWorkspace::_on_run_stopped() {
+	_undock_game();
+	if (game_clipped) {
+		lagoonic_clip_game_layer(get_window() != nullptr ? get_window()->get_window_id() : 0, Rect2(), 0, false);
+		game_clipped = false;
+	}
+}
+
+void LagoonicVibeWorkspace::_fit_game_card() {
+	// La tarjeta del juego toma, dentro de su columna, la altura que pide la
+	// proporcion del juego para su ancho (asi casi no quedan bandas). Sola en
+	// su columna ya lo ocupa todo.
+	if (!game_docked || bento_board == nullptr || game_holder == nullptr || bento_board->get_side("game") == nullptr) {
+		game_fit_width = 0;
+		return;
+	}
+	LagoonicBento *card = bento_board->get_side("game");
+	const float w = game_holder->get_size().x;
+	if (w <= 1 || !card->is_visible_in_tree() || Math::abs(w - game_fit_width) < 4) {
+		return;
+	}
+	game_fit_width = w;
+	const int vw = GLOBAL_GET("display/window/size/viewport_width");
+	const int vh = GLOBAL_GET("display/window/size/viewport_height");
+	if (vw <= 0 || vh <= 0) {
+		return;
+	}
+	// Lo que la tarjeta ocupa ademas del juego: cabecera, barra y linea.
+	Control *area = _lagoonic_find_embedded_process(game_wrapper != nullptr ? game_wrapper->get_wrapped_control() : nullptr);
+	const float extra = area != nullptr ? MAX(0.0f, card->get_size().y - area->get_size().y) : 90 * EDSCALE;
+	bento_board->fit_card_height("game", w * float(vh) / float(vw) + extra);
+}
+
+void LagoonicVibeWorkspace::_update_game_clip() {
+	// Mientras el juego esta en su tarjeta, su capa nativa toma las esquinas
+	// de abajo de la tarjeta. Fuera de ella (o ampliado a otra cosa) se suelta.
+	Control *area = (game_docked && game_wrapper != nullptr) ? _lagoonic_find_embedded_process(game_wrapper->get_wrapped_control()) : nullptr;
+	const bool on = area != nullptr && area->is_visible_in_tree();
+	if (!on && !game_clipped) {
+		return;
+	}
+	const Rect2 rect = on ? area->get_global_rect() : Rect2();
+	// Cada fotograma mientras dure: la capa del juego aparece un momento
+	// despues de entrar en la tarjeta (y otra nueva en cada partida).
+	game_clip_rect = rect;
+	game_clipped = on;
+	// Radio de la tarjeta menos su borde de 1 px.
+	lagoonic_clip_game_layer(get_window() != nullptr ? get_window()->get_window_id() : 0, rect, 16 * EDSCALE - 1, on);
+}
+
+void LagoonicVibeWorkspace::_dock_game() {
+	EditorInterface *ei = EditorInterface::get_singleton();
+	if (game_docked || game_holder == nullptr || !vibe_mode_active || ei == nullptr || !ei->is_playing_scene() || EditorNode::get_singleton() == nullptr) {
+		return;
+	}
+	if (game_wrapper == nullptr) {
+		game_wrapper = _lagoonic_find_game_wrapper(EditorNode::get_singleton()->get_editor_main_screen()->get_control());
+	}
+	if (game_wrapper == nullptr || game_wrapper->get_parent() == nullptr) {
+		return;
+	}
+	// El editor clasico saca el juego a una ventana aparte al lanzarlo: en
+	// modo Vibe vuelve dentro, a su tarjeta.
+	if (game_wrapper->get_window_enabled()) {
+		game_wrapper->set_window_enabled(false);
+	}
+	game_wrapper_home = game_wrapper->get_parent();
+	game_wrapper_index = game_wrapper->get_index();
+	game_wrapper_home->remove_child(game_wrapper);
+	game_wrapper->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	game_wrapper->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+	game_scroll->add_child(game_wrapper);
+	game_wrapper->set_visible(true);
+	game_placeholder->set_visible(false);
+	game_docked = true;
+	// Linea divisoria entre la barra de herramientas y el juego, sin el
+	// espaciado propio de la vista de juego (dejaba una franja vacia arriba).
+	if (Control *view = game_wrapper->get_wrapped_control()) {
+		view->add_theme_constant_override(SNAME("separation"), 0);
+		// La barra de la vista de juego mide ~800 px y no dejaba estrechar su
+		// columna: al adelgazar la ventana se recortaba la UI. Aqui se
+		// desplaza en horizontal cuando no cabe.
+		if (Control *toolbar = Object::cast_to<Control>(view->get_child(0, false))) {
+			game_toolbar = toolbar;
+			game_toolbar_scroll = memnew(ScrollContainer);
+			game_toolbar_scroll->set_vertical_scroll_mode(ScrollContainer::SCROLL_MODE_DISABLED);
+			game_toolbar_scroll->set_horizontal_scroll_mode(ScrollContainer::SCROLL_MODE_AUTO);
+			game_toolbar_scroll->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+			view->remove_child(toolbar);
+			view->add_child(game_toolbar_scroll);
+			view->move_child(game_toolbar_scroll, 0);
+			toolbar->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+			game_toolbar_scroll->add_child(toolbar);
+		}
+		// El fondo del panel del juego asomaba en las esquinas redondeadas
+		// (un tono azulado sobre el borde de la tarjeta): transparente aqui.
+		for (int i = 0; i < view->get_child_count(false); i++) {
+			if (Panel *panel = Object::cast_to<Panel>(view->get_child(i, false))) {
+				panel->add_theme_style_override(SceneStringName(panel), memnew(StyleBoxEmpty));
+				game_panel = panel;
+			}
+		}
+		game_divider = memnew(ColorRect);
+		game_divider->set_custom_minimum_size(Size2(0, MAX(1, int(EDSCALE))));
+		game_divider->set_color(LagoonicVibeTheme::current().border);
+		game_divider->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
+		view->add_child(game_divider);
+		view->move_child(game_divider, MIN(1, view->get_child_count(false) - 1));
+	}
+}
+
+void LagoonicVibeWorkspace::_undock_game() {
+	if (!game_docked || game_wrapper == nullptr || game_wrapper_home == nullptr || game_scroll == nullptr) {
+		return;
+	}
+	game_docked = false;
+	if (game_wrapper->get_wrapped_control() != nullptr) {
+		Control *view = game_wrapper->get_wrapped_control();
+		view->remove_theme_constant_override(SNAME("separation"));
+		// La barra vuelve a su sitio de siempre en la vista de juego.
+		if (game_toolbar != nullptr && game_toolbar_scroll != nullptr) {
+			game_toolbar_scroll->remove_child(game_toolbar);
+			view->add_child(game_toolbar);
+			view->move_child(game_toolbar, 0);
+			view->remove_child(game_toolbar_scroll);
+			memdelete(game_toolbar_scroll);
+		}
+		game_toolbar = nullptr;
+		game_toolbar_scroll = nullptr;
+	}
+	if (game_panel != nullptr) {
+		game_panel->remove_theme_style_override(SceneStringName(panel));
+		game_panel = nullptr;
+	}
+	if (game_divider != nullptr) {
+		game_divider->get_parent()->remove_child(game_divider);
+		memdelete(game_divider);
+		game_divider = nullptr;
+	}
+	if (game_wrapper->get_parent() != nullptr) {
+		game_wrapper->get_parent()->remove_child(game_wrapper);
+	}
+	game_wrapper_home->add_child(game_wrapper);
+	game_wrapper_home->move_child(game_wrapper, MIN(game_wrapper_index, game_wrapper_home->get_child_count() - 1));
+	// Visible solo si el editor clasico tiene elegida la pantalla Juego.
+	game_wrapper->set_visible(EditorNode::get_singleton()->get_editor_main_screen()->get_selected_index() == EditorMainScreen::EDITOR_GAME);
+	if (game_placeholder != nullptr) {
+		game_placeholder->set_visible(true);
+	}
+	if (bento_board != nullptr && bento_board->get_expanded() == "game") {
+		bento_board->set_expanded(String());
+	}
+}
+
+void LagoonicVibeWorkspace::_on_game_started() {
+	if (!vibe_mode_active || bento_board == nullptr) {
+		return;
+	}
+	if (bento_board->get_side("game") == nullptr) {
+		_open_bento("game", false); // Solo mientras dure esta partida.
+		game_auto_opened = true;
+		// Lo primero de la columna, para que se vea nada mas lanzar.
+		bento_board->move_side_first("game");
+	}
+	_dock_game();
+}
+
+void LagoonicVibeWorkspace::_on_game_stopped() {
+	_undock_game();
+	if (game_auto_opened) {
+		_close_bento("game");
+	}
+}
+
 void LagoonicVibeWorkspace::_save_layout() {
 	// Se llama cada pocos segundos: solo escribe cuando el usuario movio algo.
 	if (EditorSettings::get_singleton() == nullptr || bento_board == nullptr || !layout_restored) {
@@ -320,9 +654,47 @@ void LagoonicVibeWorkspace::_open_bento(const String &p_id, bool p_save) {
 		LagoonicTeamPanel *panel = memnew(LagoonicTeamPanel);
 		panel->setup(callable_mp(this, &LagoonicVibeWorkspace::_get_team));
 		bento->set_content(panel);
+	} else if (p_id == "scene") {
+		bento->set_content(memnew(LagoonicScenePanel));
+	} else if (p_id == "inspector") {
+		bento->set_content(memnew(LagoonicInspectorPanel));
+		bento->set_content_margins(8, 8);
+	} else if (p_id == "game") {
+		// Donde se aloja la vista de juego del editor mientras el juego corre.
+		game_holder = memnew(MarginContainer);
+		{
+			// Sin marco alrededor del juego (el borde de foco de la vista de
+			// juego): en la tarjeta solo hay una linea bajo la barra.
+			Ref<Theme> frame_theme;
+			frame_theme.instantiate();
+			Ref<StyleBoxEmpty> no_frame;
+			no_frame.instantiate();
+			frame_theme->set_stylebox(SNAME("FocusViewport"), SNAME("EditorStyles"), no_frame);
+			game_holder->set_theme(frame_theme);
+		}
+		game_placeholder = memnew(Label);
+		game_placeholder->set_text(String::utf8("Pulsa Jugar y tu juego aparecerá aquí."));
+		game_placeholder->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
+		game_placeholder->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
+		game_placeholder->set_vertical_alignment(VERTICAL_ALIGNMENT_CENTER);
+		game_placeholder->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+		game_holder->add_child(game_placeholder);
+		// Contenedor fijo para la vista de juego. Su barra marca el ancho
+		// minimo de la columna; el chat conserva el suyo (ver set_main).
+		game_scroll = memnew(ScrollContainer);
+		game_scroll->set_vertical_scroll_mode(ScrollContainer::SCROLL_MODE_DISABLED);
+		game_scroll->set_horizontal_scroll_mode(ScrollContainer::SCROLL_MODE_DISABLED);
+		game_holder->add_child(game_scroll);
+		bento->set_content(game_holder);
+		// El juego llega hasta el borde de la tarjeta (solo deja su linea de 1 px).
+		bento->set_content_margins(1, 0);
+		game_holder->add_theme_constant_override(SNAME("margin_bottom"), 1);
 	}
 	bento_board->add_side(bento);
 	bento->apply_palette();
+	if (p_id == "game") {
+		_dock_game(); // Si el juego ya esta en marcha, entra ahora.
+	}
 	if (p_save) {
 		_save_bentos();
 	}
@@ -331,6 +703,13 @@ void LagoonicVibeWorkspace::_open_bento(const String &p_id, bool p_save) {
 void LagoonicVibeWorkspace::_close_bento(const String &p_id) {
 	if (bento_board == nullptr) {
 		return;
+	}
+	if (p_id == "game") {
+		_undock_game(); // Antes de liberar la tarjeta: la vista es del editor.
+		game_holder = nullptr;
+		game_placeholder = nullptr;
+		game_scroll = nullptr;
+		game_auto_opened = false;
 	}
 	bento_board->remove_side(p_id);
 	if (p_id == "plan" && agent_dock != nullptr) {
@@ -341,7 +720,11 @@ void LagoonicVibeWorkspace::_close_bento(const String &p_id) {
 
 void LagoonicVibeWorkspace::_save_bentos() {
 	if (EditorSettings::get_singleton() != nullptr && bento_board != nullptr) {
-		EditorSettings::get_singleton()->set_project_metadata("lagoonic", "bentos", bento_board->get_side_ids());
+		PackedStringArray ids = bento_board->get_side_ids();
+		if (game_auto_opened) {
+			ids.erase("game"); // Se abrio sola para esta partida: no se recuerda.
+		}
+		EditorSettings::get_singleton()->set_project_metadata("lagoonic", "bentos", ids);
 		EditorSettings::get_singleton()->save_project_metadata(); // Al momento, no solo al cerrar.
 	}
 }
@@ -355,6 +738,7 @@ void LagoonicVibeWorkspace::_restore_bentos() {
 		_open_bento(id, false);
 	}
 	// Los tamanos que el usuario dejo, cuando el tablero ya tiene su ancho.
+	bento_board->set_order_callback(callable_mp(this, &LagoonicVibeWorkspace::_save_bentos));
 	const Variant layout = EditorSettings::get_singleton()->get_project_metadata("lagoonic", "bento_layout", Dictionary());
 	callable_mp(this, &LagoonicVibeWorkspace::_restore_layout).call_deferred(layout.get_type() == Variant::DICTIONARY ? Dictionary(layout) : Dictionary());
 }
@@ -419,6 +803,7 @@ void LagoonicVibeWorkspace::_on_play_pressed() {
 		return;
 	}
 	// Un solo boton: Jugar o Detener segun el estado.
+	_set_game_floating_suppressed(true);
 	if (ei->is_playing_scene()) {
 		ei->stop_playing_scene();
 	} else {
@@ -500,6 +885,12 @@ void LagoonicVibeWorkspace::_sync_play_button() {
 	}
 	was_playing = playing;
 	play_button->set_text(playing ? String::utf8("■  Detener") : String::utf8("▶  Jugar"));
+	if (playing) {
+		// Despues de que la vista de juego del editor prepare la partida.
+		callable_mp(this, &LagoonicVibeWorkspace::_on_game_started).call_deferred();
+	} else {
+		_on_game_stopped();
+	}
 }
 
 void LagoonicVibeWorkspace::_on_stop_pressed() {
@@ -518,6 +909,15 @@ void LagoonicVibeWorkspace::_on_return_to_vibe_pressed() {
 
 void LagoonicVibeWorkspace::set_vibe_mode(bool p_enabled) {
 	vibe_mode_active = p_enabled;
+	// La vista de juego vuelve al editor clasico, o entra en su tarjeta.
+	if (!p_enabled) {
+		_undock_game();
+	} else {
+		callable_mp(this, &LagoonicVibeWorkspace::_dock_game).call_deferred();
+	}
+	if (is_inside_tree()) {
+		_set_game_floating_suppressed(p_enabled);
+	}
 	set_visible(vibe_mode_active);
 	if (vibe_mode_active) {
 		move_to_front();
@@ -809,10 +1209,13 @@ void LagoonicVibeWorkspace::_notification(int p_notification) {
 
 		case NOTIFICATION_EXIT_TREE: {
 			LagoonicVibeTheme::get_notifier()->disconnect(SNAME("changed"), callable_mp(this, &LagoonicVibeWorkspace::_apply_palette));
+			_set_game_floating_suppressed(false); // Deja la preferencia del editor clasico como estaba.
 		} break;
 
 		case NOTIFICATION_INTERNAL_PROCESS: {
 			_sync_play_button();
+			_update_game_clip();
+			_fit_game_card();
 		} break;
 
 		case NOTIFICATION_READY: {
@@ -825,6 +1228,15 @@ void LagoonicVibeWorkspace::_notification(int p_notification) {
 			connect(SceneStringName(resized), callable_mp(this, &LagoonicVibeWorkspace::_update_title_margins));
 			callable_mp(this, &LagoonicVibeWorkspace::_play_intro).call_deferred();
 			call_deferred(SNAME("_consume_initial_prompt"));
+			callable_mp(this, &LagoonicVibeWorkspace::_set_game_floating_suppressed).call_deferred(vibe_mode_active);
+			// Al parar el juego (tambien al salir del editor o volver a
+			// Proyectos, que lo paran primero) la vista de juego vuelve a su
+			// sitio en ese mismo momento. Si siguiera en la tarjeta, se liberaria
+			// con ella y el editor la usaria despues: cierre brusco y el juego
+			// quedaba abierto, huerfano.
+			if (EditorRunBar::get_singleton() != nullptr) {
+				EditorRunBar::get_singleton()->connect(SNAME("stop_pressed"), callable_mp(this, &LagoonicVibeWorkspace::_on_run_stopped));
+			}
 		} break;
 
 		case NOTIFICATION_THEME_CHANGED: {

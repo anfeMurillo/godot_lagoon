@@ -19,8 +19,11 @@
 
 namespace {
 
+// Compartida entre transiciones; se suelta al descargar el modulo, antes de
+// que desaparezca el servidor de render (si no, el editor fallaba al salir).
+Ref<ImageTexture> texture;
+
 Ref<Texture2D> _lily_texture() {
-	static Ref<ImageTexture> texture;
 	if (texture.is_null()) {
 		Ref<Image> img;
 		img.instantiate();
@@ -35,6 +38,10 @@ Ref<Texture2D> _lily_texture() {
 }
 
 } // namespace
+
+void LagoonicLilyVeil::free_shared_texture() {
+	texture.unref();
+}
 
 LagoonicLilyVeil::LagoonicLilyVeil() {
 	set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
