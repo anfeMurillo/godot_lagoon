@@ -27,6 +27,7 @@
 #include "core/object/class_db.h"
 #include "core/os/keyboard.h"
 #include "core/os/os.h"
+#include "core/os/time.h"
 #include "core/templates/sort_array.h"
 #include "editor/editor_string_names.h"
 #include "editor/file_system/editor_paths.h"
@@ -37,6 +38,10 @@
 #include "editor/themes/editor_scale.h"
 #include "main/main.h"
 #include "scene/gui/box_container.h"
+#include "scene/gui/center_container.h"
+#include "scene/resources/gradient_texture.h"
+#include "scene/resources/image_texture.h"
+#include "scene/resources/style_box_flat.h"
 #include "scene/gui/button.h"
 #include "scene/gui/flow_container.h"
 #include "scene/gui/label.h"
@@ -71,6 +76,7 @@ struct CardData {
 	String meta;
 	PackedStringArray tags;
 	Ref<Texture2D> icon;
+	String icon_path; // Icono del proyecto (config/icon), en disco.
 	bool favorite = false;
 	bool missing = false;
 };
@@ -83,7 +89,48 @@ enum CardMenuId {
 	CARD_MENU_DUPLICATE,
 	CARD_MENU_TAGS,
 	CARD_MENU_REMOVE,
+	CARD_MENU_COVER_SET,
+	CARD_MENU_COVER_REMOVE,
 };
+
+const char *LAGOONIC_COVER_EXTS[] = { "png", "jpg", "jpeg", "webp" };
+
+// "Hoy, 08:46", "Ayer, 21:10", "12 nov" o "12 nov 2025".
+String _lagoonic_friendly_date(uint64_t p_unix) {
+	if (p_unix == 0) {
+		return String();
+	}
+	static const char *MONTHS[] = { "ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic" };
+	const int64_t bias = int64_t(Time::get_singleton()->get_time_zone_from_system().get("bias", 0)) * 60;
+	const Dictionary d = Time::get_singleton()->get_datetime_dict_from_unix_time(int64_t(p_unix) + bias);
+	const Dictionary now = Time::get_singleton()->get_datetime_dict_from_unix_time(int64_t(Time::get_singleton()->get_unix_time_from_system()) + bias);
+	const int64_t day = (int64_t(p_unix) + bias) / 86400;
+	const int64_t today = (int64_t(Time::get_singleton()->get_unix_time_from_system()) + bias) / 86400;
+	const String hm = vformat("%02d:%02d", int(d["hour"]), int(d["minute"]));
+	if (day == today) {
+		return String::utf8("Hoy, ") + hm;
+	}
+	if (day == today - 1) {
+		return String::utf8("Ayer, ") + hm;
+	}
+	const String dm = vformat("%d %s", int(d["day"]), MONTHS[CLAMP(int(d["month"]) - 1, 0, 11)]);
+	return int(d["year"]) == int(now["year"]) ? dm : vformat("%s %d", dm, int(d["year"]));
+}
+
+void _lagoonic_card_border(const Ref<StyleBoxFlat> &p_style, const Color &p_color) {
+	p_style->set_border_color(p_color);
+}
+
+// La caratula vive en el propio proyecto: viaja con el.
+String _cover_path(const String &p_project_dir) {
+	for (const char *ext : LAGOONIC_COVER_EXTS) {
+		const String p = p_project_dir.path_join(".lagoonic").path_join(String("cover.") + ext);
+		if (FileAccess::exists(p)) {
+			return p;
+		}
+	}
+	return String();
+}
 } // namespace
 
 LagoonicVibeHome::LagoonicVibeHome() {
@@ -118,11 +165,50 @@ void LagoonicVibeHome::_build_ui() {
 	// La franja de agua queda libre (reservada para las animaciones).
 
 	// 2. Cuerpo desplazable centrado con columna central de ancho ~680 px.
+	// El cuerpo va en un contenedor propio para poder poner encima, abajo, un
+	// desvanecimiento al color del fondo: las tarjetas no se ven cortadas.
+	scroll_holder = memnew(Control);
+	scroll_holder->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	scroll_holder->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+	scroll_holder->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
+	root_vbox->add_child(scroll_holder);
+
 	main_scroll = memnew(ScrollContainer);
-	main_scroll->set_h_size_flags(Control::SIZE_EXPAND_FILL);
-	main_scroll->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+	main_scroll->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
 	main_scroll->set_horizontal_scroll_mode(ScrollContainer::SCROLL_MODE_DISABLED);
-	root_vbox->add_child(main_scroll);
+	scroll_holder->add_child(main_scroll);
+
+	scroll_fade_gradient.instantiate();
+	Ref<GradientTexture2D> fade_tex;
+	fade_tex.instantiate();
+	fade_tex->set_gradient(scroll_fade_gradient);
+	fade_tex->set_fill_from(Vector2(0, 0));
+	fade_tex->set_fill_to(Vector2(0, 1));
+	fade_tex->set_width(4);
+	fade_tex->set_height(64);
+	scroll_fade = memnew(TextureRect);
+	scroll_fade->set_texture(fade_tex);
+	scroll_fade->set_expand_mode(TextureRect::EXPAND_IGNORE_SIZE);
+	scroll_fade->set_stretch_mode(TextureRect::STRETCH_SCALE);
+	scroll_fade->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
+	scroll_fade->set_anchors_and_offsets_preset(Control::PRESET_BOTTOM_WIDE);
+	scroll_holder->add_child(scroll_fade);
+
+	// Lo mismo arriba, bajo la franja de agua (degradado al reves).
+	Ref<GradientTexture2D> fade_top_tex;
+	fade_top_tex.instantiate();
+	fade_top_tex->set_gradient(scroll_fade_gradient);
+	fade_top_tex->set_fill_from(Vector2(0, 1));
+	fade_top_tex->set_fill_to(Vector2(0, 0));
+	fade_top_tex->set_width(4);
+	fade_top_tex->set_height(64);
+	scroll_fade_top = memnew(TextureRect);
+	scroll_fade_top->set_texture(fade_top_tex);
+	scroll_fade_top->set_expand_mode(TextureRect::EXPAND_IGNORE_SIZE);
+	scroll_fade_top->set_stretch_mode(TextureRect::STRETCH_SCALE);
+	scroll_fade_top->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
+	scroll_fade_top->set_anchors_and_offsets_preset(Control::PRESET_TOP_WIDE);
+	scroll_holder->add_child(scroll_fade_top);
 
 	// 2b. Vista de plantillas (AssetLib del gestor clasico), oculta hasta pedirla.
 	templates_view = memnew(VBoxContainer);
@@ -356,6 +442,9 @@ void LagoonicVibeHome::_build_ui() {
 	card_menu->add_item(String::utf8("Duplicar..."), CARD_MENU_DUPLICATE);
 	card_menu->add_item(String::utf8("Etiquetas..."), CARD_MENU_TAGS);
 	card_menu->add_separator();
+	card_menu->add_item(String::utf8("Poner carátula..."), CARD_MENU_COVER_SET);
+	card_menu->add_item(String::utf8("Quitar carátula"), CARD_MENU_COVER_REMOVE);
+	card_menu->add_separator();
 	card_menu->add_item(String::utf8("Quitar de la lista..."), CARD_MENU_REMOVE);
 	card_menu->connect(SceneStringName(id_pressed), callable_mp(this, &LagoonicVibeHome::_on_card_menu_id));
 	add_child(card_menu);
@@ -373,6 +462,7 @@ void LagoonicVibeHome::_build_ui() {
 	projects_list_vbox = memnew(VBoxContainer);
 	projects_list_vbox->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	projects_list_vbox->add_theme_constant_override("separation", 8);
+	projects_list_vbox->connect(SceneStringName(resized), callable_mp(this, &LagoonicVibeHome::_layout_project_grid));
 	projects_section->add_child(projects_list_vbox);
 }
 
@@ -447,6 +537,20 @@ void LagoonicVibeHome::_update_theme_styles() {
 	}
 	bg_style.instantiate();
 	bg_style->set_bg_color(page_bg);
+	if (scroll_fade_gradient.is_valid()) {
+		scroll_fade_gradient->set_color(0, Color(page_bg, 0.0f));
+		scroll_fade_gradient->set_color(1, page_bg);
+	}
+	if (scroll_fade != nullptr) {
+		// Deja libre el hueco de la barra de desplazamiento.
+		const float h = 56.0f * scale;
+		scroll_fade->set_offset(SIDE_TOP, -h);
+		scroll_fade->set_offset(SIDE_RIGHT, -14.0f * scale);
+	}
+	if (scroll_fade_top != nullptr) {
+		scroll_fade_top->set_offset(SIDE_BOTTOM, 40.0f * scale);
+		scroll_fade_top->set_offset(SIDE_RIGHT, -14.0f * scale);
+	}
 	bg_style->set_content_margin_all(0);
 	add_theme_style_override(SceneStringName(panel), bg_style);
 
@@ -818,6 +922,7 @@ void LagoonicVibeHome::_rebuild_project_cards() {
 		memdelete(child);
 	}
 	project_cards.clear();
+	project_grid = nullptr;
 	missing_paths.clear();
 
 	Vector<CardData> cards;
@@ -839,12 +944,10 @@ void LagoonicVibeHome::_rebuild_project_cards() {
 			card.favorite = item.favorite;
 			card.missing = item.missing;
 			card.icon = LagoonicPMBridge::get_item_icon(item);
-			PackedStringArray meta;
-			if (!item.project_version.is_empty()) {
-				meta.push_back("Godot " + item.project_version);
+			if (!item.icon.is_empty()) {
+				card.icon_path = item.icon.begins_with("res://") ? item.path.path_join(item.icon.trim_prefix("res://")) : item.icon;
 			}
-			meta.push_back(item.missing ? String::utf8("Carpeta no encontrada") : vformat(String::utf8("Editado %s"), item.get_last_edited_string()));
-			card.meta = String::utf8(" · ").join(meta);
+			card.meta = item.missing ? String::utf8("Carpeta no encontrada") : _lagoonic_friendly_date(item.last_edited);
 			cards.push_back(card);
 		}
 	} else {
@@ -858,6 +961,15 @@ void LagoonicVibeHome::_rebuild_project_cards() {
 			card.name = proj.name;
 			card.path = proj.path;
 			card.favorite = proj.favorite;
+			card.meta = _lagoonic_friendly_date(proj.last_modified);
+			Ref<ConfigFile> pcfg;
+			pcfg.instantiate();
+			if (pcfg->load(proj.path.path_join("project.godot")) == OK) {
+				const String icon = pcfg->get_value("application", "config/icon", String());
+				if (!icon.is_empty()) {
+					card.icon_path = proj.path.path_join(icon.trim_prefix("res://"));
+				}
+			}
 			cards.push_back(card);
 		}
 	}
@@ -888,54 +1000,166 @@ void LagoonicVibeHome::_rebuild_project_cards() {
 	const LagoonicVibeTheme::Palette pal = LagoonicVibeTheme::current();
 	const float scale = EDSCALE > 0.0f ? EDSCALE : 1.0f;
 
+	// Rejilla de tarjetas: portada arriba (caratula, o degradado del tema con
+	// el icono del proyecto al centro) y debajo nombre, fecha y acciones.
+	project_grid = memnew(HFlowContainer);
+	project_grid->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	project_grid->add_theme_constant_override("h_separation", (int)Math::round(14.0f * scale));
+	project_grid->add_theme_constant_override("v_separation", (int)Math::round(14.0f * scale));
+	projects_list_vbox->add_child(project_grid);
+
 	for (const CardData &proj : cards) {
 		PanelContainer *card = memnew(PanelContainer);
-		card->set_h_size_flags(Control::SIZE_EXPAND_FILL);
-		if (project_card_style.is_valid()) {
-			card->add_theme_style_override(SceneStringName(panel), project_card_style);
-		}
+		Ref<StyleBoxFlat> card_style;
+		card_style.instantiate();
+		card_style->set_bg_color(pal.light ? pal.bg.lightened(0.5f) : pal.bg.lerp(pal.surface, 0.4f));
+		card_style->set_border_color(Color(pal.border, 0.9f));
+		card_style->set_border_width_all(MAX(1, (int)Math::round(scale)));
+		card_style->set_corner_radius_all((int)Math::round(14.0f * scale));
+		card_style->set_corner_detail(8);
+		card_style->set_anti_aliased(true);
+		card_style->set_content_margin_all(0);
+		card->add_theme_style_override(SceneStringName(panel), card_style);
+		// La portada respeta las esquinas redondeadas de la tarjeta.
+		card->set_clip_children_mode(CanvasItem::CLIP_CHILDREN_AND_DRAW);
+		card->set_custom_minimum_size(Size2(PROJECT_CARD_MIN_WIDTH * scale, 0));
 		if (!proj.missing) {
 			card->set_default_cursor_shape(Control::CURSOR_POINTING_HAND);
 			card->connect(SceneStringName(gui_input), callable_mp(this, &LagoonicVibeHome::_on_card_gui_input).bind(proj.path));
+			// Al pasar el raton, el borde toma el color del tema.
+			card->connect(SceneStringName(mouse_entered), callable_mp_static(&_lagoonic_card_border).bind(card_style, pal.accent));
+			card->connect(SceneStringName(mouse_exited), callable_mp_static(&_lagoonic_card_border).bind(card_style, Color(pal.border, 0.9f)));
 		}
+		PackedStringArray tip;
+		tip.push_back(proj.path);
 		if (!proj.description.is_empty()) {
-			card->set_tooltip_text(proj.description);
+			tip.push_back(proj.description);
 		}
+		if (!proj.tags.is_empty()) {
+			tip.push_back("#" + String(" #").join(proj.tags));
+		}
+		card->set_tooltip_text(String("\n").join(tip));
 
-		HBoxContainer *row = memnew(HBoxContainer);
-		row->set_h_size_flags(Control::SIZE_EXPAND_FILL);
-		row->add_theme_constant_override("separation", 12);
-		row->set_mouse_filter(Control::MOUSE_FILTER_PASS);
-		card->add_child(row);
+		VBoxContainer *vb = memnew(VBoxContainer);
+		vb->add_theme_constant_override("separation", 0);
+		vb->set_mouse_filter(Control::MOUSE_FILTER_PASS);
+		card->add_child(vb);
+
+		// --- Portada ---
+		Control *cover_box = memnew(Control);
+		cover_box->set_custom_minimum_size(Size2(0, 136.0f * scale));
+		cover_box->set_mouse_filter(Control::MOUSE_FILTER_PASS);
+		vb->add_child(cover_box);
+
+		const Ref<Texture2D> cover = proj.missing ? Ref<Texture2D>() : _load_card_texture(_cover_path(proj.path));
+		if (cover.is_valid()) {
+			TextureRect *tr = memnew(TextureRect);
+			tr->set_texture(cover);
+			tr->set_expand_mode(TextureRect::EXPAND_IGNORE_SIZE);
+			tr->set_stretch_mode(TextureRect::STRETCH_KEEP_ASPECT_COVERED);
+			tr->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
+			tr->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
+			cover_box->add_child(tr);
+		} else {
+			// Degradado del color del tema, con un matiz propio por proyecto
+			// para distinguirlos de un vistazo.
+			const float shift = (float(proj.name.hash() % 1000u) / 1000.0f - 0.5f) * 0.16f;
+			Color top = pal.accent;
+			top.set_ok_hsl_h(Math::fposmod(top.get_ok_hsl_h() + shift, 1.0f));
+			Color bottom = top.lerp(pal.bg, pal.light ? 0.45f : 0.65f);
+			if (pal.light) {
+				top = top.lerp(Color(1, 1, 1), 0.2f);
+			}
+			Ref<Gradient> g;
+			g.instantiate();
+			g->set_color(0, top);
+			g->set_color(1, bottom);
+			Ref<GradientTexture2D> gt;
+			gt.instantiate();
+			gt->set_gradient(g);
+			gt->set_fill_from(Vector2(0, 0));
+			gt->set_fill_to(Vector2(1, 1));
+			gt->set_width(64);
+			gt->set_height(64);
+			TextureRect *bg = memnew(TextureRect);
+			bg->set_texture(gt);
+			bg->set_expand_mode(TextureRect::EXPAND_IGNORE_SIZE);
+			bg->set_stretch_mode(TextureRect::STRETCH_SCALE);
+			bg->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
+			bg->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
+			cover_box->add_child(bg);
+
+			CenterContainer *center = memnew(CenterContainer);
+			center->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
+			center->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
+			cover_box->add_child(center);
+			// El icono se lee del propio proyecto (la lista clasica lo carga
+			// tarde y a veces aun no estaba: la tarjeta se quedaba sin el).
+			Ref<Texture2D> icon = _load_card_texture(proj.icon_path);
+			if (icon.is_null()) {
+				icon = proj.icon;
+			}
+			if (icon.is_valid()) {
+				TextureRect *ic = memnew(TextureRect);
+				ic->set_texture(icon);
+				ic->set_expand_mode(TextureRect::EXPAND_IGNORE_SIZE);
+				ic->set_stretch_mode(TextureRect::STRETCH_KEEP_ASPECT_CENTERED);
+				ic->set_custom_minimum_size(Size2(72.0f, 72.0f) * scale);
+				ic->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
+				center->add_child(ic);
+			} else {
+				Label *initial = memnew(Label);
+				initial->set_text(proj.name.strip_edges().left(1).to_upper());
+				initial->add_theme_font_size_override(SceneStringName(font_size), (int)Math::round(44.0f * scale));
+				initial->add_theme_color_override(SceneStringName(font_color), Color(1, 1, 1, 0.92f));
+				initial->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
+				center->add_child(initial);
+			}
+		}
+		if (proj.missing) {
+			cover_box->set_modulate(Color(1, 1, 1, 0.45f));
+		}
 
 		if (pm_list != nullptr) {
 			Button *fav_btn = memnew(Button);
 			fav_btn->set_text(proj.favorite ? String::utf8("★") : String::utf8("☆"));
 			fav_btn->set_tooltip_text(proj.favorite ? String::utf8("Quitar de favoritos") : String::utf8("Añadir a favoritos"));
 			fav_btn->set_focus_mode(Control::FOCUS_NONE);
-			fav_btn->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
-			_style_flat(fav_btn);
-			fav_btn->add_theme_font_size_override(SceneStringName(font_size), (int)Math::round(18.0f * scale));
-			const Color star = proj.favorite ? pal.accent : pal.text_muted;
-			fav_btn->add_theme_color_override(SceneStringName(font_color), star);
-			fav_btn->add_theme_color_override(SNAME("font_hover_color"), pal.accent);
+			// Solo la estrella, sin caja: blanca (se lee sobre cualquier portada)
+			// y del color del tema si es favorito o al pasar el raton.
+			for (const char *st : { "normal", "hover", "pressed", "hover_pressed", "focus", "disabled" }) {
+				fav_btn->add_theme_style_override(st, memnew(StyleBoxEmpty));
+			}
+			fav_btn->add_theme_font_size_override(SceneStringName(font_size), (int)Math::round(20.0f * scale));
+			const Color gold = pal.light ? pal.accent.lightened(0.1f) : pal.accent.lightened(0.25f);
+			const Color star = proj.favorite ? gold : Color(1, 1, 1, 0.9f);
+			for (const char *fc : { "font_color", "font_pressed_color", "font_focus_color" }) {
+				fav_btn->add_theme_color_override(fc, star);
+			}
+			fav_btn->add_theme_color_override(SNAME("font_hover_color"), gold);
+			fav_btn->add_theme_color_override(SNAME("font_hover_pressed_color"), gold);
+			fav_btn->add_theme_color_override(SNAME("font_outline_color"), Color(0, 0, 0, 0.28f));
+			fav_btn->add_theme_constant_override(SNAME("outline_size"), (int)Math::round(4.0f * scale));
+			fav_btn->set_anchors_and_offsets_preset(Control::PRESET_TOP_RIGHT);
+			fav_btn->set_position(Vector2(-40.0f * scale, 6.0f * scale));
+			fav_btn->set_size(Size2(34.0f, 34.0f) * scale);
 			fav_btn->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_on_favorite_pressed).bind(proj.path, !proj.favorite));
-			row->add_child(fav_btn);
+			cover_box->add_child(fav_btn);
 		}
 
-		if (proj.icon.is_valid()) {
-			TextureRect *icon = memnew(TextureRect);
-			icon->set_texture(proj.icon);
-			icon->set_expand_mode(TextureRect::EXPAND_IGNORE_SIZE);
-			icon->set_stretch_mode(TextureRect::STRETCH_KEEP_ASPECT_CENTERED);
-			icon->set_custom_minimum_size(Size2(40.0f, 40.0f) * scale);
-			icon->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
-			icon->set_mouse_filter(Control::MOUSE_FILTER_PASS);
-			if (proj.missing) {
-				icon->set_modulate(Color(1, 1, 1, 0.5));
-			}
-			row->add_child(icon);
-		}
+		// --- Pie: nombre, fecha y acciones ---
+		MarginContainer *foot = memnew(MarginContainer);
+		foot->add_theme_constant_override("margin_left", (int)Math::round(14.0f * scale));
+		foot->add_theme_constant_override("margin_right", (int)Math::round(8.0f * scale));
+		foot->add_theme_constant_override("margin_top", (int)Math::round(10.0f * scale));
+		foot->add_theme_constant_override("margin_bottom", (int)Math::round(10.0f * scale));
+		foot->set_mouse_filter(Control::MOUSE_FILTER_PASS);
+		vb->add_child(foot);
+
+		HBoxContainer *row = memnew(HBoxContainer);
+		row->add_theme_constant_override("separation", (int)Math::round(6.0f * scale));
+		row->set_mouse_filter(Control::MOUSE_FILTER_PASS);
+		foot->add_child(row);
 
 		VBoxContainer *info_vbox = memnew(VBoxContainer);
 		info_vbox->set_h_size_flags(Control::SIZE_EXPAND_FILL);
@@ -946,78 +1170,150 @@ void LagoonicVibeHome::_rebuild_project_cards() {
 		Label *name_lbl = memnew(Label);
 		name_lbl->set_text(proj.missing ? vformat(String::utf8("%s (falta)"), proj.name) : proj.name);
 		name_lbl->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
+		name_lbl->set_custom_minimum_size(Size2(1, 0));
 		name_lbl->add_theme_color_override(SceneStringName(font_color), proj.missing ? pal.text_muted : pal.text);
 		name_lbl->set_mouse_filter(Control::MOUSE_FILTER_PASS);
 		info_vbox->add_child(name_lbl);
 
-		Label *path_lbl = memnew(Label);
-		path_lbl->set_text(proj.path);
-		path_lbl->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
-		path_lbl->add_theme_color_override(SceneStringName(font_color), pal.text_muted);
-		path_lbl->set_mouse_filter(Control::MOUSE_FILTER_PASS);
-		info_vbox->add_child(path_lbl);
-
-		if (!proj.meta.is_empty() || !proj.tags.is_empty()) {
-			HFlowContainer *meta_row = memnew(HFlowContainer);
-			meta_row->add_theme_constant_override("h_separation", 6);
-			meta_row->set_mouse_filter(Control::MOUSE_FILTER_PASS);
-			info_vbox->add_child(meta_row);
-
-			if (!proj.meta.is_empty()) {
-				Label *meta_lbl = memnew(Label);
-				meta_lbl->set_text(proj.meta);
-				meta_lbl->add_theme_font_size_override(SceneStringName(font_size), (int)Math::round(12.0f * scale));
-				meta_lbl->add_theme_color_override(SceneStringName(font_color), pal.text_muted);
-				meta_lbl->set_mouse_filter(Control::MOUSE_FILTER_PASS);
-				meta_row->add_child(meta_lbl);
-			}
-			for (const String &tag : proj.tags) {
-				Button *tag_btn = memnew(Button);
-				tag_btn->set_text("#" + tag);
-				tag_btn->set_tooltip_text(vformat(String::utf8("Filtrar por la etiqueta \"%s\""), tag));
-				tag_btn->set_focus_mode(Control::FOCUS_NONE);
-				_style_flat(tag_btn);
-				tag_btn->add_theme_font_size_override(SceneStringName(font_size), (int)Math::round(12.0f * scale));
-				tag_btn->add_theme_color_override(SceneStringName(font_color), pal.accent);
-				tag_btn->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_on_tag_pressed).bind(tag));
-				meta_row->add_child(tag_btn);
-			}
+		if (!proj.meta.is_empty()) {
+			Label *meta_lbl = memnew(Label);
+			meta_lbl->set_text(proj.meta);
+			meta_lbl->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
+			meta_lbl->set_custom_minimum_size(Size2(1, 0));
+			meta_lbl->add_theme_font_size_override(SceneStringName(font_size), (int)Math::round(12.0f * scale));
+			meta_lbl->add_theme_color_override(SceneStringName(font_color), pal.text_muted);
+			meta_lbl->set_mouse_filter(Control::MOUSE_FILTER_PASS);
+			info_vbox->add_child(meta_lbl);
 		}
-
-		HBoxContainer *btn_row = memnew(HBoxContainer);
-		btn_row->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
-		btn_row->add_theme_constant_override("separation", 8);
-		row->add_child(btn_row);
 
 		Button *run_btn = memnew(Button);
-		run_btn->set_text(String::utf8("Ejecutar"));
-		run_btn->set_tooltip_text(vformat(String::utf8("Ejecutar %s"), proj.name));
+		run_btn->set_tooltip_text(vformat(String::utf8("Jugar %s sin abrir el editor"), proj.name));
 		run_btn->set_disabled(proj.missing);
-		_style_subtle(run_btn);
-		run_btn->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_run_project).bind(proj.path));
-		btn_row->add_child(run_btn);
-
-		Button *open_btn = memnew(Button);
-		open_btn->set_text(String::utf8("Abrir"));
-		open_btn->set_tooltip_text(vformat(String::utf8("Abrir %s en el editor de Vibe Coding"), proj.name));
-		open_btn->set_disabled(proj.missing);
-		_style_primary(open_btn);
-		open_btn->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_open_project_in_editor).bind(proj.path));
-		btn_row->add_child(open_btn);
-
-		if (pm_list != nullptr) {
-			Button *more_btn = memnew(Button);
-			more_btn->set_text(String::utf8("···"));
-			more_btn->set_tooltip_text(String::utf8("Más acciones: renombrar, duplicar, etiquetas, quitar..."));
-			more_btn->set_focus_mode(Control::FOCUS_NONE);
-			_style_subtle(more_btn);
-			more_btn->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_on_card_menu_pressed).bind(proj.path, more_btn));
-			btn_row->add_child(more_btn);
+		run_btn->set_focus_mode(Control::FOCUS_NONE);
+		run_btn->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+		// Circulo perfecto: tamano fijo y radio de sobra (se recorta a la mitad).
+		// Siempre del acento del tema (un punto mas apagado en reposo) con el
+		// triangulo en el color que el tema usa encima del acento: se ve bien
+		// en temas claros y oscuros.
+		{
+			const float d = 34.0f * scale;
+			Ref<StyleBoxFlat> round;
+			round.instantiate();
+			const Color card_bg = pal.light ? pal.bg.lightened(0.5f) : pal.bg.lerp(pal.surface, 0.4f);
+			round->set_bg_color(pal.accent.lerp(card_bg, 0.22f));
+			round->set_corner_radius_all((int)Math::round(d));
+			round->set_corner_detail(12);
+			round->set_anti_aliased(true);
+			round->set_content_margin_all(0);
+			Ref<StyleBoxFlat> round_hover = round->duplicate();
+			round_hover->set_bg_color(pal.light ? pal.accent.darkened(0.08f) : pal.accent.lightened(0.12f));
+			Ref<StyleBoxFlat> round_disabled = round->duplicate();
+			round_disabled->set_bg_color(Color(pal.text_muted, 0.15f));
+			run_btn->add_theme_style_override(SNAME("normal"), round);
+			run_btn->add_theme_style_override(SNAME("hover"), round_hover);
+			run_btn->add_theme_style_override(SNAME("pressed"), round_hover);
+			run_btn->add_theme_style_override(SNAME("hover_pressed"), round_hover);
+			run_btn->add_theme_style_override(SNAME("disabled"), round_disabled);
+			run_btn->add_theme_style_override(SNAME("focus"), memnew(StyleBoxEmpty));
+			run_btn->set_custom_minimum_size(Size2(d, d));
+			run_btn->set_h_size_flags(Control::SIZE_SHRINK_CENTER);
+			run_btn->add_theme_constant_override(SNAME("icon_max_width"), (int)Math::round(14.0f * scale));
 		}
+		run_btn->set_button_icon(get_editor_theme_icon(SNAME("Play")));
+		run_btn->set_icon_alignment(HORIZONTAL_ALIGNMENT_CENTER);
+		run_btn->set_vertical_icon_alignment(VERTICAL_ALIGNMENT_CENTER);
+		run_btn->set_expand_icon(false);
+		run_btn->add_theme_color_override(SNAME("icon_normal_color"), pal.on_accent);
+		run_btn->add_theme_color_override(SNAME("icon_focus_color"), pal.on_accent);
+		run_btn->add_theme_color_override(SNAME("icon_hover_color"), pal.on_accent);
+		run_btn->add_theme_color_override(SNAME("icon_pressed_color"), pal.on_accent);
+		run_btn->add_theme_color_override(SNAME("icon_hover_pressed_color"), pal.on_accent);
+		run_btn->add_theme_color_override(SNAME("icon_disabled_color"), Color(pal.text_muted, 0.5f));
+		run_btn->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_run_project).bind(proj.path));
+		row->add_child(run_btn);
 
-		projects_list_vbox->add_child(card);
+		Button *more_btn = memnew(Button);
+		more_btn->set_text(String::utf8("···"));
+		more_btn->set_tooltip_text(String::utf8("Más: carátula, renombrar, duplicar, etiquetas, quitar..."));
+		more_btn->set_focus_mode(Control::FOCUS_NONE);
+		more_btn->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+		_style_flat(more_btn);
+		more_btn->add_theme_color_override(SceneStringName(font_color), pal.text_muted);
+		more_btn->connect(SceneStringName(pressed), callable_mp(this, &LagoonicVibeHome::_on_card_menu_pressed).bind(proj.path, more_btn));
+		row->add_child(more_btn);
+
+		project_grid->add_child(card);
 		project_cards.push_back(card);
 	}
+	_layout_project_grid();
+}
+
+void LagoonicVibeHome::_layout_project_grid() {
+	if (project_grid == nullptr || project_cards.is_empty()) {
+		return;
+	}
+	// Tantas columnas como quepan; las tarjetas se ensanchan para llenar la fila.
+	const float scale = EDSCALE > 0.0f ? EDSCALE : 1.0f;
+	const float gap = 14.0f * scale;
+	const float width = projects_list_vbox->get_size().x;
+	if (width <= 0) {
+		return;
+	}
+	const int cols = MAX(1, (int)Math::floor((width + gap) / (PROJECT_CARD_MIN_WIDTH * scale + gap)));
+	const float card_w = Math::floor((width - gap * (cols - 1)) / cols);
+	for (PanelContainer *card : project_cards) {
+		card->set_custom_minimum_size(Size2(card_w, 0));
+	}
+}
+
+Ref<Texture2D> LagoonicVibeHome::_load_card_texture(const String &p_path) {
+	if (p_path.is_empty() || !FileAccess::exists(p_path)) {
+		return Ref<Texture2D>();
+	}
+	const uint64_t mtime = FileAccess::get_modified_time(p_path);
+	const String key = p_path + "|" + itos(mtime);
+	if (Ref<Texture2D> *cached = card_textures.getptr(key)) {
+		return *cached;
+	}
+	Ref<Image> img;
+	img.instantiate();
+	Ref<Texture2D> tex;
+	if (img->load(p_path) == OK && !img->is_empty()) {
+		// Portadas grandes: se reducen para que la rejilla vaya ligera.
+		if (img->get_width() > 640) {
+			img->resize(640, MAX(1, img->get_height() * 640 / img->get_width()), Image::INTERPOLATE_LANCZOS);
+		}
+		tex = ImageTexture::create_from_image(img);
+	}
+	card_textures[key] = tex;
+	return tex;
+}
+
+void LagoonicVibeHome::_on_cover_selected(const String &p_file) {
+	const String dir = cover_project_path;
+	if (dir.is_empty()) {
+		return;
+	}
+	Ref<Image> img;
+	img.instantiate();
+	if (img->load(p_file) != OK || img->is_empty()) {
+		_show_status(String::utf8("No se pudo leer esa imagen. Usa un PNG, JPG o WebP."), true);
+		return;
+	}
+	const String folder = dir.path_join(".lagoonic");
+	DirAccess::make_dir_recursive_absolute(folder);
+	for (const char *ext : LAGOONIC_COVER_EXTS) {
+		DirAccess::remove_absolute(folder.path_join(String("cover.") + ext));
+	}
+	// Se guarda como PNG reducido: pesa poco y siempre se puede leer.
+	if (img->get_width() > 1280) {
+		img->resize(1280, MAX(1, img->get_height() * 1280 / img->get_width()), Image::INTERPOLATE_LANCZOS);
+	}
+	if (img->save_png(folder.path_join("cover.png")) != OK) {
+		_show_status(String::utf8("No se pudo guardar la carátula en el proyecto."), true);
+		return;
+	}
+	_rebuild_project_cards();
 }
 
 void LagoonicVibeHome::_style_subtle(Button *p_button) const {
@@ -1186,6 +1482,9 @@ void LagoonicVibeHome::_show_templates(bool p_show) {
 	if (main_scroll) {
 		main_scroll->set_visible(!p_show);
 	}
+	if (scroll_holder) {
+		scroll_holder->set_visible(!p_show);
+	}
 	if (templates_view) {
 		templates_view->set_visible(p_show);
 	}
@@ -1234,8 +1533,13 @@ void LagoonicVibeHome::_on_card_menu_pressed(const String &p_project_dir, Button
 	}
 	card_menu_path = p_project_dir;
 	const bool missing = missing_paths.has(p_project_dir);
-	for (int id : { CARD_MENU_OPEN_VERBOSE, CARD_MENU_OPEN_RECOVERY, CARD_MENU_SHOW_IN_FM, CARD_MENU_RENAME, CARD_MENU_DUPLICATE, CARD_MENU_TAGS }) {
+	for (int id : { CARD_MENU_OPEN_VERBOSE, CARD_MENU_OPEN_RECOVERY, CARD_MENU_SHOW_IN_FM, CARD_MENU_RENAME, CARD_MENU_DUPLICATE, CARD_MENU_TAGS, CARD_MENU_COVER_SET }) {
 		card_menu->set_item_disabled(card_menu->get_item_index(id), missing);
+	}
+	card_menu->set_item_disabled(card_menu->get_item_index(CARD_MENU_COVER_REMOVE), missing || _cover_path(p_project_dir).is_empty());
+	// Sin la lista clasica solo hay caratula.
+	for (int id : { CARD_MENU_OPEN_VERBOSE, CARD_MENU_OPEN_RECOVERY, CARD_MENU_SHOW_IN_FM, CARD_MENU_RENAME, CARD_MENU_DUPLICATE, CARD_MENU_TAGS, CARD_MENU_REMOVE }) {
+		card_menu->set_item_disabled(card_menu->get_item_index(id), missing || pm_list == nullptr);
 	}
 	card_menu->reset_size();
 	const Vector2 pos = p_button->get_screen_position() + Vector2(0.0f, p_button->get_size().y);
@@ -1244,6 +1548,27 @@ void LagoonicVibeHome::_on_card_menu_pressed(const String &p_project_dir, Button
 }
 
 void LagoonicVibeHome::_on_card_menu_id(int p_id) {
+	if (p_id == CARD_MENU_COVER_SET) {
+		cover_project_path = card_menu_path;
+		if (cover_dialog == nullptr) {
+			cover_dialog = memnew(EditorFileDialog);
+			cover_dialog->set_access(EditorFileDialog::ACCESS_FILESYSTEM);
+			cover_dialog->set_file_mode(EditorFileDialog::FILE_MODE_OPEN_FILE);
+			cover_dialog->set_title(String::utf8("Elegir carátula del proyecto"));
+			cover_dialog->add_filter("*.png, *.jpg, *.jpeg, *.webp", String::utf8("Imágenes"));
+			cover_dialog->connect("file_selected", callable_mp(this, &LagoonicVibeHome::_on_cover_selected));
+			add_child(cover_dialog);
+		}
+		cover_dialog->popup_file_dialog();
+		return;
+	}
+	if (p_id == CARD_MENU_COVER_REMOVE) {
+		for (const char *ext : LAGOONIC_COVER_EXTS) {
+			DirAccess::remove_absolute(card_menu_path.path_join(".lagoonic").path_join(String("cover.") + ext));
+		}
+		_rebuild_project_cards();
+		return;
+	}
 	if (!_select_for_action(card_menu_path)) {
 		return;
 	}

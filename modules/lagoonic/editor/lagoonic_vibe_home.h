@@ -97,6 +97,19 @@ private:
 
 	Vector<ProjectEntry> projects;
 	Vector<PanelContainer *> project_cards;
+	Control *scroll_holder = nullptr;
+	class TextureRect *scroll_fade = nullptr; // Desvanecimiento abajo del cuerpo.
+	class TextureRect *scroll_fade_top = nullptr; // Y arriba, bajo el agua.
+	Ref<class Gradient> scroll_fade_gradient;
+	class HFlowContainer *project_grid = nullptr;
+	static constexpr float PROJECT_CARD_MIN_WIDTH = 236.0f;
+	// Iconos y caratulas ya cargados (clave: ruta|fecha de modificacion).
+	HashMap<String, Ref<Texture2D>> card_textures;
+	EditorFileDialog *cover_dialog = nullptr;
+	String cover_project_path;
+	void _layout_project_grid();
+	Ref<Texture2D> _load_card_texture(const String &p_path);
+	void _on_cover_selected(const String &p_file);
 
 	Ref<StyleBoxFlat> bg_style;
 	Ref<StyleBoxFlat> prompt_card_style;
