@@ -229,6 +229,14 @@ String LagoonicCrewOrchestrator::queue_task(const String &p_title, const String 
 		last_error = "No worker agent is set up. Do the task yourself.";
 		return "";
 	}
+	// Workers may share the boss's tools (OpenCode runs both): only the boss
+	// delegates, never a worker in the middle of its task.
+	for (const LagoonicCrewTask &t : crew_round_tasks) {
+		if (t.status == "running") {
+			last_error = "Workers cannot start other workers. Finish your task and report.";
+			return "";
+		}
+	}
 	String want = p_worker.strip_edges();
 	const LagoonicCrewWorkerEntry *chosen = nullptr;
 	if (want.is_empty()) {

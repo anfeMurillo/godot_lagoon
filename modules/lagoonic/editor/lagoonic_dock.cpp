@@ -253,21 +253,25 @@ void LagoonicDock::_on_agent_event(const StringName &p_event, const Variant &p_a
 		if (chat != nullptr) {
 			chat->set_boss_agent(boss);
 		}
-		runtime_host->set_crew_boss(boss);
+		// The team (boss + workers from Configuracion > Equipo) goes to the
+		// host before each message, so changes apply right away.
+		runtime_host->set_project_dir(cwd);
+		const Array workers = LagoonicAgentSettings::crew_workers();
+		runtime_host->set_crew(boss, workers);
+		bool opencode_worker = false;
+		for (int i = 0; i < workers.size(); i++) {
+			opencode_worker = opencode_worker || String(Dictionary(workers[i]).get("id", "")) == "opencode";
+		}
 		if (boss != "opencode") {
-			// Claude Code, Codex... answer through their ACP adapter: no
-			// OpenCode server needed for this turn.
-			runtime_host->set_project_dir(cwd);
+			// Claude Code, Codex... answer through their ACP adapter; OpenCode
+			// only starts when it works as one of the workers.
+			if (opencode_worker) {
+				runtime_host->ensure_server(cwd, model, LagoonicAgentSettings::secret_env());
+			}
 			if (runtime_host->send_prompt(session, String(p_a), mode, model) != OK && chat != nullptr) {
 				chat->set_busy(false);
 			}
 		} else if (runtime_host->ensure_server(cwd, model, LagoonicAgentSettings::secret_env()) == OK) {
-			if (!crew_applied) {
-				// Configuracion > Equipo: necesita la carpeta del proyecto, que
-				// el host conoce tras ensure_server().
-				runtime_host->set_crew(boss, LagoonicAgentSettings::crew_workers());
-				crew_applied = true;
-			}
 			runtime_host->send_prompt(session, String(p_a), mode, model, (chat != nullptr) ? chat->get_effort() : LagoonicAgentSettings::get_effort());
 		} else if (chat != nullptr) {
 			chat->set_busy(false);

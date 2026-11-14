@@ -36,6 +36,9 @@
 #include "core/os/os.h"
 
 #include "lagoonic_coding_agents.h"
+#include "lagoonic_crew_server.h"
+
+#include "scene/main/scene_tree.h"
 #include "lagoonic_config_writer.h"
 #include "lagoonic_mcp_locator.h"
 
@@ -56,6 +59,7 @@ class LagoonicHostCrewRunner : public LagoonicCrewRunner {
 	LagoonicRuntimeHost *host = nullptr;
 	mutable Mutex worker_mutex;
 	String worker_session; // Ephemeral OpenCode session of the running worker.
+	Ref<LagoonicAcpRunner> worker_runner; // ACP worker turn in progress, if any.
 	bool worker_abort_requested = false;
 
 public:
@@ -76,9 +80,27 @@ public:
 
 	virtual String crew_run_worker(const String &p_worker_id, const String &p_prompt, const String &p_title, int p_number, const String &p_boss_session_id, String &r_error) override {
 		(void)p_boss_session_id;
-		if (p_worker_id != "opencode") {
-			r_error = "Worker '" + p_worker_id + "' needs an ACP adapter turn (not wired in host v1).";
+		if (host == nullptr) {
+			r_error = "Runtime host is gone.";
 			return String();
+		}
+		if (p_worker_id != "opencode") {
+			// Claude Code, Codex...: one silent ACP turn; its text is the report.
+			Ref<LagoonicAcpRunner> runner;
+			runner.instantiate();
+			worker_mutex.lock();
+			worker_runner = runner;
+			worker_abort_requested = false;
+			worker_mutex.unlock();
+			const String report = host->acp_worker_turn(p_worker_id, p_prompt, runner, r_error);
+			worker_mutex.lock();
+			worker_runner.unref();
+			const bool aborted = worker_abort_requested;
+			worker_mutex.unlock();
+			if (aborted && r_error.is_empty()) {
+				r_error = "Worker turn aborted.";
+			}
+			return report;
 		}
 		if (host == nullptr) {
 			r_error = "Runtime host is gone.";
@@ -203,7 +225,11 @@ public:
 		worker_mutex.lock();
 		worker_abort_requested = true;
 		const String sid = worker_session;
+		const Ref<LagoonicAcpRunner> acp = worker_runner;
 		worker_mutex.unlock();
+		if (acp.is_valid()) {
+			acp->session_cancel(acp->get_acp_session_id());
+		}
 		if (host != nullptr && !sid.is_empty()) {
 			Ref<LagoonicOpenCodeClient> client = host->get_client();
 			if (client.is_valid()) {
@@ -235,6 +261,12 @@ public:
 			r_error = "Runtime host is gone.";
 			return;
 		}
+		const String boss = host->get_crew_boss();
+		if (!boss.is_empty() && boss != "opencode") {
+			crew_emit_chat(p_boss_session_id, p_bubble);
+			r_error = host->acp_wake_boss(boss, p_boss_session_id, p_wake_text);
+			return;
+		}
 		Ref<LagoonicOpenCodeClient> client = host->get_client();
 		const String dir = host->get_project_dir();
 		if (client.is_null() || dir.is_empty()) {
@@ -246,6 +278,7 @@ public:
 		text_part["type"] = String("text");
 		text_part["text"] = p_wake_text;
 		parts.push_back(text_part);
+		host->_append_boss_instruction(parts);
 		Mutex *m = host->get_client_mutex();
 		m->lock();
 		const Dictionary res = client->lagoonic_prompt_parts_async(p_boss_session_id, dir, parts, String(), String(), String());
@@ -310,6 +343,12 @@ LagoonicRuntimeHost::LagoonicRuntimeHost() {
 }
 
 LagoonicRuntimeHost::~LagoonicRuntimeHost() {
+	if (crew_poll_hooked && SceneTree::get_singleton() != nullptr) {
+		SceneTree::get_singleton()->disconnect(SNAME("process_frame"), callable_mp(this, &LagoonicRuntimeHost::_poll_crew_server));
+	}
+	if (crew_server.is_valid()) {
+		crew_server->stop();
+	}
 	if (acp_runner.is_valid()) {
 		acp_runner->close(); // Ends a running turn so its thread returns.
 	}
@@ -433,8 +472,14 @@ Error LagoonicRuntimeHost::ensure_server(const String &p_project_dir, const Stri
 		return ERR_INVALID_PARAMETER;
 	}
 
+	// The crew server must be in OpenCode's config: restart once when the
+	// running server was started without it.
+	_ensure_crew_server();
+	state_mutex.lock();
+	const bool crew_missing = !crew_url_cache.is_empty() && !server_has_crew;
+	state_mutex.unlock();
 	// Fast path: already up (mirrors supervisor.ts: reuse the healthy server).
-	if (supervisor->is_running() && supervisor->check_health()) {
+	if (!crew_missing && supervisor->is_running() && supervisor->check_health()) {
 		state_mutex.lock();
 		server_down = false;
 		state_mutex.unlock();
@@ -444,10 +489,21 @@ Error LagoonicRuntimeHost::ensure_server(const String &p_project_dir, const Stri
 	}
 	supervisor->stop();
 
+	state_mutex.lock();
+	const String crew_url = crew_url_cache;
+	const String crew_auth = crew_auth_cache;
+	state_mutex.unlock();
 	LagoonicConfigWriter writer;
 	Dictionary input;
 	input["project_dir"] = dir;
 	input["default_model"] = model;
+	if (!crew_url.is_empty()) {
+		// The boss reaches start_worker / list_workers through this server.
+		Dictionary crew_input;
+		crew_input["url"] = crew_url;
+		crew_input["authorization"] = crew_auth;
+		input["crew"] = crew_input;
+	}
 	const String config_path = writer.default_config_path(_slugify(dir));
 	const Error werr = writer.write_config(config_path, input);
 	if (werr != OK) {
@@ -465,6 +521,7 @@ Error LagoonicRuntimeHost::ensure_server(const String &p_project_dir, const Stri
 	}
 	state_mutex.lock();
 	server_down = false;
+	server_has_crew = !crew_url.is_empty();
 	state_mutex.unlock();
 	_attach_client();
 	_emit_status("ready");
@@ -521,6 +578,7 @@ Error LagoonicRuntimeHost::send_prompt(const String &p_session_id, const String 
 	text_part["type"] = String("text");
 	text_part["text"] = p_text;
 	parts.push_back(text_part);
+	_append_boss_instruction(parts);
 	const Dictionary res = client->lagoonic_prompt_parts_async(session, dir, parts, provider, model_id, agent, p_variant);
 	client_mutex.unlock();
 
@@ -1033,6 +1091,183 @@ void LagoonicRuntimeHost::_on_acp_probe_finished(const String &p_agent_id, const
 	_emit_event(event);
 }
 
+Array LagoonicRuntimeHost::_acp_mcp_servers(const String &dir, const String &path_value, bool p_with_crew) const {
+	// lagoonic-mcp gives the agent the Godot tools, like OpenCode's config.
+	Array mcp_servers;
+	const Vector<String> mcp_command = LagoonicMcpLocator::command();
+	if (mcp_command.is_empty()) {
+		WARN_PRINT("Lagoonic: lagoonic-mcp was not found, so the agent has no Godot tools.");
+	} else {
+		Array mcp_env;
+		const char *env_names[3] = { "GODOT_PATH", "LAGOONIC_PLATFORM", "PATH" };
+		const String env_values[3] = { OS::get_singleton()->get_executable_path(), "desktop", path_value };
+		for (int i = 0; i < 3; i++) {
+			Dictionary entry;
+			entry["name"] = String(env_names[i]);
+			entry["value"] = env_values[i];
+			mcp_env.push_back(entry);
+		}
+		Array mcp_args;
+		for (int i = 1; i < mcp_command.size(); i++) {
+			mcp_args.push_back(mcp_command[i]);
+		}
+		mcp_args.push_back("--project");
+		mcp_args.push_back(dir);
+		Dictionary server;
+		server["name"] = String("lagoonic");
+		server["command"] = mcp_command[0];
+		server["args"] = mcp_args;
+		server["env"] = mcp_env;
+		mcp_servers.push_back(server);
+	}
+	// The boss also gets the crew tools (start_worker, list_workers) over HTTP.
+	state_mutex.lock();
+	const String crew_url = crew_url_cache;
+	const String crew_auth = crew_auth_cache;
+	state_mutex.unlock();
+	if (p_with_crew && !crew_url.is_empty() && !crew->crew_worker_names().is_empty()) {
+		Array headers;
+		Dictionary auth;
+		auth["name"] = String("Authorization");
+		auth["value"] = crew_auth;
+		headers.push_back(auth);
+		Dictionary crew_entry;
+		crew_entry["type"] = String("http");
+		crew_entry["name"] = String(LagoonicCrewServer::CREW_SERVER_NAME);
+		crew_entry["url"] = crew_url;
+		crew_entry["headers"] = headers;
+		mcp_servers.push_back(crew_entry);
+	}
+	return mcp_servers;
+}
+
+String LagoonicRuntimeHost::_boss_prompt(const String &p_text) const {
+	// With workers, the boss learns how to delegate (prepended like the
+	// desktop bridge did for ACP bosses).
+	const Vector<String> names = crew->crew_worker_names();
+	state_mutex.lock();
+	const bool has_crew = !crew_url_cache.is_empty();
+	state_mutex.unlock();
+	if (names.is_empty() || !has_crew) {
+		return p_text;
+	}
+	return LagoonicCrewOrchestrator::boss_instruction(names, LagoonicCrewOrchestrator::MAX_CREW_TASKS) + "\n\n" + p_text;
+}
+
+void LagoonicRuntimeHost::_append_boss_instruction(Array &r_parts) const {
+	// OpenCode boss: hidden from the chat history (synthetic), so only the
+	// boss reads it; workers run in their own sessions without it.
+	const Vector<String> names = crew->crew_worker_names();
+	state_mutex.lock();
+	const bool has_crew = !crew_url_cache.is_empty();
+	state_mutex.unlock();
+	if (names.is_empty() || !has_crew) {
+		return;
+	}
+	Dictionary part;
+	part["type"] = String("text");
+	part["text"] = LagoonicCrewOrchestrator::boss_instruction(names, LagoonicCrewOrchestrator::MAX_CREW_TASKS);
+	part["synthetic"] = true;
+	r_parts.push_back(part);
+}
+
+String LagoonicRuntimeHost::acp_wake_boss(const String &p_boss_id, const String &p_session_id, const String &p_wake_text) {
+	// Crew round thread: the wake-up is a normal boss turn, run here so the
+	// orchestrator's loop sees the tasks the boss queues from the reports.
+	if (acp_busy.is_set()) {
+		return "The boss is still answering; send a message to continue.";
+	}
+	if (acp_runner.is_null()) {
+		return "The boss is not connected; send a message to continue.";
+	}
+	String bin, path_value, error;
+	PackedStringArray args;
+	if (!_resolve_acp(p_boss_id, bin, args, path_value, error)) {
+		return error;
+	}
+	state_mutex.lock();
+	const String dir = project_dir;
+	const Dictionary choices = acp_choices;
+	state_mutex.unlock();
+	Dictionary env;
+	if (!path_value.is_empty()) {
+		env["PATH"] = path_value;
+	}
+	acp_busy.set();
+	acp_runner->set_chosen_options(choices);
+	acp_runner->set_requested_mode(acp_mode == 2 ? String("plan") : (acp_mode == 1 ? String("default") : String()));
+	const String session = p_session_id.is_empty() ? ("acp-" + p_boss_id) : p_session_id;
+	const Dictionary result = acp_runner->run_turn(bin, args, dir, env, _acp_mcp_servers(dir, path_value, true),
+			_boss_prompt(p_wake_text), Array(), acp_mode == 0, false, session);
+	acp_busy.clear();
+	if (!bool(result.get("ok", false))) {
+		const String message = String(result.get("error", ""));
+		return message.is_empty() ? String::utf8("El jefe no respondió a los informes.") : message;
+	}
+	return String();
+}
+
+String LagoonicRuntimeHost::acp_worker_turn(const String &p_worker_id, const String &p_prompt, const Ref<LagoonicAcpRunner> &p_runner, String &r_error) {
+	// Crew round thread: one silent, autonomous turn of a worker agent; its
+	// text is the report. Workers get lagoonic-mcp but no crew tools.
+	String bin, path_value;
+	PackedStringArray args;
+	if (!_resolve_acp(p_worker_id, bin, args, path_value, r_error)) {
+		return String();
+	}
+	const String dir = get_project_dir();
+	Dictionary env;
+	if (!path_value.is_empty()) {
+		env["PATH"] = path_value;
+	}
+	const Dictionary result = p_runner->run_turn(bin, args, dir, env, _acp_mcp_servers(dir, path_value, false),
+			p_prompt, Array(), true, true, "crew-" + p_worker_id);
+	if (!bool(result.get("ok", false))) {
+		r_error = String(result.get("error", ""));
+		if (r_error.is_empty()) {
+			r_error = "The worker did not finish its task.";
+		}
+		return String();
+	}
+	return String(result.get("text", ""));
+}
+
+// ---------------------------------------------------------- crew server
+
+void LagoonicRuntimeHost::_ensure_crew_server() {
+	state_mutex.lock();
+	const bool wanted = !crew_workers.is_empty();
+	state_mutex.unlock();
+	if (!wanted) {
+		return;
+	}
+	if (crew_server.is_null()) {
+		crew_server.instantiate();
+		crew_server->set_tools(crew.ptr());
+	}
+	if (!crew_server->is_running()) {
+		if (crew_server->start() != OK) {
+			_emit_error("Could not start the crew server; the boss works alone this time.");
+			return;
+		}
+		state_mutex.lock();
+		crew_url_cache = crew_server->get_url();
+		crew_auth_cache = crew_server->get_authorization();
+		state_mutex.unlock();
+	}
+	if (!crew_poll_hooked && SceneTree::get_singleton() != nullptr) {
+		// The server answers on the main thread, every frame.
+		SceneTree::get_singleton()->connect(SNAME("process_frame"), callable_mp(this, &LagoonicRuntimeHost::_poll_crew_server));
+		crew_poll_hooked = true;
+	}
+}
+
+void LagoonicRuntimeHost::_poll_crew_server() {
+	if (crew_server.is_valid()) {
+		crew_server->poll();
+	}
+}
+
 Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_session_id, const String &p_text, int p_mode) {
 	const LagoonicCodingAgents::AgentInfo *agent = LagoonicCodingAgents::get_agent(p_boss_id);
 	if (agent == nullptr || agent->acp == nullptr) {
@@ -1067,34 +1302,8 @@ Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_se
 		return ERR_FILE_NOT_FOUND;
 	}
 
-	// lagoonic-mcp gives the agent the Godot tools, like OpenCode's config.
-	Array mcp_servers;
-	const Vector<String> mcp_command = LagoonicMcpLocator::command();
-	if (mcp_command.is_empty()) {
-		WARN_PRINT("Lagoonic: lagoonic-mcp was not found, so the agent has no Godot tools.");
-	} else {
-		Array mcp_env;
-		const char *env_names[3] = { "GODOT_PATH", "LAGOONIC_PLATFORM", "PATH" };
-		const String env_values[3] = { OS::get_singleton()->get_executable_path(), "desktop", path_value };
-		for (int i = 0; i < 3; i++) {
-			Dictionary entry;
-			entry["name"] = String(env_names[i]);
-			entry["value"] = env_values[i];
-			mcp_env.push_back(entry);
-		}
-		Array mcp_args;
-		for (int i = 1; i < mcp_command.size(); i++) {
-			mcp_args.push_back(mcp_command[i]);
-		}
-		mcp_args.push_back("--project");
-		mcp_args.push_back(dir);
-		Dictionary server;
-		server["name"] = String("lagoonic");
-		server["command"] = mcp_command[0];
-		server["args"] = mcp_args;
-		server["env"] = mcp_env;
-		mcp_servers.push_back(server);
-	}
+	_ensure_crew_server();
+	const Array mcp_servers = _acp_mcp_servers(dir, path_value, true);
 
 	if (acp_runner.is_null()) {
 		acp_runner.instantiate();
@@ -1114,9 +1323,10 @@ Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_se
 	}
 	acp_mcp_servers = mcp_servers;
 	acp_cwd = dir;
-	acp_prompt = p_text;
+	acp_prompt = _boss_prompt(p_text);
 	acp_session = session;
 	acp_auto_approve = (p_mode == 0);
+	acp_mode = p_mode;
 	acp_busy.set();
 	acp_thread.start(&LagoonicRuntimeHost::_acp_thread_main, this);
 	return OK;
@@ -1170,6 +1380,12 @@ void LagoonicRuntimeHost::_on_acp_finished(const Dictionary &p_result) {
 		idle["session_id"] = acp_session;
 		idle["busy"] = false;
 		_emit_event(idle);
+		return;
+	}
+	// Boss turn ended: run the tasks it queued (same hook as OpenCode's
+	// turn_finished frame).
+	if (!crew->is_in_progress()) {
+		crew->maybe_run(acp_session);
 	}
 }
 

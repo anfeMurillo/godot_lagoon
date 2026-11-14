@@ -84,6 +84,7 @@
 
 #include "lagoonic_acp_runner.h"
 #include "lagoonic_crew_orchestrator.h"
+#include "lagoonic_crew_server.h"
 #include "lagoonic_event_mapper.h"
 #include "lagoonic_opencode_client.h"
 #include "lagoonic_supervisor.h"
@@ -125,6 +126,15 @@ class LagoonicRuntimeHost : public RefCounted {
 	String acp_prompt;
 	String acp_session;
 	bool acp_auto_approve = false;
+	int acp_mode = 0; // Last chat mode, reused by crew wake-ups.
+
+	// Crew MCP server (start_worker / list_workers) for the boss; started
+	// once workers are set, polled on the main thread every frame.
+	Ref<LagoonicCrewServer> crew_server;
+	bool crew_poll_hooked = false;
+	bool server_has_crew = false; // OpenCode's config already lists it.
+	String crew_url_cache; // Guarded by state_mutex (read from the round thread).
+	String crew_auth_cache;
 	String acp_agent; // Boss id of the running/last ACP turn.
 	Dictionary acp_choices; // Option id -> value chosen in the chat.
 
@@ -144,6 +154,12 @@ class LagoonicRuntimeHost : public RefCounted {
 	// the agent has none or it is not installed.
 	bool _resolve_acp(const String &p_agent_id, String &r_bin, PackedStringArray &r_args, String &r_path, String &r_error) const;
 	Error _send_acp(const String &p_boss_id, const String &p_session_id, const String &p_text, int p_mode);
+	Array _acp_mcp_servers(const String &p_dir, const String &p_path_value, bool p_with_crew) const;
+	String _boss_prompt(const String &p_text) const;
+	void _append_boss_instruction(Array &r_parts) const;
+	void _ensure_crew_server();
+	void _poll_crew_server();
+	friend class LagoonicHostCrewRunner;
 	static void _acp_thread_main(void *p_userdata);
 	void _on_acp_event(const Dictionary &p_event);
 	void _on_acp_permission(const Dictionary &p_request);
@@ -228,6 +244,10 @@ public:
 	void set_project_dir(const String &p_project_dir);
 	// Boss that answers the chat ("opencode" or a chat agent id).
 	String get_crew_boss() const;
+	// Crew round thread: the wake-up as an ACP boss turn ("" = ok, else the
+	// error), and one silent ACP worker turn returning its report.
+	String acp_wake_boss(const String &p_boss_id, const String &p_session_id, const String &p_wake_text);
+	String acp_worker_turn(const String &p_worker_id, const String &p_prompt, const Ref<LagoonicAcpRunner> &p_runner, String &r_error);
 	Ref<LagoonicOpenCodeClient> get_client() const { return client; }
 	Ref<LagoonicCrewOrchestrator> get_crew() const { return crew; }
 	// Exposed for the crew runner (same module): serializes blocking
