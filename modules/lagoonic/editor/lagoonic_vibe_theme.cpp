@@ -722,13 +722,10 @@ Ref<Theme> LagoonicVibeTheme::build() {
 		t->set_stylebox("panel", USER_BUBBLE, sb);
 	}
 
-	// Burbuja del agente: tarjeta oscura, pico arriba a la izquierda.
+	// Respuesta del agente: texto suelto sobre el fondo, sin tarjeta; solo
+	// los mensajes del usuario van en burbuja.
 	t->set_type_variation(AGENT_BUBBLE, "PanelContainer");
-	{
-		Ref<StyleBoxFlat> sb = _flat(surf, Color(brd, 0.45f), 18, 18, 14);
-		sb->set_corner_radius(CORNER_TOP_LEFT, (int)_s(5));
-		t->set_stylebox("panel", AGENT_BUBBLE, sb);
-	}
+	t->set_stylebox("panel", AGENT_BUBBLE, _empty(0, 4));
 
 	t->set_type_variation(TOOL_CHIP, "PanelContainer");
 	t->set_stylebox("panel", TOOL_CHIP, _flat(field_bg, Color(brd, 0.5f), 12, 10, 4));

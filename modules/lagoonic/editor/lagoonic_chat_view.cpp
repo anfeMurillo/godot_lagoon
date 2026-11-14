@@ -1903,12 +1903,14 @@ void LagoonicChatView::add_user_message(const String &p_text) {
 	bubble->add_child(text);
 
 	// La burbuja se ajusta al texto hasta un ancho maximo; despues envuelve.
-	const Ref<Font> font = get_theme_font(SceneStringName(font), SNAME("Label"));
-	const int font_size = get_theme_font_size(SceneStringName(font_size), SNAME("Label"));
+	// Se mide con la fuente de la propia etiqueta (tema Vibe + variacion de
+	// burbuja): la del panel es mas pequena y partia la linea antes de tiempo.
+	const Ref<Font> font = text->get_theme_font(SceneStringName(font));
+	const int font_size = text->get_theme_font_size(SceneStringName(font_size));
 	float width = 40.0f * EDSCALE;
 	if (font.is_valid()) {
 		for (const String &line : p_text.split("\n")) {
-			width = MAX(width, font->get_string_size(line, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x + 4.0f);
+			width = MAX(width, Math::ceil(font->get_string_size(line, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x) + 8.0f * EDSCALE);
 		}
 	}
 	text->set_custom_minimum_size(Size2(MIN(width, 520.0f * EDSCALE), 0));
