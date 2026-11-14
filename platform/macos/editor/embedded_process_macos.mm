@@ -268,7 +268,11 @@ void LayerHost::_notification(int p_what) {
 					ds->mouse_set_mode(DisplayServerEnums::MOUSE_MODE_VISIBLE);
 				}
 				script_debugger->send_message("embed:win_event", { DisplayServerEnums::WINDOW_EVENT_FOCUS_OUT });
-				script_debugger->send_message("embed:notification", { NOTIFICATION_APPLICATION_FOCUS_OUT });
+				// Lagoonic: focus only moved to another part of the editor (the
+				// chat, a panel), not to another app. Games that pause on
+				// APPLICATION_FOCUS_OUT would pause each time the user types to
+				// the agent while it plays them; leaving the editor app still
+				// sends it (see NOTIFICATION_APPLICATION_FOCUS_OUT below).
 				window_focused = false;
 			}
 			process->queue_redraw();

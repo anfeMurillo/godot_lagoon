@@ -500,6 +500,7 @@ Array LagoonicAcpMapper::_on_tool_update(const Dictionary &p_update) {
 void LagoonicAcpRunner::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("spawn", "adapter_bin", "args", "cwd", "env"), &LagoonicAcpRunner::spawn);
 	ClassDB::bind_method(D_METHOD("is_running"), &LagoonicAcpRunner::is_running);
+	ClassDB::bind_method(D_METHOD("set_resume", "acp_session", "transcript"), &LagoonicAcpRunner::set_resume);
 	ClassDB::bind_method(D_METHOD("initialize", "protocol_version", "client_name", "client_version", "timeout_ms"), &LagoonicAcpRunner::initialize, DEFVAL(1), DEFVAL("lagoonic"), DEFVAL("1"), DEFVAL(DEFAULT_TIMEOUT_MS));
 	ClassDB::bind_method(D_METHOD("session_new", "cwd", "mcp_servers", "timeout_ms"), &LagoonicAcpRunner::session_new, DEFVAL(DEFAULT_TIMEOUT_MS));
 	ClassDB::bind_method(D_METHOD("session_prompt", "acp_session_id", "prompt_text", "prompt_blocks", "timeout_ms"), &LagoonicAcpRunner::session_prompt, DEFVAL(Array()), DEFVAL(0));
@@ -696,7 +697,10 @@ Error LagoonicAcpRunner::spawn(const String &p_adapter_bin, const PackedStringAr
 		return ERR_CANT_CREATE;
 	}
 	if (pid == 0) {
-		// Child.
+		// Child. Its own process group: the adapter starts the agent (the
+		// `claude` CLI, ...) and that one starts lagoonic-mcp; closing the
+		// turn must end all of them, not only the adapter (see _kill_child).
+		setpgid(0, 0);
 		dup2(in_p[0], STDIN_FILENO);
 		dup2(out_p[1], STDOUT_FILENO);
 		dup2(err_p[1], STDERR_FILENO);
@@ -793,9 +797,21 @@ void LagoonicAcpRunner::_kill_child() {
 	}
 #else
 	if (child_pid >= 0) {
-		kill((pid_t)child_pid, SIGKILL);
+		// The whole group: killing only the adapter left the agent working on
+		// its own (Stop did not stop it). SIGTERM first so lagoonic-mcp can
+		// clean up (override.cfg, games it started), then SIGKILL.
+		const pid_t group = (pid_t)child_pid;
+		kill(-group, SIGTERM);
+		kill(group, SIGTERM);
+		for (int i = 0; i < 30 && kill(-group, 0) == 0; i++) {
+			int status = 0;
+			waitpid(group, &status, WNOHANG);
+			OS::get_singleton()->delay_usec(50000);
+		}
+		kill(-group, SIGKILL);
+		kill(group, SIGKILL);
 		int status = 0;
-		waitpid((pid_t)child_pid, &status, WNOHANG);
+		waitpid(group, &status, WNOHANG);
 		child_pid = -1;
 	}
 #endif
@@ -1199,6 +1215,9 @@ void LagoonicAcpRunner::_handle_notification(const String &p_method, const Dicti
 	if (p_method != "session/update") {
 		return;
 	}
+	if (replaying) {
+		return; // session/load replays the old turns; the chat already has them.
+	}
 	String sid = _dstr(p_params, "sessionId");
 	if (!sid.is_empty() && sid != acp_session_id) {
 		return;
@@ -1326,6 +1345,29 @@ Dictionary LagoonicAcpRunner::initialize(int p_protocol_version, const String &p
 	params["clientInfo"] = info;
 	bool ok = false;
 	return _call("initialize", params, p_timeout_ms, ok);
+}
+
+void LagoonicAcpRunner::set_resume(const String &p_acp_session, const String &p_transcript) {
+	resume_acp_session = p_acp_session;
+	resume_transcript = p_transcript;
+}
+
+bool LagoonicAcpRunner::session_load(const String &p_acp_session, const String &p_cwd, const Array &p_mcp_servers, int p_timeout_ms) {
+	Dictionary params;
+	params["sessionId"] = p_acp_session;
+	params["cwd"] = p_cwd;
+	params["mcpServers"] = p_mcp_servers;
+	acp_session_id = p_acp_session;
+	replaying = true;
+	bool ok = false;
+	Dictionary result = _call("session/load", params, p_timeout_ms, ok);
+	replaying = false;
+	if (!ok) {
+		acp_session_id = String();
+		return false;
+	}
+	session_info = result;
+	return true;
 }
 
 String LagoonicAcpRunner::session_new(const String &p_cwd, const Array &p_mcp_servers, int p_timeout_ms) {
@@ -1637,9 +1679,26 @@ Dictionary LagoonicAcpRunner::run_turn(const String &p_adapter_bin, const Packed
 	Dictionary init_result = initialize(1, "lagoonic", "1", DEFAULT_TIMEOUT_MS);
 	ok = !init_result.has("error");
 	String sid;
+	bool resumed = false;
+	String prompt = p_prompt;
+	const String resume_session = resume_acp_session;
+	const String transcript = resume_transcript;
+	resume_acp_session = String();
+	resume_transcript = String();
 	if (ok) {
-		sid = session_new(p_cwd, p_mcp_servers, DEFAULT_TIMEOUT_MS);
-		ok = !sid.is_empty();
+		// The adapter starts fresh every turn: carry the conversation over.
+		const Dictionary caps = init_result.get("agentCapabilities", Dictionary());
+		if (!resume_session.is_empty() && bool(caps.get("loadSession", false)) &&
+				session_load(resume_session, p_cwd, p_mcp_servers, DEFAULT_TIMEOUT_MS)) {
+			sid = resume_session;
+			resumed = true;
+		} else {
+			sid = session_new(p_cwd, p_mcp_servers, DEFAULT_TIMEOUT_MS);
+			ok = !sid.is_empty();
+			if (ok && !transcript.is_empty()) {
+				prompt = transcript + "\n\n" + p_prompt;
+			}
+		}
 	}
 	if (ok) {
 		Array options = parse_options(session_info);
@@ -1669,7 +1728,7 @@ Dictionary LagoonicAcpRunner::run_turn(const String &p_adapter_bin, const Packed
 	}
 	Dictionary prompt_result;
 	if (ok) {
-		prompt_result = session_prompt(sid, p_prompt, p_prompt_blocks, 0);
+		prompt_result = session_prompt(sid, prompt, p_prompt_blocks, 0);
 		ok = !prompt_result.has("error");
 	}
 	String stop_reason = _dstr(prompt_result, "stopReason");
@@ -1679,6 +1738,8 @@ Dictionary LagoonicAcpRunner::run_turn(const String &p_adapter_bin, const Packed
 	}
 	out["text"] = mapper->get_text();
 	out["report"] = mapper->get_worker_report(3);
+	out["acp_session_id"] = sid;
+	out["resumed"] = resumed;
 	if (!ok) {
 		out["error"] = last_error;
 	}

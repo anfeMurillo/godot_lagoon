@@ -838,7 +838,23 @@ void LagoonicChatView::_update_send_state() {
 		return;
 	}
 	const bool empty = input == nullptr || input->get_text().strip_edges().is_empty();
-	send_button->set_disabled(busy || !connected || empty);
+	// While the agent works the user can still write to steer it.
+	send_button->set_disabled(!connected || empty);
+	if (minimal && stop_button != nullptr) {
+		// One slot: Stop while working, Send as soon as there is text.
+		stop_button->set_visible(busy && empty);
+		send_button->set_visible(!busy || !empty);
+	}
+}
+
+void LagoonicChatView::set_queued_count(int p_count) {
+	if (queued_label == nullptr) {
+		return;
+	}
+	queued_label->set_visible(p_count > 0);
+	queued_label->set_text(p_count == 1
+					? String::utf8("1 mensaje en cola: el agente lo leerá en cuanto termine lo que está haciendo.")
+					: vformat(String::utf8("%d mensajes en cola: el agente los leerá en cuanto termine lo que está haciendo."), p_count));
 }
 
 void LagoonicChatView::_on_input_focus(bool p_focused) {
@@ -1023,9 +1039,11 @@ void LagoonicChatView::_on_latest_pressed() {
 }
 
 void LagoonicChatView::_on_send_pressed() {
-	if (input == nullptr || busy || !connected) {
+	if (input == nullptr || !connected) {
 		return;
 	}
+	// Sending while the agent works steers it: the message goes to the
+	// agent now (OpenCode) or as soon as its current step ends (ACP agents).
 	const String text = input->get_text().strip_edges();
 	if (text.is_empty()) {
 		return;
@@ -1052,6 +1070,17 @@ void LagoonicChatView::_on_attach_pressed() {
 }
 
 void LagoonicChatView::_on_new_session_pressed() {
+	if (busy) {
+		// Its replies would land in the new chat's place.
+		show_error(String::utf8("Termina la tarea en curso antes de empezar otro chat."));
+		return;
+	}
+	if (!current_session_id.is_empty() && user_message_count == 0) {
+		// The open chat is still empty: use it instead of piling up empty
+		// "Chat sin título" entries.
+		_close_chats();
+		return;
+	}
 	_fire(SNAME("new_session_requested"));
 }
 
@@ -1426,6 +1455,44 @@ void LagoonicChatView::drop_data(const Point2 &p_point, const Variant &p_data) {
 	}
 }
 
+// Titulo para mostrar: los chats sin nombre (el servidor pone "Untitled" o
+// "New session - <fecha>") salen como "Chat sin título".
+static String _lagoonic_chat_title(const Dictionary &p_row) {
+	const String title = String(p_row.get("title", "")).strip_edges();
+	if (title.is_empty() || title == "Untitled" || title.begins_with("New session")) {
+		return String::utf8("Chat sin título");
+	}
+	return title;
+}
+
+static String _lagoonic_agent_display_name(const String &p_agent) {
+	if (p_agent.is_empty() || p_agent == "opencode") {
+		return String("OpenCode");
+	}
+	const LagoonicCodingAgents::AgentInfo *info = LagoonicCodingAgents::get_agent(p_agent);
+	return info != nullptr ? String::utf8(info->name) : p_agent;
+}
+
+// "Hoy 14:30", "Ayer 09:12" o "12/11 18:22" (hora local).
+static String _lagoonic_chat_when(int64_t p_updated_ms) {
+	if (p_updated_ms <= 0) {
+		return String();
+	}
+	const int64_t bias = Time::get_singleton()->get_time_zone_from_system().get("bias", 0).operator int64_t() * 60;
+	const int64_t local = p_updated_ms / 1000 + bias;
+	const int64_t today = (int64_t(Time::get_singleton()->get_unix_time_from_system()) + bias) / 86400;
+	const Dictionary dt = Time::get_singleton()->get_datetime_dict_from_unix_time(local);
+	const String hm = vformat("%02d:%02d", int(dt["hour"]), int(dt["minute"]));
+	const int64_t day = local / 86400;
+	if (day == today) {
+		return "Hoy " + hm;
+	}
+	if (day == today - 1) {
+		return "Ayer " + hm;
+	}
+	return vformat("%02d/%02d %s", int(dt["day"]), int(dt["month"]), hm);
+}
+
 void LagoonicChatView::set_sessions(const Array &p_sessions) {
 	session_ids.clear();
 	sessions_data.clear();
@@ -1441,7 +1508,7 @@ void LagoonicChatView::set_sessions(const Array &p_sessions) {
 		session_ids.push_back(id);
 		sessions_data.push_back(d);
 		if (session_option != nullptr) {
-			session_option->add_item(String(d.get("title", String::utf8("Sin título"))), session_ids.size() - 1);
+			session_option->add_item(_lagoonic_chat_title(d), session_ids.size() - 1);
 		}
 	}
 	set_current_session(current_session_id);
@@ -1479,7 +1546,7 @@ void LagoonicChatView::_update_session_title() {
 	for (int i = 0; i < sessions_data.size(); i++) {
 		const Dictionary d = sessions_data[i];
 		if (String(d.get("id", "")) == current_session_id) {
-			title = d.get("title", title);
+			title = _lagoonic_chat_title(d);
 			break;
 		}
 	}
@@ -1526,12 +1593,15 @@ void LagoonicChatView::_rebuild_chats_list() {
 		const String id = d.get("id", "");
 		const bool current = id == current_session_id;
 
-		const String title = d.get("title", String::utf8("Sin título"));
-		String subtitle = current ? String::utf8("Chat actual") : String::utf8("Conversación guardada");
-		const int64_t updated = d.get("updated_at", 0);
-		if (updated > 0) {
-			const Dictionary dt = Time::get_singleton()->get_datetime_dict_from_unix_time(updated / 1000 + Time::get_singleton()->get_time_zone_from_system().get("bias", 0).operator int64_t() * 60);
-			subtitle += vformat(String::utf8(" · %02d/%02d %02d:%02d"), int(dt["day"]), int(dt["month"]), int(dt["hour"]), int(dt["minute"]));
+		const String title = _lagoonic_chat_title(d);
+		// Quien responde en ese chat y cuando se uso por ultima vez.
+		String subtitle = _lagoonic_agent_display_name(d.get("agent", ""));
+		if (current) {
+			subtitle += String::utf8(" · chat actual");
+		}
+		const String when = _lagoonic_chat_when(d.get("updated_at", 0));
+		if (!when.is_empty()) {
+			subtitle += String::utf8(" · ") + when;
 		}
 
 		HBoxContainer *row = memnew(HBoxContainer);
@@ -2533,8 +2603,9 @@ void LagoonicChatView::set_busy(bool p_busy) {
 	if (stop_button != nullptr) {
 		stop_button->set_disabled(!busy);
 		if (minimal) {
-			stop_button->set_visible(busy);
-			send_button->set_visible(!busy);
+			const bool empty = input == nullptr || input->get_text().strip_edges().is_empty();
+			stop_button->set_visible(busy && empty);
+			send_button->set_visible(!busy || !empty);
 		}
 	}
 	if (busy_label != nullptr) {
@@ -3008,6 +3079,12 @@ LagoonicChatView::LagoonicChatView() {
 	file_guard_label->add_theme_color_override(SNAME("font_color"), Color(0.95, 0.75, 0.25));
 	file_guard_label->set_visible(false);
 	add_child(file_guard_label);
+
+	queued_label = memnew(Label);
+	queued_label->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+	queued_label->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
+	queued_label->set_visible(false);
+	add_child(queued_label);
 
 	error_label = memnew(Label);
 	error_label->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);

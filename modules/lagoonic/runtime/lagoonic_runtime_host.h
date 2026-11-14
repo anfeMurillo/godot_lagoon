@@ -160,6 +160,21 @@ class LagoonicRuntimeHost : public RefCounted {
 	void _ensure_crew_server();
 	void _poll_crew_server();
 	friend class LagoonicHostCrewRunner;
+	// Messages the user sent while an ACP boss worked (main thread only).
+	Vector<Dictionary> acp_queue;
+	void _emit_queue();
+	bool _flush_acp_queue();
+
+	// Local chats of ACP agents (.lagoonic/chats/<id>.json, ids "acp-...").
+	mutable Mutex chat_mutex;
+	String _chat_path(const String &p_id) const;
+	Dictionary _chat_load(const String &p_id) const;
+	bool _chat_save(const Dictionary &p_chat) const;
+	String _chat_create(const String &p_agent, const String &p_title);
+	Array _chat_rows() const;
+	String _chat_for_turn(const String &p_boss_id, const String &p_session_id);
+	void _chat_begin_turn(const String &p_id, const String &p_text, const String &p_prompt, String &r_resume, String &r_transcript);
+	void _chat_end_turn(const String &p_id, const Dictionary &p_result);
 	static void _acp_thread_main(void *p_userdata);
 	void _on_acp_event(const Dictionary &p_event);
 	void _on_acp_permission(const Dictionary &p_request);
@@ -244,6 +259,8 @@ public:
 	void set_project_dir(const String &p_project_dir);
 	// Boss that answers the chat ("opencode" or a chat agent id).
 	String get_crew_boss() const;
+	// Chats kept by Lagoonic itself (ACP agents), not by the OpenCode server.
+	static bool is_local_chat(const String &p_id);
 	// Crew round thread: the wake-up as an ACP boss turn ("" = ok, else the
 	// error), and one silent ACP worker turn returning its report.
 	String acp_wake_boss(const String &p_boss_id, const String &p_session_id, const String &p_wake_text);

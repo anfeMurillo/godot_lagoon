@@ -151,6 +151,7 @@ private:
 
 	Label *file_guard_label = nullptr;
 	Label *error_label = nullptr;
+	Label *queued_label = nullptr; // "N mensajes en cola" while an ACP agent works.
 
 	Button *attach_button = nullptr;
 	TextEdit *input = nullptr;
@@ -394,6 +395,8 @@ public:
 	void notify_file_changed(const String &p_path);
 	void clear_file_guard();
 	void show_error(const String &p_text);
+	// Messages waiting for the agent's current step to end (0 hides the note).
+	void set_queued_count(int p_count);
 	void clear_error();
 
 	void set_busy(bool p_busy);

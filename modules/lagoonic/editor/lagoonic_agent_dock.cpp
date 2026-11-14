@@ -371,6 +371,15 @@ void LagoonicAgentDock::hook_push_agent_event(const Dictionary &p_event) {
 		return;
 	}
 	const String type = String(p_event.get("type", ""));
+	// A turn of another chat (a crew wake-up, a reply that lands after the
+	// user switched chats) must not paint into the open one.
+	if ((type == "message" || type == "todos") && !bool(p_event.get("history", false))) {
+		const String event_session = p_event.get("session_id", "");
+		const String open_session = chat_view->get_current_session();
+		if (!event_session.is_empty() && !open_session.is_empty() && event_session != open_session) {
+			return;
+		}
+	}
 	if (type == "message") {
 		const Dictionary message = p_event.get("message", Dictionary());
 		if (bool(p_event.get("history", false))) {
@@ -411,6 +420,8 @@ void LagoonicAgentDock::hook_push_agent_event(const Dictionary &p_event) {
 			crew->set_tasks(p_event.get("todos", Array()));
 		}
 		chat_view->set_todos(p_event.get("todos", Array()));
+	} else if (type == "queued") {
+		chat_view->set_queued_count(int(p_event.get("count", 0)));
 	} else if (type == "permission") {
 		const Dictionary request = p_event.get("request", Dictionary());
 		chat_view->show_permission_card(
@@ -473,7 +484,13 @@ bool LagoonicAgentDock::handle_session_event(const Ref<LagoonicRuntimeHost> &p_h
 	if (!is_session_event) {
 		return false;
 	}
-	if (!p_host->is_server_up() && p_host->ensure_server(p_cwd, p_model, p_secret_env) != OK) {
+	// Chats of the boss in Configuracion > Equipo: OpenCode keeps its own on
+	// its server; other agents' chats live in .lagoonic/chats and need no
+	// server (OpenCode's are still listed when it is up).
+	const String boss = LagoonicAgentSettings::get_boss();
+	p_host->set_project_dir(p_cwd);
+	p_host->set_crew_boss(boss);
+	if (boss == "opencode" && !p_host->is_server_up() && p_host->ensure_server(p_cwd, p_model, p_secret_env) != OK) {
 		chat_view->show_error(String::utf8("No se pudo iniciar el agente para cargar los chats."));
 		return true;
 	}

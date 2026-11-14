@@ -118,6 +118,12 @@ private:
 	Node *game_wrapper_home = nullptr;
 	int game_wrapper_index = 0;
 	bool game_docked = false;
+	// Barra de herramientas de la vista de juego: oculta en Vibe Coding hasta
+	// que el usuario la pide con el boton de la cabecera de la tarjeta.
+	Button *game_tools_button = nullptr;
+	bool game_tools_visible = false;
+	void _on_game_tools_toggled(bool p_on);
+	void _apply_game_tools();
 	bool game_auto_opened = false;
 	bool game_floating_suppressed = false;
 	class ColorRect *game_divider = nullptr;

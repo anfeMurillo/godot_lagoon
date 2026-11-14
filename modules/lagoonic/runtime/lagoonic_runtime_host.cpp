@@ -42,7 +42,11 @@
 #include "lagoonic_config_writer.h"
 #include "lagoonic_mcp_locator.h"
 
+#include "core/io/dir_access.h"
 #include "core/io/file_access.h"
+#include "core/io/json.h"
+#include "core/math/math_funcs.h"
+#include "core/os/time.h"
 
 // ---------------------------------------------------------------------------
 // Crew runner: the LagoonicCrewOrchestrator side effects, implemented on top
@@ -604,6 +608,10 @@ Error LagoonicRuntimeHost::send_prompt(const String &p_session_id, const String 
 
 Error LagoonicRuntimeHost::abort() {
 	crew->cancel();
+	if (!acp_queue.is_empty()) {
+		acp_queue.clear(); // Stop means stop: queued messages are dropped too.
+		_emit_queue();
+	}
 	if (acp_busy.is_set() && acp_runner.is_valid()) {
 		acp_runner->session_cancel(acp_runner->get_acp_session_id());
 	}
@@ -668,7 +676,215 @@ Error LagoonicRuntimeHost::revert_message(const String &p_message_id) {
 	return ok ? OK : FAILED;
 }
 
+// ---------------------------------------------------------- local chats
+//
+// Chats answered by an ACP agent (Claude Code, Codex...) never reach the
+// OpenCode server, so they are kept here: one JSON per chat in
+// <project>/.lagoonic/chats/<id>.json with its agent, title, messages and
+// the agent's own session id (resumed with session/load next turn).
+
+static int64_t lagoonic_now_ms() {
+	return int64_t(Time::get_singleton()->get_unix_time_from_system() * 1000.0);
+}
+
+bool LagoonicRuntimeHost::is_local_chat(const String &p_id) {
+	return p_id.begins_with("acp-");
+}
+
+String LagoonicRuntimeHost::_chat_path(const String &p_id) const {
+	const String dir = get_project_dir();
+	if (dir.is_empty() || !is_local_chat(p_id) || p_id.contains("/") || p_id.contains("..")) {
+		return String();
+	}
+	return dir.path_join(".lagoonic").path_join("chats").path_join(p_id + ".json");
+}
+
+Dictionary LagoonicRuntimeHost::_chat_load(const String &p_id) const {
+	const String path = _chat_path(p_id);
+	if (path.is_empty() || !FileAccess::exists(path)) {
+		return Dictionary();
+	}
+	const Variant parsed = JSON::parse_string(FileAccess::get_file_as_string(path));
+	return parsed.get_type() == Variant::DICTIONARY ? Dictionary(parsed) : Dictionary();
+}
+
+bool LagoonicRuntimeHost::_chat_save(const Dictionary &p_chat) const {
+	const String path = _chat_path(p_chat.get("id", ""));
+	if (path.is_empty()) {
+		return false;
+	}
+	DirAccess::make_dir_recursive_absolute(path.get_base_dir());
+	// Conversations are private: never part of the game's repository.
+	const String ignore = path.get_base_dir().path_join(".gitignore");
+	if (!FileAccess::exists(ignore)) {
+		Ref<FileAccess> g = FileAccess::open(ignore, FileAccess::WRITE);
+		if (g.is_valid()) {
+			g->store_string("*\n");
+		}
+	}
+	Ref<FileAccess> f = FileAccess::open(path, FileAccess::WRITE);
+	if (f.is_null()) {
+		return false;
+	}
+	f->store_string(JSON::stringify(p_chat, "\t"));
+	return true;
+}
+
+String LagoonicRuntimeHost::_chat_create(const String &p_agent, const String &p_title) {
+	const String id = vformat("acp-%x%04x", lagoonic_now_ms(), Math::rand() & 0xffff);
+	Dictionary chat;
+	chat["id"] = id;
+	chat["agent"] = p_agent;
+	chat["title"] = p_title.strip_edges();
+	chat["created_at"] = lagoonic_now_ms();
+	chat["updated_at"] = lagoonic_now_ms();
+	chat["acp_session"] = String();
+	chat["messages"] = Array();
+	chat_mutex.lock();
+	const bool ok = _chat_save(chat);
+	chat_mutex.unlock();
+	return ok ? id : String();
+}
+
+Array LagoonicRuntimeHost::_chat_rows() const {
+	Array rows;
+	const String dir = get_project_dir();
+	if (dir.is_empty()) {
+		return rows;
+	}
+	const String chats_dir = dir.path_join(".lagoonic").path_join("chats");
+	Ref<DirAccess> da = DirAccess::open(chats_dir);
+	if (da.is_null()) {
+		return rows;
+	}
+	for (const String &file : da->get_files()) {
+		if (!file.begins_with("acp-") || !file.ends_with(".json")) {
+			continue;
+		}
+		const Dictionary chat = _chat_load(file.get_basename());
+		if (chat.is_empty()) {
+			continue;
+		}
+		Dictionary row;
+		row["id"] = chat.get("id", file.get_basename());
+		row["title"] = chat.get("title", "");
+		row["updated_at"] = chat.get("updated_at", 0);
+		row["agent"] = chat.get("agent", "");
+		rows.push_back(row);
+	}
+	return rows;
+}
+
+// Earlier turns as plain text, for agents without session/load.
+static String lagoonic_transcript(const Array &p_messages) {
+	String out;
+	for (int i = 0; i < p_messages.size(); i++) {
+		const Dictionary m = p_messages[i];
+		const String text = String(m.get("prompt", m.get("text", ""))).strip_edges();
+		if (text.is_empty()) {
+			continue;
+		}
+		out += (String(m.get("role", "")) == "user" ? "User: " : "You: ") + text + "\n\n";
+	}
+	if (out.is_empty()) {
+		return out;
+	}
+	if (out.length() > 16000) {
+		out = "[...]\n" + out.right(16000);
+	}
+	return "Earlier in this conversation (you start fresh each turn, so here is what was said):\n\n" + out + "Now the user says:";
+}
+
+void LagoonicRuntimeHost::_chat_begin_turn(const String &p_id, const String &p_text, const String &p_prompt, String &r_resume, String &r_transcript) {
+	MutexLock lock(chat_mutex);
+	Dictionary chat = _chat_load(p_id);
+	if (chat.is_empty()) {
+		return;
+	}
+	Array messages = chat.get("messages", Array());
+	r_resume = chat.get("acp_session", "");
+	r_transcript = lagoonic_transcript(messages);
+	Dictionary m;
+	m["role"] = String("user");
+	m["text"] = p_text;
+	if (p_prompt != p_text) {
+		m["prompt"] = p_prompt; // Crew wake-up: the reports, shown as a short line.
+	}
+	m["created_at"] = lagoonic_now_ms();
+	messages.push_back(m);
+	chat["messages"] = messages;
+	if (String(chat.get("title", "")).strip_edges().is_empty()) {
+		// Like the server's titles: the first thing the user asked.
+		String title = p_text.strip_edges().get_slicec('\n', 0).strip_edges();
+		if (title.length() > 60) {
+			title = title.left(57).strip_edges() + String::utf8("…");
+		}
+		chat["title"] = title;
+	}
+	chat["updated_at"] = lagoonic_now_ms();
+	_chat_save(chat);
+}
+
+void LagoonicRuntimeHost::_chat_end_turn(const String &p_id, const Dictionary &p_result) {
+	MutexLock lock(chat_mutex);
+	Dictionary chat = _chat_load(p_id);
+	if (chat.is_empty()) {
+		return;
+	}
+	const String text = String(p_result.get("text", "")).strip_edges();
+	if (!text.is_empty()) {
+		Array messages = chat.get("messages", Array());
+		Dictionary m;
+		m["role"] = String("assistant");
+		m["text"] = text;
+		m["created_at"] = lagoonic_now_ms();
+		messages.push_back(m);
+		chat["messages"] = messages;
+	}
+	const String acp_id = p_result.get("acp_session_id", "");
+	if (!acp_id.is_empty()) {
+		chat["acp_session"] = acp_id;
+	}
+	chat["updated_at"] = lagoonic_now_ms();
+	_chat_save(chat);
+}
+
+String LagoonicRuntimeHost::_chat_for_turn(const String &p_boss_id, const String &p_session_id) {
+	// A chat belongs to one agent: Claude Code does not continue an OpenCode
+	// chat (it cannot read it). Another agent, or no chat yet: a new one.
+	String session = p_session_id.is_empty() ? get_session() : p_session_id;
+	if (is_local_chat(session)) {
+		chat_mutex.lock();
+		const Dictionary chat = _chat_load(session);
+		chat_mutex.unlock();
+		if (!chat.is_empty() && String(chat.get("agent", "")) == p_boss_id) {
+			return session;
+		}
+	}
+	session = _chat_create(p_boss_id, String());
+	if (!session.is_empty()) {
+		state_mutex.lock();
+		current_session = session;
+		state_mutex.unlock();
+		_emit_status("session:" + session);
+	}
+	return session;
+}
+
 String LagoonicRuntimeHost::create_session(const String &p_title) {
+	const String boss = get_crew_boss();
+	if (!boss.is_empty() && boss != "opencode") {
+		const String id = _chat_create(boss, p_title);
+		if (id.is_empty()) {
+			_emit_error("Could not create the chat.");
+			return String();
+		}
+		state_mutex.lock();
+		current_session = id;
+		state_mutex.unlock();
+		_emit_status("session:" + id);
+		return id;
+	}
 	if (!is_server_up()) {
 		if (ensure_server(String(), String(), Dictionary()) != OK) {
 			return String();
@@ -708,20 +924,20 @@ void LagoonicRuntimeHost::select_session(const String &p_session_id) {
 }
 
 Array LagoonicRuntimeHost::list_sessions() {
-	Array out;
-	if (!is_server_up()) {
-		return out;
-	}
-	const String dir = get_project_dir();
-	client_mutex.lock();
-	const Array rows = client->lagoonic_list_sessions(dir);
-	client_mutex.unlock();
-	for (int i = 0; i < rows.size(); i++) {
-		const Dictionary row = rows[i];
-		if (String(row.get("title", "")).begins_with(LagoonicEventMapper::LAGOONIC_WORKER_PREFIX)) {
-			continue;
+	Array out = _chat_rows();
+	if (is_server_up()) {
+		const String dir = get_project_dir();
+		client_mutex.lock();
+		const Array rows = client->lagoonic_list_sessions(dir);
+		client_mutex.unlock();
+		for (int i = 0; i < rows.size(); i++) {
+			Dictionary row = rows[i];
+			if (String(row.get("title", "")).begins_with(LagoonicEventMapper::LAGOONIC_WORKER_PREFIX)) {
+				continue;
+			}
+			row["agent"] = String("opencode");
+			out.push_back(row);
 		}
-		out.push_back(row);
 	}
 	// Mas recientes primero (la API 1.x no garantiza el orden).
 	for (int i = 1; i < out.size(); i++) {
@@ -735,13 +951,24 @@ Array LagoonicRuntimeHost::list_sessions() {
 }
 
 bool LagoonicRuntimeHost::delete_session(const String &p_session_id) {
-	if (p_session_id.is_empty() || !is_server_up()) {
+	if (p_session_id.is_empty()) {
 		return false;
 	}
-	const String dir = get_project_dir();
-	client_mutex.lock();
-	const bool ok = client->lagoonic_delete_session(dir, p_session_id);
-	client_mutex.unlock();
+	bool ok = false;
+	if (is_local_chat(p_session_id)) {
+		chat_mutex.lock();
+		const String path = _chat_path(p_session_id);
+		ok = !path.is_empty() && DirAccess::remove_absolute(path) == OK;
+		chat_mutex.unlock();
+	} else {
+		if (!is_server_up()) {
+			return false;
+		}
+		const String dir = get_project_dir();
+		client_mutex.lock();
+		ok = client->lagoonic_delete_session(dir, p_session_id);
+		client_mutex.unlock();
+	}
 	if (ok && get_session() == p_session_id) {
 		state_mutex.lock();
 		current_session = String();
@@ -765,7 +992,19 @@ Array LagoonicRuntimeHost::get_changes() {
 }
 
 bool LagoonicRuntimeHost::rename_session(const String &p_session_id, const String &p_title) {
-	if (p_session_id.is_empty() || p_title.strip_edges().is_empty() || !is_server_up()) {
+	if (p_session_id.is_empty() || p_title.strip_edges().is_empty()) {
+		return false;
+	}
+	if (is_local_chat(p_session_id)) {
+		MutexLock lock(chat_mutex);
+		Dictionary chat = _chat_load(p_session_id);
+		if (chat.is_empty()) {
+			return false;
+		}
+		chat["title"] = p_title.strip_edges().left(120);
+		return _chat_save(chat);
+	}
+	if (!is_server_up()) {
 		return false;
 	}
 	const String dir = get_project_dir();
@@ -777,6 +1016,35 @@ bool LagoonicRuntimeHost::rename_session(const String &p_session_id, const Strin
 
 Array LagoonicRuntimeHost::load_history(const String &p_session_id) {
 	Array events;
+	if (is_local_chat(p_session_id)) {
+		chat_mutex.lock();
+		const Dictionary chat = _chat_load(p_session_id);
+		chat_mutex.unlock();
+		const Array messages = chat.get("messages", Array());
+		for (int i = 0; i < messages.size(); i++) {
+			const Dictionary m = messages[i];
+			Dictionary message;
+			message["id"] = p_session_id + "-" + itos(i);
+			message["role"] = m.get("role", "user");
+			message["text"] = m.get("text", "");
+			message["tools"] = Array();
+			Array timeline;
+			Dictionary entry;
+			entry["kind"] = String("text");
+			entry["id"] = itos(i);
+			entry["text"] = m.get("text", "");
+			timeline.push_back(entry);
+			message["timeline"] = timeline;
+			message["created_at"] = m.get("created_at", 0);
+			Dictionary event;
+			event["type"] = String("message");
+			event["session_id"] = p_session_id;
+			event["history"] = true;
+			event["message"] = message;
+			events.push_back(event);
+		}
+		return events;
+	}
 	if (p_session_id.is_empty() || !is_server_up()) {
 		return events;
 	}
@@ -1197,9 +1465,15 @@ String LagoonicRuntimeHost::acp_wake_boss(const String &p_boss_id, const String 
 	acp_runner->set_chosen_options(choices);
 	acp_runner->set_requested_mode(acp_mode == 2 ? String("plan") : (acp_mode == 1 ? String("default") : String()));
 	const String session = p_session_id.is_empty() ? ("acp-" + p_boss_id) : p_session_id;
+	String resume, transcript;
+	_chat_begin_turn(session, String::utf8("Informes del equipo"), p_wake_text, resume, transcript);
+	acp_runner->set_resume(resume, transcript);
 	const Dictionary result = acp_runner->run_turn(bin, args, dir, env, _acp_mcp_servers(dir, path_value, true),
 			_boss_prompt(p_wake_text), Array(), acp_mode == 0, false, session);
+	_chat_end_turn(session, result);
 	acp_busy.clear();
+	// Messages sent during the wake-up go next (main thread).
+	callable_mp(this, &LagoonicRuntimeHost::_flush_acp_queue).call_deferred();
 	if (!bool(result.get("ok", false))) {
 		const String message = String(result.get("error", ""));
 		return message.is_empty() ? String::utf8("El jefe no respondió a los informes.") : message;
@@ -1276,8 +1550,14 @@ Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_se
 	}
 	const String name = String::utf8(agent->name);
 	if (acp_busy.is_set()) {
-		_emit_error(vformat(String::utf8("%s todavía está respondiendo."), name));
-		return ERR_BUSY;
+		// ACP has no way to add a message to a turn in flight: it waits and
+		// goes as the next turn, the moment this one ends (nothing is stopped).
+		Dictionary queued;
+		queued["text"] = p_text;
+		queued["mode"] = p_mode;
+		acp_queue.push_back(queued);
+		_emit_queue();
+		return OK;
 	}
 	if (acp_thread.is_started()) {
 		acp_thread.wait_to_finish(); // Previous turn already ended.
@@ -1291,10 +1571,6 @@ Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_se
 		_emit_error("No project directory: open a project first.");
 		return ERR_INVALID_PARAMETER;
 	}
-	if (session.is_empty()) {
-		session = "acp-" + p_boss_id;
-	}
-
 	String adapter, path_value, resolve_error;
 	PackedStringArray adapter_args;
 	if (!_resolve_acp(p_boss_id, adapter, adapter_args, path_value, resolve_error)) {
@@ -1323,6 +1599,14 @@ Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_se
 	}
 	acp_mcp_servers = mcp_servers;
 	acp_cwd = dir;
+	session = _chat_for_turn(p_boss_id, session);
+	if (session.is_empty()) {
+		_emit_error("Could not save the chat in .lagoonic/chats.");
+		return ERR_CANT_CREATE;
+	}
+	String resume, transcript;
+	_chat_begin_turn(session, p_text, p_text, resume, transcript);
+	acp_runner->set_resume(resume, transcript);
 	acp_prompt = _boss_prompt(p_text);
 	acp_session = session;
 	acp_auto_approve = (p_mode == 0);
@@ -1365,6 +1649,7 @@ void LagoonicRuntimeHost::_on_acp_permission(const Dictionary &p_request) {
 }
 
 void LagoonicRuntimeHost::_on_acp_finished(const Dictionary &p_result) {
+	_chat_end_turn(acp_session, p_result);
 	acp_busy.clear();
 	if (acp_thread.is_started()) {
 		acp_thread.wait_to_finish();
@@ -1380,13 +1665,41 @@ void LagoonicRuntimeHost::_on_acp_finished(const Dictionary &p_result) {
 		idle["session_id"] = acp_session;
 		idle["busy"] = false;
 		_emit_event(idle);
+		_flush_acp_queue();
 		return;
+	}
+	if (_flush_acp_queue()) {
+		return; // The user's new message goes first; crew tasks wait for its turn.
 	}
 	// Boss turn ended: run the tasks it queued (same hook as OpenCode's
 	// turn_finished frame).
 	if (!crew->is_in_progress()) {
 		crew->maybe_run(acp_session);
 	}
+}
+
+void LagoonicRuntimeHost::_emit_queue() {
+	Dictionary event;
+	event["type"] = String("queued");
+	event["session_id"] = acp_session;
+	event["count"] = acp_queue.size();
+	_emit_event(event);
+}
+
+bool LagoonicRuntimeHost::_flush_acp_queue() {
+	// Messages the user sent while the agent worked, as one next turn.
+	if (acp_queue.is_empty() || acp_busy.is_set()) {
+		return false;
+	}
+	String text;
+	int mode = 0;
+	for (const Dictionary &q : acp_queue) {
+		text += (text.is_empty() ? String() : String("\n\n")) + String(q.get("text", ""));
+		mode = q.get("mode", 0);
+	}
+	acp_queue.clear();
+	_emit_queue();
+	return _send_acp(acp_agent, acp_session, text, mode) == OK;
 }
 
 Mutex *LagoonicRuntimeHost::get_client_mutex() const {

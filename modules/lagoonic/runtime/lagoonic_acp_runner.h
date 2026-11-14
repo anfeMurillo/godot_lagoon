@@ -206,6 +206,14 @@ public:
 	// "plan" / "default" / "" : permission mode for the turn, applied to
 	// the agent's category "mode" option when it offers that value.
 	void set_requested_mode(const String &p_mode);
+	// Conversation memory for the next run_turn (adapters run one process
+	// per turn): resume p_acp_session with session/load when the agent
+	// supports it; otherwise p_transcript (earlier turns as text) is put
+	// before the prompt. Both are consumed by run_turn.
+	void set_resume(const String &p_acp_session, const String &p_transcript);
+	// session/load: replays the conversation into the agent (its replay
+	// updates are not shown). Returns false (see last_error) on failure.
+	bool session_load(const String &p_acp_session, const String &p_cwd, const Array &p_mcp_servers, int p_timeout_ms = DEFAULT_TIMEOUT_MS);
 
 	void set_session_id(const String &p_session_id);
 	String get_session_id() const;
@@ -243,6 +251,9 @@ private:
 	Dictionary session_info; // Last session/new result.
 	Dictionary chosen_options;
 	String requested_mode;
+	String resume_acp_session;
+	String resume_transcript;
+	bool replaying = false; // session/load in progress: updates are history.
 	// Sets the chosen options on the session; returns the options as
 	// they are afterwards.
 	Array _apply_options(const String &p_acp_session_id, const Array &p_options);

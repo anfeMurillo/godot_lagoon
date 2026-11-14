@@ -521,6 +521,22 @@ void LagoonicVibeWorkspace::_dock_game() {
 		view->add_child(game_divider);
 		view->move_child(game_divider, MIN(1, view->get_child_count(false) - 1));
 	}
+	_apply_game_tools();
+}
+
+void LagoonicVibeWorkspace::_on_game_tools_toggled(bool p_on) {
+	game_tools_visible = p_on;
+	_apply_game_tools();
+}
+
+void LagoonicVibeWorkspace::_apply_game_tools() {
+	if (game_toolbar_scroll != nullptr) {
+		game_toolbar_scroll->set_visible(game_tools_visible);
+	}
+	if (game_divider != nullptr) {
+		game_divider->set_visible(game_tools_visible);
+	}
+	game_fit_width = 0; // La tarjeta recalcula su alto sin (o con) la barra.
 }
 
 void LagoonicVibeWorkspace::_undock_game() {
@@ -686,6 +702,28 @@ void LagoonicVibeWorkspace::_open_bento(const String &p_id, bool p_save) {
 		game_scroll->set_horizontal_scroll_mode(ScrollContainer::SCROLL_MODE_DISABLED);
 		game_holder->add_child(game_scroll);
 		bento->set_content(game_holder);
+		// La barra de la vista de juego (pausa, velocidad, entrada, 2D/3D) es
+		// para usuarios avanzados: oculta hasta que se pide con este boton,
+		// junto al de ampliar.
+		game_tools_button = memnew(Button);
+		game_tools_button->set_flat(true);
+		game_tools_button->set_toggle_mode(true);
+		game_tools_button->set_pressed_no_signal(game_tools_visible);
+		game_tools_button->set_focus_mode(Control::FOCUS_NONE);
+		game_tools_button->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+		game_tools_button->set_tooltip_text(String::utf8("Muestra u oculta las herramientas del juego (pausa, velocidad, cámara…)."));
+		game_tools_button->set_button_icon(get_editor_theme_icon(SNAME("Tools")));
+		{
+			const LagoonicVibeTheme::Palette pal = LagoonicVibeTheme::current();
+			for (const char *n : { "icon_normal_color", "icon_hover_color", "icon_focus_color" }) {
+				game_tools_button->add_theme_color_override(n, pal.text_muted);
+			}
+			for (const char *n : { "icon_pressed_color", "icon_hover_pressed_color" }) {
+				game_tools_button->add_theme_color_override(n, pal.accent);
+			}
+		}
+		game_tools_button->connect(SceneStringName(toggled), callable_mp(this, &LagoonicVibeWorkspace::_on_game_tools_toggled));
+		bento->get_header_actions()->add_child(game_tools_button);
 		// El juego llega hasta el borde de la tarjeta (solo deja su linea de 1 px).
 		bento->set_content_margins(1, 0);
 		game_holder->add_theme_constant_override(SNAME("margin_bottom"), 1);
@@ -718,6 +756,7 @@ void LagoonicVibeWorkspace::_close_bento(const String &p_id) {
 			game_clipped = false;
 		}
 		game_holder = nullptr;
+		game_tools_button = nullptr;
 		game_placeholder = nullptr;
 		game_scroll = nullptr;
 		game_auto_opened = false;
