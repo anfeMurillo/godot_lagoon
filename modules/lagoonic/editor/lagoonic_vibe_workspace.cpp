@@ -705,7 +705,18 @@ void LagoonicVibeWorkspace::_close_bento(const String &p_id) {
 		return;
 	}
 	if (p_id == "game") {
+		// Cerrar la tarjeta con el juego en marcha lo detiene (como Detener):
+		// si no, su capa nativa se quedaba pintada encima del chat.
+		game_auto_opened = false; // Evita que _on_game_stopped la cierre otra vez.
+		EditorInterface *ei = EditorInterface::get_singleton();
+		if (ei != nullptr && ei->is_playing_scene()) {
+			ei->stop_playing_scene();
+		}
 		_undock_game(); // Antes de liberar la tarjeta: la vista es del editor.
+		if (game_clipped) {
+			lagoonic_clip_game_layer(get_window() != nullptr ? get_window()->get_window_id() : 0, Rect2(), 0, false);
+			game_clipped = false;
+		}
 		game_holder = nullptr;
 		game_placeholder = nullptr;
 		game_scroll = nullptr;
