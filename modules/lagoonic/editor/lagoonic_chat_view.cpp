@@ -250,7 +250,7 @@ StringName LagoonicChatView::_tool_icon_name(const String &p_label) const {
 		return SNAME("Load");
 	}
 	if (l.begins_with("godot") || l.begins_with("lagoonic")) {
-		return SNAME("Godot");
+		return SNAME("PackedScene");
 	}
 	if (l.begins_with("task") || l.begins_with("agent")) {
 		return SNAME("Node");
@@ -414,9 +414,12 @@ void LagoonicChatView::_refresh_tool_icon(const String &p_key, int p_state) {
 	} else if (phrase.contains("web") || phrase.begins_with("descargando")) {
 		icon = SNAME("Load");
 	} else if (phrase.contains("escena") || phrase.contains("godot") || phrase.contains("editor") || phrase.contains("propiedades") || phrase.contains("imágenes") || phrase.contains("recursos") || phrase.contains("código")) {
-		icon = SNAME("Godot");
+		// Not "Godot": the branded build swaps that icon for a large old
+		// Lagoonic logo, which showed up huge in the chat.
+		icon = SNAME("PackedScene");
 	}
 	b->set_button_icon(get_editor_theme_icon(icon));
+	b->add_theme_constant_override(SNAME("icon_max_width"), int(16 * EDSCALE));
 	Color c = _tool_color((ToolState)p_state);
 	if (p_state == TOOL_DONE) {
 		c = LagoonicVibeTheme::current().text_muted;
