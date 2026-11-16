@@ -80,7 +80,6 @@
 #include "scene/main/timer.h"
 #include "servers/text/text_server.h"
 
-static const char *LAGOONIC_BOSS_IDS[6] = { "opencode", "claude", "codex", "qwen", "kimi", "goose" };
 
 static Array _acp_pair(const String &p_option_id, const String &p_value) {
 	Array pair;
@@ -1977,8 +1976,8 @@ void LagoonicChatView::set_boss_options(const PackedStringArray &p_agent_ids) {
 	boss_option->clear();
 	PackedStringArray ids = p_agent_ids;
 	if (ids.is_empty()) {
-		for (int i = 0; i < 6; i++) {
-			ids.push_back(LAGOONIC_BOSS_IDS[i]);
+		for (int i = 0; i < LagoonicCodingAgents::CHAT_AGENT_COUNT; i++) {
+			ids.push_back(LagoonicCodingAgents::CHAT_AGENT_IDS[i]);
 		}
 	}
 	for (int i = 0; i < ids.size(); i++) {
@@ -2003,13 +2002,24 @@ void LagoonicChatView::set_boss_agent(const String &p_agent_id) {
 	if (boss_option == nullptr) {
 		return;
 	}
+	int index = -1;
 	for (int i = 0; i < boss_option->get_item_count(); i++) {
 		if (String(boss_option->get_item_text(i)) == p_agent_id) {
-			boss_option->select(i);
-			crew_view->set_boss_name(p_agent_id);
-			_update_welcome_logo();
-			return;
+			index = i;
+			break;
 		}
+	}
+	if (index < 0 && !p_agent_id.is_empty()) {
+		// A boss missing from the list (Configuracion > Equipo offers more
+		// agents): add it, or the picker, the logo and get_boss_agent()
+		// would stay on the previous one.
+		index = boss_option->get_item_count();
+		boss_option->add_item(p_agent_id, index);
+	}
+	if (index >= 0) {
+		boss_option->select(index);
+		crew_view->set_boss_name(p_agent_id);
+		_update_welcome_logo();
 	}
 }
 
@@ -2853,20 +2863,25 @@ void LagoonicChatView::_update_welcome_logo() {
 		return;
 	}
 	const String agent = get_boss_agent();
-	const char *svg = LagoonicAgentLogos::svg_for(agent);
-	if (svg == nullptr) {
-		welcome_logo->set_texture(Ref<Texture2D>());
-		welcome_logo_agent = String();
-		return;
-	}
 	if (welcome_logo_agent != agent || welcome_logo->get_texture().is_null()) {
 		// Se pinta en blanco y se tiñe con el color del tema (self_modulate),
-		// asi un cambio de tema no obliga a rasterizar de nuevo.
-		Ref<Image> img;
-		img.instantiate();
-		if (img->load_svg_from_string(String(svg), 16.0f) == OK) {
-			welcome_logo->set_texture(ImageTexture::create_from_image(img));
-			welcome_logo_agent = agent;
+		// asi un cambio de tema no obliga a rasterizar de nuevo. El SVG es
+		// nitido a cualquier tamaño; los demas agentes usan el PNG del equipo.
+		Ref<Texture2D> texture;
+		if (const char *svg = LagoonicAgentLogos::svg_for(agent)) {
+			Ref<Image> img;
+			img.instantiate();
+			if (img->load_svg_from_string(String(svg), 16.0f) == OK) {
+				texture = ImageTexture::create_from_image(img);
+			}
+		}
+		if (texture.is_null()) {
+			texture = LagoonicAgentLogos::png_texture_for(agent);
+		}
+		welcome_logo->set_texture(texture);
+		welcome_logo_agent = texture.is_valid() ? agent : String();
+		if (texture.is_null()) {
+			return;
 		}
 	}
 	Color tint = get_theme_color(SNAME("font_color"), SNAME("Label"));
@@ -3035,8 +3050,8 @@ LagoonicChatView::LagoonicChatView() {
 
 	boss_option = memnew(OptionButton);
 	boss_option->set_tooltip_text(TTRC("Jefe del equipo (agente del chat)."));
-	for (int i = 0; i < 6; i++) {
-		boss_option->add_item(LAGOONIC_BOSS_IDS[i], i);
+	for (int i = 0; i < LagoonicCodingAgents::CHAT_AGENT_COUNT; i++) {
+		boss_option->add_item(LagoonicCodingAgents::CHAT_AGENT_IDS[i], i);
 	}
 	boss_option->connect(StringName("item_selected"), callable_mp(this, &LagoonicChatView::_on_boss_selected));
 	header->add_child(boss_option);

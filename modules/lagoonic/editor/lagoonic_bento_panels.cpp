@@ -47,7 +47,7 @@
 #include "editor/scene/scene_tree_editor.h"
 #include "editor/file_system/editor_file_system.h"
 #include "editor/themes/editor_scale.h"
-#include "lagoonic_agent_logos.gen.h"
+#include "lagoonic_agent_logos.h"
 #include "scene/gui/button.h"
 #include "scene/resources/image_texture.h"
 #include "core/templates/sort_array.h"
@@ -739,37 +739,12 @@ static String _team_duration(uint64_t p_msec) {
 	return vformat("%d h %d min", int(secs / 3600), int((secs % 3600) / 60));
 }
 
-// Logo of a coding agent (editor/agent_logos, baked in by SCsub), or null.
-static Ref<Texture2D> _team_logo(const String &p_agent_id) {
-	static HashMap<String, Ref<Texture2D>> cache;
-	if (const Ref<Texture2D> *hit = cache.getptr(p_agent_id)) {
-		return *hit;
-	}
-	Ref<Texture2D> texture;
-	for (int i = 0; LAGOONIC_AGENT_LOGOS[i].id != nullptr; i++) {
-		if (p_agent_id != LAGOONIC_AGENT_LOGOS[i].id) {
-			continue;
-		}
-		Vector<uint8_t> bytes;
-		bytes.resize(LAGOONIC_AGENT_LOGOS[i].size);
-		memcpy(bytes.ptrw(), LAGOONIC_AGENT_LOGOS[i].data, LAGOONIC_AGENT_LOGOS[i].size);
-		Ref<Image> image;
-		image.instantiate();
-		if (image->load_png_from_buffer(bytes) == OK) {
-			texture = ImageTexture::create_from_image(image);
-		}
-		break;
-	}
-	cache[p_agent_id] = texture;
-	return texture;
-}
-
 // The agent's logo as a silhouette in the theme's text color, like the
 // editor's icons; the initial of its name when there is no logo.
 static Control *_team_badge(const String &p_agent_id, const String &p_name, float p_px) {
 	const int px = int(p_px * EDSCALE);
 	const Color tint = LagoonicVibeTheme::current().text;
-	const Ref<Texture2D> logo = _team_logo(p_agent_id);
+	const Ref<Texture2D> logo = LagoonicAgentLogos::png_texture_for(p_agent_id);
 	if (logo.is_valid()) {
 		TextureRect *image = memnew(TextureRect);
 		image->set_texture(logo);
@@ -914,7 +889,7 @@ static void _orbit_node(Control *p_canvas, const Vector2 &p_pos, float p_radius,
 	if (p_selected) {
 		p_canvas->draw_arc(p_pos, p_radius + ring_w * 2.2f, 0, Math::TAU, 48, Color(p.text, 0.7f), MAX(1.0f, ring_w * 0.6f), true);
 	}
-	const Ref<Texture2D> logo = _team_logo(p_agent_id);
+	const Ref<Texture2D> logo = LagoonicAgentLogos::png_texture_for(p_agent_id);
 	const float side = p_radius * 1.15f;
 	if (logo.is_valid()) {
 		p_canvas->draw_texture_rect(logo, Rect2(p_pos - Vector2(side, side) * 0.5f, Vector2(side, side)), false, p.text);
