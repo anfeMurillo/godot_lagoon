@@ -50,6 +50,7 @@
 #include "lagoonic_agent_logos.gen.h"
 #include "scene/gui/button.h"
 #include "scene/resources/image_texture.h"
+#include "core/templates/sort_array.h"
 #include "editor/settings/editor_settings.h"
 #include "scene/gui/graph_edit.h"
 #include "scene/gui/graph_node.h"
@@ -453,21 +454,191 @@ void LagoonicContextPanel::setup(LagoonicChatView *p_chat) {
 	callable_mp(this, &LagoonicContextPanel::_refresh).call_deferred();
 }
 
-void LagoonicContextPanel::_add_field(const String &p_key, const String &p_label) {
-	VBoxContainer *cell = memnew(VBoxContainer);
-	cell->add_theme_constant_override(SNAME("separation"), int(2 * EDSCALE));
-	cell->set_h_size_flags(Control::SIZE_EXPAND_FILL);
-	grid->add_child(cell);
-	Label *l = memnew(Label);
-	l->set_text(p_label);
-	l->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
-	cell->add_child(l);
-	Label *v = memnew(Label);
-	v->set_text(String::utf8("—"));
-	v->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
-	v->set_custom_minimum_size(Size2(1, 0));
-	cell->add_child(v);
-	values[p_key] = v;
+void LagoonicContextCube::set_free(float p_free, bool p_known, const Color &p_color) {
+	target = CLAMP(p_free, 0.0f, 1.0f);
+	if (known != p_known || color != p_color) {
+		known = p_known;
+		color = p_color;
+		queue_redraw();
+	}
+}
+
+void LagoonicContextCube::_notification(int p_what) {
+	switch (p_what) {
+		case NOTIFICATION_VISIBILITY_CHANGED:
+		case NOTIFICATION_ENTER_TREE: {
+			set_process(is_visible_in_tree());
+		} break;
+		case NOTIFICATION_MOUSE_ENTER: {
+			hovered = true;
+		} break;
+		case NOTIFICATION_MOUSE_EXIT: {
+			hovered = false;
+		} break;
+		case NOTIFICATION_PROCESS: {
+			const float delta = float(get_process_delta_time());
+			time += delta;
+			// The level glides to its value, cube by cube.
+			shown = Math::move_toward(shown, target, delta * 0.6f);
+			// It turns toward the mouse; idle, it sways slowly.
+			float want = Math::sin(time * 0.5f) * 0.22f;
+			if (hovered && get_size().x > 0) {
+				want = CLAMP((get_local_mouse_position().x / get_size().x - 0.5f) * 1.2f, -0.6f, 0.6f);
+			}
+			yaw = Math::lerp(yaw, want, MIN(1.0f, delta * 4.0f));
+			queue_redraw();
+		} break;
+		case NOTIFICATION_RESIZED:
+		case NOTIFICATION_THEME_CHANGED: {
+			queue_redraw();
+		} break;
+		case NOTIFICATION_DRAW: {
+			const Size2 size = get_size();
+			if (size.x <= 0 || size.y <= 0) {
+				break;
+			}
+			const int n = size.x >= 150 * EDSCALE ? 5 : 4;
+			const float half = n * 0.5f;
+			// Camera: turned 45 degrees plus the yaw, looking down ~35 degrees.
+			const float turn = Math::PI * 0.25f + yaw;
+			const float ct = Math::cos(turn), st = Math::sin(turn);
+			const float sp = 0.577f, cp = 0.8165f;
+			// Fit: the cube spans at most n*sqrt(2) wide and n*(sp*sqrt(2)+cp) tall.
+			const float scale = MIN(size.x / (n * 1.45f), size.y * 0.86f / (n * (sp * 1.42f + cp))) * 0.92f;
+			const float bob = Math::sin(time * 1.3f) * 3.0f * EDSCALE;
+			const Vector2 center(size.x * 0.5f, size.y * 0.46f + bob);
+			// World (x, y, z up), centered on the cube; returns screen point.
+			auto rot = [&](const Vector3 &p) {
+				return Vector3(p.x * ct - p.y * st, p.x * st + p.y * ct, p.z);
+			};
+			auto project = [&](const Vector3 &p) {
+				const Vector3 r = rot(p - Vector3(half, half, half));
+				return center + Vector2(r.x, r.y * sp - r.z * cp) * scale;
+			};
+			const Vector3 view(0.0f, cp, sp); // Toward the viewer, in turned space.
+			const Vector3 light = Vector3(-0.45f, 0.35f, 0.82f).normalized();
+
+			const LagoonicVibeTheme::Palette p = LagoonicVibeTheme::current();
+			const Color edge = p.surface;
+			const Color ghost = p.border;
+
+			// Soft shadow on the floor, smaller when the cube floats up.
+			{
+				const float r = n * scale * 0.78f * (1.0f - bob / (60.0f * EDSCALE));
+				const Vector2 c(size.x * 0.5f, size.y * 0.46f + (half * cp + n * 0.72f * sp) * scale + 6.0f * EDSCALE);
+				for (int ring = 4; ring >= 1; ring--) {
+					const float k = ring / 4.0f;
+					Vector<Vector2> ellipse;
+					for (int i = 0; i < 32; i++) {
+						const float a = Math::TAU * i / 32.0f;
+						ellipse.push_back(c + Vector2(Math::cos(a) * r * k, Math::sin(a) * r * k * 0.28f));
+					}
+					draw_colored_polygon(ellipse, Color(0, 0, 0, 0.10f));
+				}
+			}
+
+			const int free_cubes = known ? int(Math::round(shown * n * n * n)) : 0;
+			auto is_free = [&](int x, int y, int z) {
+				if (x < 0 || y < 0 || z < 0 || x >= n || y >= n || z >= n) {
+					return false;
+				}
+				return (z * n + x) * n + y < free_cubes;
+			};
+			// The six faces: normal and corners (unit cube offsets).
+			static const Vector3i normals[6] = { Vector3i(0, 0, 1), Vector3i(0, 0, -1), Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 1, 0), Vector3i(0, -1, 0) };
+			static const Vector3 corners[6][4] = {
+				{ Vector3(0, 0, 1), Vector3(1, 0, 1), Vector3(1, 1, 1), Vector3(0, 1, 1) },
+				{ Vector3(0, 0, 0), Vector3(0, 1, 0), Vector3(1, 1, 0), Vector3(1, 0, 0) },
+				{ Vector3(1, 0, 0), Vector3(1, 1, 0), Vector3(1, 1, 1), Vector3(1, 0, 1) },
+				{ Vector3(0, 0, 0), Vector3(0, 0, 1), Vector3(0, 1, 1), Vector3(0, 1, 0) },
+				{ Vector3(0, 1, 0), Vector3(0, 1, 1), Vector3(1, 1, 1), Vector3(1, 1, 0) },
+				{ Vector3(0, 0, 0), Vector3(1, 0, 0), Vector3(1, 0, 1), Vector3(0, 0, 1) },
+			};
+			bool face_visible[6];
+			float face_light[6];
+			for (int f = 0; f < 6; f++) {
+				const Vector3 nr = rot(Vector3(normals[f]));
+				face_visible[f] = nr.dot(view) > 0.02f;
+				face_light[f] = 0.52f + 0.48f * MAX(0.0f, nr.dot(light));
+			}
+			// Back to front by depth toward the viewer.
+			struct Cell {
+				Vector3i c;
+				float depth;
+			};
+			LocalVector<Cell> cells;
+			for (int z = 0; z < n; z++) {
+				for (int y = 0; y < n; y++) {
+					for (int x = 0; x < n; x++) {
+						const Vector3 r = rot(Vector3(x + 0.5f - half, y + 0.5f - half, z + 0.5f - half));
+						cells.push_back({ Vector3i(x, y, z), r.y * cp + r.z * sp });
+					}
+				}
+			}
+			struct ByDepth {
+				bool operator()(const Cell &a, const Cell &b) const { return a.depth < b.depth; }
+			};
+			SortArray<Cell, ByDepth> sorter;
+			sorter.sort(cells.ptr(), cells.size());
+
+			for (const Cell &cell : cells) {
+				const Vector3i c = cell.c;
+				const bool solid = is_free(c.x, c.y, c.z);
+				for (int f = 0; f < 6; f++) {
+					if (!face_visible[f]) {
+						continue;
+					}
+					const Vector3i nb = c + normals[f];
+					Vector<Vector2> quad;
+					for (int k = 0; k < 4; k++) {
+						quad.push_back(project(Vector3(c) + corners[f][k]));
+					}
+					if (solid) {
+						if (is_free(nb.x, nb.y, nb.z)) {
+							continue; // Hidden by its neighbor.
+						}
+						Color shade = color * face_light[f];
+						shade.a = 1.0f;
+						if (f == 0) {
+							shade = shade.lightened(0.08f); // The top catches the light.
+						}
+						draw_colored_polygon(quad, shade);
+						quad.push_back(quad[0]);
+						draw_polyline(quad, edge, 1.0f, true);
+					} else {
+						// A used cube: only the big cube's outer faces, as a
+						// faint wireframe of what the window holds.
+						const bool outer = nb.x < 0 || nb.y < 0 || nb.z < 0 || nb.x >= n || nb.y >= n || nb.z >= n;
+						if (outer) {
+							quad.push_back(quad[0]);
+							draw_polyline(quad, ghost, 1.0f, true);
+						}
+					}
+				}
+			}
+		} break;
+	}
+}
+
+LagoonicContextCube::LagoonicContextCube() {
+	set_custom_minimum_size(Size2(0, 150 * EDSCALE));
+	set_v_size_flags(Control::SIZE_EXPAND_FILL);
+	set_mouse_filter(Control::MOUSE_FILTER_PASS);
+}
+
+void LagoonicContextCube::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("set_free", "free", "known", "color"), &LagoonicContextCube::set_free);
+}
+
+
+static String _context_tokens(int64_t p_tokens) {
+	if (p_tokens >= 1000000) {
+		return String::num(double(p_tokens) / 1000000.0, 1) + "M";
+	}
+	if (p_tokens >= 1000) {
+		return itos(int64_t(Math::round(double(p_tokens) / 1000.0))) + "k";
+	}
+	return itos(p_tokens);
 }
 
 void LagoonicContextPanel::_refresh() {
@@ -475,49 +646,92 @@ void LagoonicContextPanel::_refresh() {
 		return;
 	}
 	const Dictionary d = chat->get_context_info();
-	values["title"]->set_text(d.get("title", ""));
-	values["title"]->set_tooltip_text(d.get("title", ""));
-	values["state"]->set_text(bool(d.get("busy", false)) ? String::utf8("Trabajando…") : String::utf8("Listo"));
-	values["model"]->set_text(d.get("model", ""));
-	values["mode"]->set_text(d.get("mode", ""));
-	values["effort"]->set_text(d.get("effort", ""));
-	values["user"]->set_text(itos(int(d.get("user_messages", 0))));
-	values["answers"]->set_text(itos(int(d.get("answers", 0))));
-	values["steps"]->set_text(itos(int(d.get("steps", 0))));
-	values["worked"]->set_text(d.get("worked", ""));
-	const int64_t updated = d.get("updated_at", 0);
-	if (updated > 0) {
-		const Dictionary dt = Time::get_singleton()->get_datetime_dict_from_unix_time(updated / 1000 + int64_t(Time::get_singleton()->get_time_zone_from_system().get("bias", 0)) * 60);
-		values["updated"]->set_text(vformat("%02d/%02d %02d:%02d", int(dt["day"]), int(dt["month"]), int(dt["hour"]), int(dt["minute"])));
+	const LagoonicVibeTheme::Palette p = LagoonicVibeTheme::current();
+	const int64_t used = d.get("context_used", 0);
+	const int64_t size = d.get("context_size", 0);
+	const bool known = size > 0;
+	const int64_t free_tokens = known ? MAX<int64_t>(0, size - used) : 0;
+	const float free = known ? float(double(free_tokens) / double(size)) : 0.0f;
+	const Color amber = Color::html("#f0b45a");
+	const Color red = Color::html("#f07070");
+	const Color state = !known ? p.border : (free < 0.15f ? red : (free < 0.4f ? amber : p.accent));
+	cube->set_free(free, known, state);
+
+	percent->set_text(known ? itos(int(Math::round(free * 100.0f))) + String::utf8("% libre") : String::utf8("—"));
+	tokens->set_text(known ? vformat(String::utf8("%s de %s libres"), _context_tokens(free_tokens), _context_tokens(size)) : String());
+	tokens->set_visible(known);
+
+	String note_text;
+	Color note_color = p.text_muted;
+	const int64_t compacted = d.get("context_compacted_at", 0);
+	const int steps = d.get("steps", 0);
+	if (!known) {
+		note_text = String::utf8("Aparecerá cuando el agente responda. Algunos agentes no comparten su contexto.");
+	} else if (compacted > 0 && int64_t(Time::get_singleton()->get_unix_time_from_system()) - compacted < 30) {
+		note_text = String::utf8("Resumió la conversación para hacer sitio");
+		note_color = p.accent;
+	} else if (free < 0.15f) {
+		note_text = String::utf8("Casi lleno: conviene empezar un chat nuevo");
+		note_color = red;
+	} else if (free < 0.4f) {
+		note_text = String::utf8("Pronto resumirá lo antiguo");
+		note_color = amber;
+	} else if (int64_t(d.get("context_growth", 0)) > 0) {
+		const int64_t left = free_tokens / int64_t(d.get("context_growth", 1));
+		note_text = left > 50 ? String::utf8("Más de 50 respuestas por delante") : vformat(String::utf8("≈ %d respuestas más"), int(left));
 	} else {
-		values["updated"]->set_text(String::utf8("—"));
+		note_text = String::utf8("Mucho sitio por delante");
 	}
-	values["project"]->set_text(ProjectSettings::get_singleton()->globalize_path("res://").trim_suffix("/").get_file());
-	// Las celdas son estrechas: el texto entero queda al pasar el raton.
-	for (const KeyValue<String, Label *> &kv : values) {
-		kv.value->set_tooltip_text(kv.value->get_text());
-		kv.value->set_mouse_filter(Control::MOUSE_FILTER_PASS);
+	note->set_text(note_text);
+	note->add_theme_color_override(SceneStringName(font_color), note_color);
+	note->set_visible(!note_text.is_empty());
+
+	PackedStringArray foot;
+	if (!String(d.get("model", "")).is_empty()) {
+		foot.push_back(d.get("model", ""));
 	}
+	foot.push_back(d.get("title", ""));
+	footer->set_text(String::utf8(" · ").join(foot));
+
+	// The rest of the chat's data, on hover.
+	String tip = String(d.get("title", "")) + "\n";
+	tip += String::utf8("Estado: ") + (bool(d.get("busy", false)) ? String::utf8("trabajando") : String::utf8("listo")) + "\n";
+	tip += String::utf8("Modelo: ") + String(d.get("model", "")) + "\n";
+	tip += String::utf8("Modo: ") + String(d.get("mode", "")) + String::utf8(" · ") + String(d.get("effort", "")) + "\n";
+	tip += vformat(String::utf8("Tus mensajes: %d · Respuestas: %d · Pasos: %d"), int(d.get("user_messages", 0)), int(d.get("answers", 0)), steps) + "\n";
+	tip += String::utf8("Tiempo trabajando: ") + String(d.get("worked", "")) + "\n";
+	if (known) {
+		tip += vformat(String::utf8("Contexto: %s usados de %s"), _context_tokens(used), _context_tokens(size)) + "\n";
+	}
+	tip += String::utf8("Proyecto: ") + ProjectSettings::get_singleton()->globalize_path("res://").trim_suffix("/").get_file();
+	cube->set_tooltip_text(tip);
+	footer->set_tooltip_text(tip);
+}
+
+void LagoonicContextPanel::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("setup", "chat"), &LagoonicContextPanel::setup);
 }
 
 LagoonicContextPanel::LagoonicContextPanel() {
-	add_theme_constant_override(SNAME("separation"), int(8 * EDSCALE));
-	grid = memnew(GridContainer);
-	grid->set_columns(2);
-	grid->add_theme_constant_override(SNAME("h_separation"), int(16 * EDSCALE));
-	grid->add_theme_constant_override(SNAME("v_separation"), int(14 * EDSCALE));
-	add_child(_bento_scroll(grid));
-	_add_field("title", "Chat");
-	_add_field("state", "Estado");
-	_add_field("model", "Modelo");
-	_add_field("mode", "Modo");
-	_add_field("effort", "Esfuerzo");
-	_add_field("worked", "Tiempo trabajando");
-	_add_field("user", "Tus mensajes");
-	_add_field("answers", "Respuestas");
-	_add_field("steps", "Pasos");
-	_add_field("updated", String::utf8("Última actividad"));
-	_add_field("project", "Proyecto");
+	add_theme_constant_override(SNAME("separation"), int(4 * EDSCALE));
+	cube = memnew(LagoonicContextCube);
+	add_child(cube);
+	percent = memnew(Label);
+	percent->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
+	percent->add_theme_font_size_override(SceneStringName(font_size), int(26 * EDSCALE));
+	add_child(percent);
+	tokens = memnew(Label);
+	tokens->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
+	add_child(tokens);
+	note = _bento_muted(String());
+	note->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
+	add_child(note);
+	footer = _bento_muted(String());
+	footer->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
+	footer->set_autowrap_mode(TextServer::AUTOWRAP_OFF);
+	footer->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
+	footer->set_mouse_filter(Control::MOUSE_FILTER_PASS);
+	add_child(footer);
 	timer = memnew(Timer);
 	timer->set_wait_time(1.0);
 	timer->set_autostart(true);

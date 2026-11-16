@@ -185,6 +185,8 @@ void initialize_lagoonic_module(ModuleInitializationLevel p_level) {
 		GDREGISTER_CLASS(LagoonicTeamOrbit);
 		GDREGISTER_CLASS(LagoonicUsagePanel);
 		GDREGISTER_CLASS(LagoonicTerminalPanel);
+		GDREGISTER_CLASS(LagoonicContextCube);
+		GDREGISTER_CLASS(LagoonicContextPanel);
 		GDREGISTER_CLASS(LagoonicUsageRings);
 		GDREGISTER_CLASS(LagoonicAgentDock);
 		GDREGISTER_CLASS(LagoonicWaterCaustics);

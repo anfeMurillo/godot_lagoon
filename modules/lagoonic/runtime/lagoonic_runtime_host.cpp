@@ -2630,6 +2630,9 @@ void LagoonicRuntimeHost::_on_acp_event(const Dictionary &p_event) {
 	if (String(event.get("type", "")) == "acp_options") {
 		event["agent"] = acp_agent;
 	}
+	if (String(event.get("type", "")) == "context") {
+		event["session_id"] = acp_session; // The chat this turn belongs to.
+	}
 	if (String(event.get("type", "")) == "permission") {
 		Dictionary request = event.get("request", Dictionary());
 		if (!request.has("sessionId")) {

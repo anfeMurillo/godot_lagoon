@@ -286,6 +286,21 @@ Array LagoonicAcpMapper::feed_update(const Dictionary &p_update) {
 		return _on_tool_call(p_update);
 	} else if (kind == "tool_call_update") {
 		return _on_tool_update(p_update);
+	} else if (kind == "usage_update") {
+		// How full the model's context window is (ACP: used / size tokens).
+		const int64_t used = int64_t(double(p_update.get("used", 0)));
+		const int64_t size = int64_t(double(p_update.get("size", 0)));
+		if (size <= 0) {
+			return Array();
+		}
+		Dictionary event;
+		event["type"] = "context";
+		event["session_id"] = String(session_id);
+		event["used"] = used;
+		event["size"] = size;
+		Array out;
+		out.push_back(event);
+		return out;
 	} else if (kind == "plan") {
 		Array entries = _darr(p_update, "entries");
 		Array todos;
@@ -2150,6 +2165,22 @@ void LagoonicAcpRunner::_handle_codex_notification(const String &p_method, const
 			if (!text.is_empty()) {
 				codex_final_text += (codex_final_text.is_empty() ? "" : "\n\n") + text;
 			}
+		}
+	} else if (p_method == "thread/tokenUsage/updated") {
+		// The last request's tokens are what the context holds now.
+		const Dictionary usage = _ddict(p_params, "tokenUsage");
+		const Dictionary last = _ddict(usage, "last");
+		int64_t used = int64_t(double(last.get("totalTokens", 0)));
+		if (used <= 0) {
+			used = int64_t(double(last.get("inputTokens", 0))) + int64_t(double(last.get("outputTokens", 0)));
+		}
+		const Variant window = usage.get("modelContextWindow", Variant());
+		if (window.get_type() == Variant::INT || window.get_type() == Variant::FLOAT) {
+			Dictionary update;
+			update["sessionUpdate"] = "usage_update";
+			update["used"] = used;
+			update["size"] = int64_t(double(window));
+			_feed_codex_update(update);
 		}
 	} else if (p_method == "turn/completed") {
 		const Dictionary turn = _ddict(p_params, "turn");

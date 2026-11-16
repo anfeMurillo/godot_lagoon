@@ -225,6 +225,8 @@ private:
 	Button *plan_toggle = nullptr;
 	VBoxContainer *plan_list = nullptr;
 	Array plan_todos;
+	Dictionary context_usage; // session id -> {used, size, compacted_at}
+	Dictionary _context_for(const String &p_session_id) const;
 	void _rebuild_plan();
 	void _on_plan_toggle();
 
@@ -384,6 +386,9 @@ public:
 	void set_plan_card_suppressed(bool p_suppressed);
 	// Datos del panel Contexto: chat, modelo, modo, mensajes, pasos, tiempo.
 	Dictionary get_context_info() const;
+	// How full the model's context window is in a chat (tokens), from the
+	// agent. Saved per chat in the project's metadata.
+	void set_context_usage(const String &p_session_id, int64_t p_used, int64_t p_size);
 	// Escribe en la caja de texto (p. ej. "@res://player.png ").
 	void insert_in_composer(const String &p_text);
 	HBoxContainer *get_session_bar() const { return session_bar; }

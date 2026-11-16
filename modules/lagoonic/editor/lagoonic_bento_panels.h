@@ -112,15 +112,44 @@ public:
 };
 
 // Resumen del chat: modelo, modo, mensajes, pasos, tiempo trabajado...
+// The context window as a cube made of cubes: the solid ones are what is
+// still free, the used ones stay as an outline. It empties from the top.
+class LagoonicContextCube : public Control {
+	GDCLASS(LagoonicContextCube, Control);
+
+	float target = 0.0f; // Free fraction, 0..1.
+	float shown = 0.0f;
+	bool known = false;
+	Color color;
+	// 2.5D: the cube turns a little toward the mouse, sways when idle and
+	// floats over its shadow.
+	float yaw = 0.0f; // Radians around the vertical axis, 0 = isometric.
+	float time = 0.0f;
+	bool hovered = false;
+
+protected:
+	void _notification(int p_what);
+	static void _bind_methods();
+
+public:
+	void set_free(float p_free, bool p_known, const Color &p_color);
+	LagoonicContextCube();
+};
+
 class LagoonicContextPanel : public VBoxContainer {
 	GDCLASS(LagoonicContextPanel, VBoxContainer);
 
 	LagoonicChatView *chat = nullptr;
-	GridContainer *grid = nullptr;
+	LagoonicContextCube *cube = nullptr;
+	Label *percent = nullptr;
+	Label *tokens = nullptr;
+	Label *note = nullptr;
+	Label *footer = nullptr;
 	Timer *timer = nullptr;
-	HashMap<String, Label *> values;
-	void _add_field(const String &p_key, const String &p_label);
 	void _refresh();
+
+protected:
+	static void _bind_methods();
 
 public:
 	void setup(LagoonicChatView *p_chat);

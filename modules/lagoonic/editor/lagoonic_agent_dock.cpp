@@ -390,6 +390,8 @@ void LagoonicAgentDock::hook_push_agent_event(const Dictionary &p_event) {
 			crew->set_tasks(p_event.get("todos", Array()));
 		}
 		chat_view->set_todos(p_event.get("todos", Array()));
+	} else if (type == "context") {
+		chat_view->set_context_usage(p_event.get("session_id", ""), int64_t(p_event.get("used", 0)), int64_t(p_event.get("size", 0)));
 	} else if (type == "queued") {
 		chat_view->set_queued_count(int(p_event.get("count", 0)));
 	} else if (type == "permission") {

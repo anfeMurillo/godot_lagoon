@@ -51,6 +51,7 @@
 #include "scene/resources/gradient_texture.h"
 #include "scene/resources/image_texture.h"
 #include "core/os/time.h"
+#include "editor/settings/editor_settings.h"
 #include "scene/gui/dialogs.h"
 #include "scene/gui/scroll_bar.h"
 #include "core/os/keyboard.h"
@@ -534,7 +535,62 @@ Dictionary LagoonicChatView::get_context_info() const {
 	}
 	d["worked"] = total > 0 ? _format_duration(total) : String::utf8("—");
 	d["busy"] = busy;
+	const Dictionary context = _context_for(current_session_id);
+	d["context_used"] = context.get("used", 0);
+	d["context_size"] = context.get("size", 0);
+	d["context_compacted_at"] = context.get("compacted_at", 0);
+	const int updates = context.get("updates", 0);
+	const int64_t grown = int64_t(context.get("used", 0)) - int64_t(context.get("first", 0));
+	d["context_growth"] = updates >= 3 && grown > 0 ? grown / (updates - 1) : 0;
 	return d;
+}
+
+Dictionary LagoonicChatView::_context_for(const String &p_session_id) const {
+	if (p_session_id.is_empty()) {
+		return Dictionary();
+	}
+	if (context_usage.has(p_session_id)) {
+		return context_usage[p_session_id];
+	}
+	EditorSettings *es = EditorSettings::get_singleton();
+	if (es == nullptr) {
+		return Dictionary();
+	}
+	const Dictionary saved = es->get_project_metadata("lagoonic_context", "sessions", Dictionary());
+	return saved.get(p_session_id, Dictionary());
+}
+
+void LagoonicChatView::set_context_usage(const String &p_session_id, int64_t p_used, int64_t p_size) {
+	const String id = p_session_id.is_empty() ? current_session_id : p_session_id;
+	if (id.is_empty() || p_size <= 0) {
+		return;
+	}
+	const Dictionary before = _context_for(id);
+	Dictionary entry;
+	entry["used"] = p_used;
+	entry["size"] = p_size;
+	entry["compacted_at"] = before.get("compacted_at", 0);
+	// How much the context grows per answer: the start (agent instructions
+	// and tools) does not count, only what each update adds.
+	entry["first"] = before.get("first", p_used);
+	entry["updates"] = int(before.get("updates", 0)) + 1;
+	// A big drop while the chat goes on: the agent summarized the
+	// conversation to make room.
+	const int64_t was = int64_t(before.get("used", 0));
+	if (was > 0 && p_used < was * 6 / 10 && was - p_used > p_size / 10) {
+		entry["compacted_at"] = int64_t(Time::get_singleton()->get_unix_time_from_system());
+		entry["first"] = p_used;
+		entry["updates"] = 1;
+	}
+	context_usage[id] = entry;
+	EditorSettings *es = EditorSettings::get_singleton();
+	if (es != nullptr) {
+		Dictionary saved = es->get_project_metadata("lagoonic_context", "sessions", Dictionary());
+		saved = saved.duplicate();
+		saved[id] = entry;
+		es->set_project_metadata("lagoonic_context", "sessions", saved);
+	}
+	_notify_listeners(SNAME("context"));
 }
 
 void LagoonicChatView::add_history_message(const Dictionary &p_message) {
@@ -2830,6 +2886,7 @@ void LagoonicChatView::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_event_handler", "handler"), &LagoonicChatView::set_event_handler);
 	ClassDB::bind_method(D_METHOD("set_sessions", "sessions"), &LagoonicChatView::set_sessions);
 	ClassDB::bind_method(D_METHOD("set_current_session", "session_id"), &LagoonicChatView::set_current_session);
+	ClassDB::bind_method(D_METHOD("set_context_usage", "session_id", "used", "size"), &LagoonicChatView::set_context_usage);
 	ClassDB::bind_method(D_METHOD("get_current_session"), &LagoonicChatView::get_current_session);
 	ClassDB::bind_method(D_METHOD("set_boss_options", "agent_ids"), &LagoonicChatView::set_boss_options);
 	ClassDB::bind_method(D_METHOD("set_boss_agent", "agent_id"), &LagoonicChatView::set_boss_agent);
