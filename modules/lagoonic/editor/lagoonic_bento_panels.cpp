@@ -1824,12 +1824,11 @@ void LagoonicUsagePanel::_rebuild(const Dictionary &p_usage) {
 		title->set_text(name);
 		title->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 		head->add_child(title);
+		// Sin el nombre del plan: solo cuenta lo que queda (va en el tooltip).
 		const String plan = entry.get("plan", "");
 		if (!plan.is_empty()) {
-			Label *plan_label = memnew(Label);
-			plan_label->set_text(plan);
-			plan_label->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
-			head->add_child(plan_label);
+			title->set_tooltip_text(name + String::utf8(" · plan ") + plan);
+			title->set_mouse_filter(Control::MOUSE_FILTER_PASS);
 		}
 
 		HFlowContainer *rings_row = memnew(HFlowContainer);

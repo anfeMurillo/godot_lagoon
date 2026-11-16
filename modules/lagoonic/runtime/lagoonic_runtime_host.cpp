@@ -1257,8 +1257,47 @@ void LagoonicRuntimeHost::_read_usage() {
 
 	// OpenCode Go: opencode.ai/zen/go/v1/usage with the key Lagoonic keeps.
 	usage_mutex.lock();
-	const String go_key = opencode_go_key;
+	String go_key = opencode_go_key;
 	usage_mutex.unlock();
+	if (go_key.is_empty()) {
+		// OpenCode 2 keeps its keys in its own database (table credential),
+		// like Orca reads it. Read-only, for this request only.
+		const String db = LagoonicCodingAgents::home_dir().path_join(".local/share/opencode/opencode.db");
+		if (FileAccess::exists(db) && FileAccess::exists("/usr/bin/sqlite3")) {
+			List<String> args;
+			args.push_back("-readonly");
+			args.push_back(db);
+			args.push_back("SELECT value FROM credential WHERE integration_id = 'opencode-go' ORDER BY active DESC, time_created DESC LIMIT 1;");
+			String out;
+			int exit_code = -1;
+			if (OS::get_singleton()->execute("/usr/bin/sqlite3", args, &out, &exit_code) == OK && exit_code == 0) {
+				const Variant value = JSON::parse_string(out.strip_edges());
+				if (value.get_type() == Variant::DICTIONARY) {
+					go_key = Dictionary(value).get("key", "");
+				}
+			}
+		}
+	}
+	if (go_key.is_empty()) {
+		// OpenCode 1 (`opencode auth login`): its auth.json. Used for this
+		// request only.
+		const String home = LagoonicCodingAgents::home_dir();
+		for (const String &file : { home.path_join(".local/share/opencode/auth.json"), home.path_join("Library/Application Support/opencode/auth.json") }) {
+			if (!FileAccess::exists(file)) {
+				continue;
+			}
+			const Variant auth = JSON::parse_string(FileAccess::get_file_as_string(file));
+			if (auth.get_type() == Variant::DICTIONARY) {
+				const Variant go = Dictionary(auth).get("opencode-go", Variant());
+				if (go.get_type() == Variant::DICTIONARY) {
+					go_key = Dictionary(go).get("key", "");
+				}
+			}
+			if (!go_key.is_empty()) {
+				break;
+			}
+		}
+	}
 	if (!go_key.is_empty()) {
 		Dictionary entry;
 		entry["name"] = String("OpenCode Go");
@@ -1288,7 +1327,7 @@ void LagoonicRuntimeHost::_read_usage() {
 		}
 		entry["windows"] = windows;
 		if (windows.is_empty()) {
-			entry["note"] = status == 401 ? String::utf8("La clave de OpenCode Go no vale; revísala en Configuración › Proveedores.") : (status == 403 ? String::utf8("Esta cuenta no tiene plan OpenCode Go.") : vformat(String::utf8("OpenCode Go no respondió (%d)."), status));
+			entry["note"] = status == 401 ? String::utf8("La clave de OpenCode Go no vale; conéctala de nuevo en OpenCode o ponla en Configuración › Proveedores.") : (status == 403 ? String::utf8("Esta cuenta no tiene plan OpenCode Go.") : vformat(String::utf8("OpenCode Go no respondió (%d)."), status));
 		}
 		MutexLock lock(usage_mutex);
 		usage_cache["opencode"] = entry;

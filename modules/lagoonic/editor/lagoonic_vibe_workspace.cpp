@@ -817,13 +817,30 @@ void LagoonicVibeWorkspace::_restore_bentos() {
 	if (EditorSettings::get_singleton() == nullptr) {
 		return;
 	}
-	const PackedStringArray ids = EditorSettings::get_singleton()->get_project_metadata("lagoonic", "bentos", PackedStringArray());
+	// Un proyecto que nunca eligio sus paneles abre Equipo y Uso, uno sobre
+	// otro, a la derecha del chat.
+	const Variant saved_ids = EditorSettings::get_singleton()->get_project_metadata("lagoonic", "bentos", Variant());
+	const bool first_time = saved_ids.get_type() == Variant::NIL;
+	PackedStringArray ids = first_time ? PackedStringArray({ "team", "usage" }) : PackedStringArray(saved_ids);
 	for (const String &id : ids) {
 		_open_bento(id, false);
 	}
 	// Los tamanos que el usuario dejo, cuando el tablero ya tiene su ancho.
 	bento_board->set_order_callback(callable_mp(this, &LagoonicVibeWorkspace::_save_bentos));
-	const Variant layout = EditorSettings::get_singleton()->get_project_metadata("lagoonic", "bento_layout", Dictionary());
+	Variant layout = EditorSettings::get_singleton()->get_project_metadata("lagoonic", "bento_layout", Dictionary());
+	if (first_time) {
+		Dictionary defaults;
+		Array columns;
+		Array chat_column;
+		chat_column.push_back("chat");
+		Array side_column;
+		side_column.push_back("team");
+		side_column.push_back("usage");
+		columns.push_back(chat_column);
+		columns.push_back(side_column);
+		defaults["columns"] = columns;
+		layout = defaults;
+	}
 	callable_mp(this, &LagoonicVibeWorkspace::_restore_layout).call_deferred(layout.get_type() == Variant::DICTIONARY ? Dictionary(layout) : Dictionary());
 }
 
