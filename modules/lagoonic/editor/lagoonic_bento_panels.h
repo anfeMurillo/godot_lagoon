@@ -144,7 +144,6 @@ class LagoonicContextPanel : public VBoxContainer {
 	Label *percent = nullptr;
 	Label *tokens = nullptr;
 	Label *note = nullptr;
-	Label *footer = nullptr;
 	Timer *timer = nullptr;
 	void _refresh();
 

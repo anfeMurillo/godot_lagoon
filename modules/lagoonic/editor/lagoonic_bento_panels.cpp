@@ -686,7 +686,6 @@ void LagoonicContextPanel::_refresh() {
 	note->add_theme_color_override(SceneStringName(font_color), note_color);
 	note->set_visible(!note_text.is_empty());
 
-	footer->set_text(d.get("title", ""));
 
 	// The rest of the chat's data, on hover.
 	String tip = String(d.get("title", "")) + "\n";
@@ -700,7 +699,6 @@ void LagoonicContextPanel::_refresh() {
 	}
 	tip += String::utf8("Proyecto: ") + ProjectSettings::get_singleton()->globalize_path("res://").trim_suffix("/").get_file();
 	cube->set_tooltip_text(tip);
-	footer->set_tooltip_text(tip);
 }
 
 void LagoonicContextPanel::_bind_methods() {
@@ -721,12 +719,6 @@ LagoonicContextPanel::LagoonicContextPanel() {
 	note = _bento_muted(String());
 	note->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
 	add_child(note);
-	footer = _bento_muted(String());
-	footer->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
-	footer->set_autowrap_mode(TextServer::AUTOWRAP_OFF);
-	footer->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
-	footer->set_mouse_filter(Control::MOUSE_FILTER_PASS);
-	add_child(footer);
 	timer = memnew(Timer);
 	timer->set_wait_time(1.0);
 	timer->set_autostart(true);
