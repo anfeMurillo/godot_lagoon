@@ -227,6 +227,8 @@ private:
 	Array plan_todos;
 	Dictionary context_usage; // session id -> {used, size, compacted_at}
 	Dictionary _context_for(const String &p_session_id) const;
+	LocalVector<ObjectID> user_bubble_texts;
+	void _fit_user_bubbles();
 	void _rebuild_plan();
 	void _on_plan_toggle();
 
@@ -331,7 +333,6 @@ protected:
 	// Acepta ficheros del FileSystemDock ("files") y rutas de nodos
 	// ("nodes"); las escenas llegan como ficheros .tscn.
 	// Adds files (absolute or res:// paths) to the next message.
-	void add_attachments(const PackedStringArray &p_paths);
 	PackedStringArray get_pending_attachments() const { return pending_attachments; }
 	virtual bool can_drop_data(const Point2 &p_point, const Variant &p_data) const override;
 	virtual void drop_data(const Point2 &p_point, const Variant &p_data) override;
@@ -391,6 +392,8 @@ public:
 	void set_context_usage(const String &p_session_id, int64_t p_used, int64_t p_size);
 	// Escribe en la caja de texto (p. ej. "@res://player.png ").
 	void insert_in_composer(const String &p_text);
+	// Files that go with the next message (absolute or res:// paths).
+	void add_attachments(const PackedStringArray &p_paths);
 	HBoxContainer *get_session_bar() const { return session_bar; }
 	// Color del fondo sobre el que esta el chat (alfa 0 = sin desvanecido).
 	void set_fade_color(const Color &p_color);

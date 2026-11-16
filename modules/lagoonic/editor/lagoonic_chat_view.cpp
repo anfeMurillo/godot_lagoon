@@ -2123,8 +2123,53 @@ void LagoonicChatView::add_user_message(const String &p_text) {
 			width = MAX(width, Math::ceil(font->get_string_size(line, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x) + 8.0f * EDSCALE);
 		}
 	}
-	text->set_custom_minimum_size(Size2(MIN(width, 520.0f * EDSCALE), 0));
+	text->set_meta(SNAME("_natural_width"), MIN(width, 520.0f * EDSCALE));
+	// The row sizes first (no minimum yet); then the bubble takes its width.
+	text->set_custom_minimum_size(Size2(0, 0));
+	// In a narrow chat the bubble takes the width there is and wraps,
+	// instead of keeping its natural width and being cut on the right.
+	user_bubble_texts.push_back(text->get_instance_id());
+	callable_mp(this, &LagoonicChatView::_fit_user_bubbles).call_deferred();
 	_scroll_to_bottom();
+}
+
+void LagoonicChatView::_fit_user_bubbles() {
+	// The width is the chat's (the scroll's), never the messages' own: a
+	// bubble wider than the chat would keep its row, and itself, too wide.
+	if (messages_scroll == nullptr || !messages_scroll->is_inside_tree()) {
+		return;
+	}
+	LocalVector<ObjectID> alive;
+	for (const ObjectID &id : user_bubble_texts) {
+		Control *text = Object::cast_to<Control>(ObjectDB::get_instance(id));
+		if (text == nullptr) {
+			continue;
+		}
+		alive.push_back(id);
+		Control *bubble = Object::cast_to<Control>(text->get_parent());
+		Control *row = bubble != nullptr ? Object::cast_to<Control>(bubble->get_parent()) : nullptr;
+		if (row == nullptr || !row->is_inside_tree()) {
+			continue;
+		}
+		const float natural = text->get_meta(SNAME("_natural_width"), 40.0f);
+		float frame = 0.0f;
+		const Ref<StyleBox> style = bubble->get_theme_stylebox(SceneStringName(panel));
+		if (style.is_valid()) {
+			frame = style->get_minimum_size().x;
+		}
+		const float inset = MAX(0.0f, row->get_global_position().x - messages_scroll->get_global_position().x);
+		// The scroll grows to its content's minimum; the area around it is
+		// the chat's real width.
+		const Control *area = Object::cast_to<Control>(messages_scroll->get_parent());
+		const float visible = area != nullptr ? area->get_size().x : messages_scroll->get_size().x;
+		const float gap = row->get_theme_constant(SNAME("separation"), SNAME("HBoxContainer"));
+		const float room = visible - inset * 2.0f - 14.0f * EDSCALE - 80.0f * EDSCALE - gap - frame;
+		const float width = MAX(40.0f * EDSCALE, MIN(natural, room));
+		if (!Math::is_equal_approx(text->get_custom_minimum_size().x, width)) {
+			text->set_custom_minimum_size(Size2(width, 0));
+		}
+	}
+	user_bubble_texts = alive;
 }
 
 void LagoonicChatView::upsert_assistant_message(const String &p_msg_id, const String &p_text) {
@@ -3078,6 +3123,7 @@ LagoonicChatView::LagoonicChatView() {
 	messages_scroll = memnew(ScrollContainer);
 	messages_scroll->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
 	messages_area->add_child(messages_scroll);
+	messages_area->connect(SceneStringName(resized), callable_mp(this, &LagoonicChatView::_fit_user_bubbles));
 
 	fade_overlay = memnew(Control);
 	fade_overlay->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
