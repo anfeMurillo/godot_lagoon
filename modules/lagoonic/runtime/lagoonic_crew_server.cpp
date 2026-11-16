@@ -40,6 +40,7 @@ void LagoonicCrewServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_port"), &LagoonicCrewServer::get_port);
 	ClassDB::bind_method(D_METHOD("get_url"), &LagoonicCrewServer::get_url);
 	ClassDB::bind_method(D_METHOD("get_authorization"), &LagoonicCrewServer::get_authorization);
+	ClassDB::bind_method(D_METHOD("get_boss_authorization"), &LagoonicCrewServer::get_boss_authorization);
 	ClassDB::bind_method(D_METHOD("start"), &LagoonicCrewServer::start);
 	ClassDB::bind_method(D_METHOD("stop"), &LagoonicCrewServer::stop);
 	ClassDB::bind_method(D_METHOD("poll"), &LagoonicCrewServer::poll);
@@ -60,6 +61,10 @@ String LagoonicCrewServer::get_authorization() const {
 	return "Bearer " + token;
 }
 
+String LagoonicCrewServer::get_boss_authorization() const {
+	return "Bearer " + boss_token;
+}
+
 // ---------------------------------------------------------------- lifecycle
 
 Error LagoonicCrewServer::start() {
@@ -67,6 +72,7 @@ Error LagoonicCrewServer::start() {
 		return OK;
 	}
 	token = _make_token();
+	boss_token = _make_token();
 	server.instantiate();
 	Error err = server->listen(0, IPAddress("127.0.0.1"));
 	if (err != OK) {
@@ -158,9 +164,11 @@ void LagoonicCrewServer::_service_client(int p_idx) {
 			_close_client(p_idx);
 			return;
 		}
-		String &pending = clients.write[p_idx].pending;
-		pending += String::utf8((const char *)buf.ptr(), to_read);
-		if ((uint64_t)pending.length() > MAX_LINE_BYTES + 4096) {
+		// Keep raw bytes: Content-Length counts bytes, and a UTF-8 character
+		// may be split between two reads.
+		Vector<uint8_t> &pending = clients.write[p_idx].pending;
+		pending.append_array(buf);
+		if ((uint64_t)pending.size() > MAX_LINE_BYTES + 4096) {
 			// Never-completing flood: drop without answering.
 			_close_client(p_idx);
 			return;
@@ -177,7 +185,8 @@ void LagoonicCrewServer::_service_client(int p_idx) {
 	}
 	(void)header_end;
 	(void)total_len;
-	String raw = clients[p_idx].pending;
+	const Vector<uint8_t> &bytes = clients[p_idx].pending;
+	String raw = String::utf8((const char *)bytes.ptr(), total_len);
 	_handle_request(p_idx, raw);
 }
 
@@ -188,12 +197,26 @@ void LagoonicCrewServer::_close_client(int p_idx) {
 	clients.remove_at(p_idx);
 }
 
-bool LagoonicCrewServer::_request_complete(const String &p_pending, int &r_header_end, int &r_total_len) const {
-	r_header_end = p_pending.find("\r\n\r\n");
-	if (r_header_end < 0) {
-		return (uint64_t)p_pending.length() > MAX_LINE_BYTES;
+bool LagoonicCrewServer::_request_complete(const Vector<uint8_t> &p_pending, int &r_header_end, int &r_total_len) const {
+	// Works on bytes, never on decoded characters: Content-Length is a byte
+	// count, and a body with accents has more bytes than characters.
+	r_header_end = -1;
+	const uint8_t *data = p_pending.ptr();
+	const int size = p_pending.size();
+	for (int i = 0; i + 3 < size; i++) {
+		if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' && data[i + 3] == '\n') {
+			r_header_end = i;
+			break;
+		}
 	}
-	String head = p_pending.substr(0, r_header_end);
+	if (r_header_end < 0) {
+		if ((uint64_t)size > MAX_LINE_BYTES) {
+			r_total_len = size; // Oversized header: let _handle_request refuse it.
+			return true;
+		}
+		return false;
+	}
+	String head = String::utf8((const char *)data, r_header_end);
 	int content_len = 0;
 	Vector<String> lines = head.split("\r\n");
 	for (int i = 1; i < lines.size(); i++) {
@@ -210,7 +233,7 @@ bool LagoonicCrewServer::_request_complete(const String &p_pending, int &r_heade
 		content_len = 0;
 	}
 	r_total_len = r_header_end + 4 + content_len;
-	return p_pending.length() >= r_total_len;
+	return size >= r_total_len;
 }
 
 void LagoonicCrewServer::_answer(int p_idx, int p_status, const String &p_status_text, const String &p_body, const String &p_content_type) {
@@ -288,7 +311,8 @@ void LagoonicCrewServer::_handle_request(int p_idx, const String &p_raw) {
 		_answer(p_idx, 404, "Not Found", "", "text/plain");
 		return;
 	}
-	if (_dict_string(headers, "authorization", "") != get_authorization()) {
+	const String auth = _dict_string(headers, "authorization", "");
+	if (auth != get_authorization() && auth != get_boss_authorization()) {
 		_answer(p_idx, 401, "Unauthorized", "", "text/plain");
 		return;
 	}
@@ -297,7 +321,9 @@ void LagoonicCrewServer::_handle_request(int p_idx, const String &p_raw) {
 		_answer(p_idx, 400, "Bad Request", "", "text/plain");
 		return;
 	}
+	request_from_boss = auth == get_boss_authorization();
 	String reply = handle_crew_message(parsed);
+	request_from_boss = false;
 	if (reply.is_empty()) {
 		_answer(p_idx, 202, "Accepted", "", "text/plain");
 		return;
@@ -352,20 +378,12 @@ String LagoonicCrewServer::handle_crew_message(const Dictionary &p_message) cons
 }
 
 Array LagoonicCrewServer::_build_tool_list() const {
-	Vector<String> workers;
-	if (tools != nullptr) {
-		workers = tools->crew_worker_names();
-	}
-	String first = workers.is_empty() ? String() : workers[0];
-
 	Dictionary worker_prop;
 	worker_prop["type"] = "string";
-	Array worker_enum;
-	for (const String &w : workers) {
-		worker_enum.push_back(w);
-	}
-	worker_prop["enum"] = worker_enum;
-	worker_prop["description"] = "Which worker does it. Default: " + first + ".";
+	// No enum: agents cache this schema for the whole session, but the user
+	// can change the workers at any time. The call checks the live list and
+	// answers an unknown name with the current workers.
+	worker_prop["description"] = "Which worker does it, by name (the workers of this round are listed in your instructions). Default: the first worker.";
 
 	Dictionary title_prop;
 	title_prop["type"] = "string";
@@ -375,8 +393,13 @@ Array LagoonicCrewServer::_build_tool_list() const {
 	task_prop["type"] = "string";
 	task_prop["description"] = "The full spec: target, the change, constraints, which files it may edit, and the evidence that proves it is done. The worker sees nothing else.";
 
+	Dictionary model_prop;
+	model_prop["type"] = "string";
+	model_prop["description"] = "Model for this task, as list_models shows it or in plain words (\"hydrogen high\", \"gpt-6-luna\"); an effort word (low, medium, high, xhigh, max) sets the reasoning effort. Leave it out to use the worker's default model.";
+
 	Dictionary start_props;
 	start_props["worker"] = worker_prop;
+	start_props["model"] = model_prop;
 	start_props["title"] = title_prop;
 	start_props["task"] = task_prop;
 	Dictionary start_schema;
@@ -388,7 +411,7 @@ Array LagoonicCrewServer::_build_tool_list() const {
 
 	Dictionary start_tool;
 	start_tool["name"] = "start_worker";
-	start_tool["description"] = "Hand one self-contained task to a worker agent. Workers start after you end your turn, run one at a time, and their reports come back to you as your next message. Start every independent task, then end your turn; never wait or poll.";
+	start_tool["description"] = "Hand one self-contained task to a worker agent. Workers start after you end your turn and run in parallel, so give each task different files; their reports come back to you as your next message. Start every independent task, then end your turn; never wait or poll.";
 	start_tool["inputSchema"] = start_schema;
 
 	Dictionary list_schema;
@@ -396,11 +419,74 @@ Array LagoonicCrewServer::_build_tool_list() const {
 	list_schema["properties"] = Dictionary();
 	Dictionary list_tool;
 	list_tool["name"] = "list_workers";
-	list_tool["description"] = "The worker tasks of this round and their status.";
+	list_tool["description"] = "The worker tasks of this round: status, worker and the model the worker really runs (as the worker reported it when it started).";
 	list_tool["inputSchema"] = list_schema;
 
 	Array out;
 	out.push_back(start_tool);
+
+	Dictionary stop_task_prop;
+	stop_task_prop["type"] = "integer";
+	stop_task_prop["description"] = "Number of the task to stop (from list_workers). Leave it out and set all to stop every worker task.";
+	Dictionary stop_all_prop;
+	stop_all_prop["type"] = "boolean";
+	stop_all_prop["description"] = "true stops every running and queued worker task.";
+	Dictionary stop_props;
+	stop_props["task"] = stop_task_prop;
+	stop_props["all"] = stop_all_prop;
+	Dictionary stop_schema;
+	stop_schema["type"] = "object";
+	stop_schema["properties"] = stop_props;
+	Dictionary stop_tool;
+	stop_tool["name"] = "stop_worker";
+	stop_tool["description"] = "Stop a worker task that is running or queued (or all of them). The worker stops right away and keeps what it already wrote; its report says it was stopped.";
+	stop_tool["inputSchema"] = stop_schema;
+	out.push_back(stop_tool);
+
+	Dictionary models_worker_prop;
+	models_worker_prop["type"] = "string";
+	models_worker_prop["description"] = "Worker name. Leave it out to list every worker's models.";
+	Dictionary models_props;
+	models_props["worker"] = models_worker_prop;
+	Dictionary models_schema;
+	models_schema["type"] = "object";
+	models_schema["properties"] = models_props;
+	Dictionary models_tool;
+	models_tool["name"] = "list_models";
+	models_tool["description"] = "The models each worker offers (asked from the worker itself) and its default, to pick the model argument of start_worker.";
+	models_tool["inputSchema"] = models_schema;
+	out.push_back(models_tool);
+
+	Dictionary clear_schema;
+	clear_schema["type"] = "object";
+	clear_schema["properties"] = Dictionary();
+	Dictionary clear_tool;
+	clear_tool["name"] = "clear_workers";
+	clear_tool["description"] = "Clears the finished, failed and stopped tasks from the team (list_workers and the user's team panel). Running and queued tasks stay; their files are not touched.";
+	clear_tool["inputSchema"] = clear_schema;
+	out.push_back(clear_tool);
+
+	Dictionary msg_task_prop;
+	msg_task_prop["type"] = "integer";
+	msg_task_prop["description"] = "Number of the running or queued task (from list_workers).";
+	Dictionary msg_text_prop;
+	msg_text_prop["type"] = "string";
+	msg_text_prop["description"] = "What changes or what to add to its order. The worker keeps everything it already did.";
+	Dictionary msg_props;
+	msg_props["task"] = msg_task_prop;
+	msg_props["message"] = msg_text_prop;
+	Dictionary msg_schema;
+	msg_schema["type"] = "object";
+	msg_schema["properties"] = msg_props;
+	Array msg_required;
+	msg_required.push_back("task");
+	msg_required.push_back("message");
+	msg_schema["required"] = msg_required;
+	Dictionary msg_tool;
+	msg_tool["name"] = "message_worker";
+	msg_tool["description"] = "Updates the order of a worker task without stopping it: the worker gets the new instructions in the middle of its work (Codex, OpenCode) or right after its current step (other agents), and keeps what it already did.";
+	msg_tool["inputSchema"] = msg_schema;
+	out.push_back(msg_tool);
 	out.push_back(list_tool);
 	return out;
 }
@@ -430,7 +516,53 @@ Dictionary LagoonicCrewServer::_call_tool(const Dictionary &p_params) const {
 			return _text_result("No worker agent is set up. Do the task yourself.", true);
 		}
 		String error;
-		String msg = tools->crew_start_worker(title, spec, worker, error);
+		const String model = _dict_string(args, "model", "").strip_edges();
+		String msg = tools->crew_start_worker(title, spec, worker, model, request_from_boss, error);
+		if (!error.is_empty()) {
+			return _text_result(error, true);
+		}
+		return _text_result(msg, false);
+	} else if (tool_name == "message_worker") {
+		if (tools == nullptr) {
+			return _text_result("No worker agent is set up.", true);
+		}
+		const Variant task_v = args.get("task", Variant());
+		const int number = (task_v.get_type() == Variant::INT || task_v.get_type() == Variant::FLOAT) ? int(task_v) : 0;
+		const String message = _dict_string(args, "message", "").strip_edges();
+		if (number <= 0 || message.is_empty()) {
+			return _text_result("Give the task number and the message.", true);
+		}
+		String error;
+		const String msg = tools->crew_message_worker(number, message, error);
+		if (!error.is_empty()) {
+			return _text_result(error, true);
+		}
+		return _text_result(msg, false);
+	} else if (tool_name == "clear_workers") {
+		if (tools == nullptr) {
+			return _text_result("No worker agent is set up.", true);
+		}
+		return _text_result(tools->crew_clear_workers(), false);
+	} else if (tool_name == "list_models") {
+		if (tools == nullptr) {
+			return _text_result("No worker agent is set up.", true);
+		}
+		return _text_result(tools->crew_list_models(_dict_string(args, "worker", "").strip_edges()), false);
+	} else if (tool_name == "stop_worker") {
+		if (tools == nullptr) {
+			return _text_result("No worker agent is set up.", true);
+		}
+		int number = 0;
+		const Variant task_v = args.get("task", Variant());
+		if (task_v.get_type() == Variant::INT || task_v.get_type() == Variant::FLOAT) {
+			number = int(task_v);
+		}
+		const bool all = bool(args.get("all", false));
+		if (number <= 0 && !all) {
+			return _text_result("Say which task to stop (task) or set all to true.", true);
+		}
+		String error;
+		const String msg = tools->crew_stop_worker(all ? 0 : number, error);
 		if (!error.is_empty()) {
 			return _text_result(error, true);
 		}
@@ -447,8 +579,9 @@ Dictionary LagoonicCrewServer::_call_tool(const Dictionary &p_params) const {
 					}
 					lines += "#" + String::num_int64(int64_t(list[i].get("number", 0))) +
 							" [" + String(list[i].get("status", "")) + "] " +
-							String(list[i].get("worker_name", "")) + ": " +
-							String(list[i].get("title", ""));
+							String(list[i].get("worker_name", "")) +
+							(String(list[i].get("model", "")).is_empty() ? String() : " (model: " + String(list[i].get("model", "")) + ")") +
+							": " + String(list[i].get("title", ""));
 				}
 				text = lines;
 			}

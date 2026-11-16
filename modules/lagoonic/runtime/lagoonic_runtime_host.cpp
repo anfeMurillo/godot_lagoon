@@ -30,6 +30,7 @@
 /**************************************************************************/
 
 #include "lagoonic_runtime_host.h"
+#include "lagoonic_model_match.h"
 
 #include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
@@ -43,7 +44,10 @@
 #include "lagoonic_mcp_locator.h"
 
 #include "core/io/dir_access.h"
+#include "core/crypto/crypto_core.h"
 #include "core/io/file_access.h"
+#include "core/crypto/crypto.h"
+#include "core/io/http_client.h"
 #include "core/io/json.h"
 #include "core/math/math_funcs.h"
 #include "core/os/time.h"
@@ -59,63 +63,241 @@
 // adapter command per agent id (FIX-C territory, see DOCK_WIRING.md).
 // ---------------------------------------------------------------------------
 
+namespace {
+String lagoonic_find_on_host(const String &p_bin, const Vector<String> &p_dirs); // Defined below.
+} // namespace
+
+// Worker turns are polled every 500 ms: up to 30 min, and without SSE the
+// turn ends after 60 s with no new text and no tool running.
+static constexpr int WORKER_TURN_POLLS = 3600;
+static constexpr int WORKER_QUIET_POLLS = 120;
+
 class LagoonicHostCrewRunner : public LagoonicCrewRunner {
+	// One running worker task. Tasks of a round run in parallel, each on its
+	// own thread, so every task keeps its own state (keyed by task number).
+	struct WorkerState {
+		String session; // Ephemeral OpenCode session, if the worker is OpenCode.
+		Ref<LagoonicAcpRunner> runner; // ACP / codex app-server turn, otherwise.
+		bool abort_requested = false;
+		// OpenCode's own word on the session (SSE session.status), so the
+		// turn ends when OpenCode says so, not when its text pauses.
+		bool status_seen = false;
+		bool was_busy = false;
+		bool idle = false;
+	};
+
 	LagoonicRuntimeHost *host = nullptr;
 	mutable Mutex worker_mutex;
-	String worker_session; // Ephemeral OpenCode session of the running worker.
-	Ref<LagoonicAcpRunner> worker_runner; // ACP worker turn in progress, if any.
-	bool worker_abort_requested = false;
+	HashMap<int, WorkerState> workers; // Task number -> state.
 
-public:
-	explicit LagoonicHostCrewRunner(LagoonicRuntimeHost *p_host) :
-			host(p_host) {}
+	// list_models: what each worker offers, asked once in the background and
+	// refreshed by every task (the session states its models).
+	Mutex catalog_mutex;
+	HashMap<String, String> catalog; // worker id -> text for the boss.
+	HashSet<String> probing;
+	Vector<Thread *> probe_threads;
+	struct ProbeJob {
+		LagoonicHostCrewRunner *self = nullptr;
+		String worker_id;
+	};
 
-	virtual void crew_emit_chat(const String &p_session_id, const String &p_text) override {
-		if (host != nullptr) {
-			host->call_deferred(SNAME("_crew_emit_chat"), p_session_id, p_text);
+	static String _catalog_text(const Array &p_models, const String &p_default, const Array &p_efforts) {
+		if (p_models.is_empty()) {
+			return "It does not let Lagoonic choose a model; it uses its own default.";
 		}
-	}
-
-	virtual void crew_emit_error(const String &p_session_id, const String &p_message) override {
-		if (host != nullptr) {
-			host->call_deferred(SNAME("_crew_emit_error"), p_session_id, p_message);
+		String text = "models: " + LagoonicModelMatch::describe(p_models) + ".";
+		if (!p_default.is_empty()) {
+			text += " Default: " + p_default + ".";
 		}
-	}
-
-	virtual String crew_run_worker(const String &p_worker_id, const String &p_prompt, const String &p_title, int p_number, const String &p_boss_session_id, String &r_error) override {
-		(void)p_boss_session_id;
-		if (host == nullptr) {
-			r_error = "Runtime host is gone.";
-			return String();
-		}
-		if (p_worker_id != "opencode") {
-			// Claude Code, Codex...: one silent ACP turn; its text is the report.
-			Ref<LagoonicAcpRunner> runner;
-			runner.instantiate();
-			worker_mutex.lock();
-			worker_runner = runner;
-			worker_abort_requested = false;
-			worker_mutex.unlock();
-			const String report = host->acp_worker_turn(p_worker_id, p_prompt, runner, r_error);
-			worker_mutex.lock();
-			worker_runner.unref();
-			const bool aborted = worker_abort_requested;
-			worker_mutex.unlock();
-			if (aborted && r_error.is_empty()) {
-				r_error = "Worker turn aborted.";
+		if (!p_efforts.is_empty()) {
+			PackedStringArray names;
+			for (int i = 0; i < p_efforts.size(); i++) {
+				names.push_back(String(p_efforts[i]));
 			}
-			return report;
+			text += " Efforts: " + String(", ").join(names) + ".";
 		}
-		if (host == nullptr) {
-			r_error = "Runtime host is gone.";
-			return String();
+		return text;
+	}
+
+	void _store_catalog(const String &p_worker_id, const String &p_text) {
+		MutexLock lock(catalog_mutex);
+		catalog[p_worker_id] = p_text;
+		probing.erase(p_worker_id);
+	}
+
+	static void _probe_entry(void *p_userdata) {
+		ProbeJob *job = static_cast<ProbeJob *>(p_userdata);
+		job->self->_probe(job->worker_id);
+		memdelete(job);
+	}
+
+	// Asks the worker itself which models it offers (background thread).
+	void _probe(const String &p_worker_id) {
+		const String dir = host->get_project_dir();
+		if (p_worker_id == "opencode") {
+			_store_catalog(p_worker_id, _catalog_text(_opencode_models(), host->get_default_model(), Array()));
+			return;
 		}
+		static const String npm_prefix = LagoonicCodingAgents::npm_global_prefix();
+		const Vector<String> dirs = LagoonicCodingAgents::host_search_dirs(npm_prefix);
+		String path_value;
+		for (int i = 0; i < dirs.size(); i++) {
+			if (!dirs[i].is_empty()) {
+				path_value += (path_value.is_empty() ? "" : (LagoonicCodingAgents::is_windows() ? ";" : ":")) + dirs[i];
+			}
+		}
+		Dictionary env;
+		env["PATH"] = path_value;
+		Ref<LagoonicAcpRunner> runner;
+		runner.instantiate();
+		const String cwd = dir.is_empty() ? OS::get_singleton()->get_user_data_dir() : dir;
+		if (p_worker_id == "codex") {
+			const String bin = lagoonic_find_on_host("codex", dirs);
+			if (bin.is_empty()) {
+				_store_catalog(p_worker_id, "Codex CLI is not installed.");
+				return;
+			}
+			const Array models = runner->probe_codex_models(bin, cwd, env);
+			Array efforts;
+			if (!models.is_empty()) {
+				efforts = Dictionary(models[0]).get("efforts", Array());
+			}
+			_store_catalog(p_worker_id, _catalog_text(models, String(), efforts));
+			return;
+		}
+		String bin, error;
+		PackedStringArray args;
+		if (!host->_resolve_acp(p_worker_id, bin, args, path_value, error)) {
+			_store_catalog(p_worker_id, error);
+			return;
+		}
+		LagoonicRuntimeHost::_add_acp_env(p_worker_id, env);
+		const Array options = runner->probe_options(bin, args, cwd, env);
+		Array models;
+		String current;
+		Array efforts;
+		for (int i = 0; i < options.size(); i++) {
+			const Dictionary option = options[i];
+			const String category = option.get("category", "");
+			const Array values = option.get("values", Array());
+			if (category == "model" && models.is_empty()) {
+				current = option.get("current", "");
+				for (int v = 0; v < values.size(); v++) {
+					Dictionary row;
+					row["value"] = Dictionary(values[v]).get("value", "");
+					row["name"] = Dictionary(values[v]).get("name", "");
+					models.push_back(row);
+				}
+			} else if ((category == "thought_level" || String(option.get("id", "")).contains("effort")) && efforts.is_empty()) {
+				for (int v = 0; v < values.size(); v++) {
+					efforts.push_back(Dictionary(values[v]).get("value", ""));
+				}
+			}
+		}
+		_store_catalog(p_worker_id, options.is_empty() ? String("Could not ask it for its models (is it installed and signed in?).") : _catalog_text(models, current, efforts));
+	}
+
+	// OpenCode's models as {value: "provider/model", name}.
+	Array _opencode_models() {
+		Array out;
+		Ref<LagoonicOpenCodeClient> client = host->get_client();
+		const String dir = host->get_project_dir();
+		if (client.is_null() || dir.is_empty()) {
+			return out;
+		}
+		Mutex *m = host->get_client_mutex();
+		m->lock();
+		const Array providers = client->lagoonic_list_providers(dir);
+		m->unlock();
+		for (int i = 0; i < providers.size(); i++) {
+			const Array models = Dictionary(providers[i]).get("models", Array());
+			for (int k = 0; k < models.size(); k++) {
+				const Dictionary model = models[k];
+				Dictionary row;
+				row["value"] = String(model.get("provider_id", "")) + "/" + String(model.get("id", ""));
+				row["name"] = model.get("name", "");
+				out.push_back(row);
+			}
+		}
+		return out;
+	}
+
+	bool _aborted(int p_number) const {
+		MutexLock lock(worker_mutex);
+		const WorkerState *state = workers.getptr(p_number);
+		return state == nullptr || state->abort_requested;
+	}
+
+	void _note_model(int p_number, const String &p_model) {
+		if (host == nullptr || p_model.is_empty()) {
+			return;
+		}
+		const Ref<LagoonicCrewOrchestrator> crew = host->get_crew();
+		if (crew.is_valid()) {
+			crew->note_task_model(p_model, p_number);
+		}
+	}
+
+	String _run_acp_worker(const String &p_worker_id, const String &p_model, const String &p_prompt, int p_number, String &r_error) {
+		// Claude Code, Codex, Antigravity...: one silent turn; its text is the report.
+		Ref<LagoonicAcpRunner> runner;
+		runner.instantiate();
+		runner->set_requested_model(p_model);
+		// The agent states its model when the session opens: show it live.
+		const Ref<LagoonicCrewOrchestrator> crew = host->get_crew();
+		if (crew.is_valid()) {
+			runner->set_model_callback(callable_mp(crew.ptr(), &LagoonicCrewOrchestrator::note_task_model).bind(p_number));
+		}
+		{
+			MutexLock lock(worker_mutex);
+			WorkerState *state = workers.getptr(p_number);
+			if (state == nullptr || state->abort_requested) {
+				r_error = "Worker turn aborted.";
+				return String();
+			}
+			state->runner = runner;
+		}
+		const String report = host->acp_worker_turn(p_worker_id, p_prompt, runner, r_error);
+		// The session stated the models it offers: keep them for list_models.
+		const Array offered = runner->get_offered_models();
+		if (!offered.is_empty()) {
+			MutexLock lock(catalog_mutex);
+			if (!catalog.has(p_worker_id)) {
+				// The fuller probe (default, efforts) wins when it already ran.
+				catalog[p_worker_id] = _catalog_text(offered, String(), Array());
+			}
+		}
+		if (_aborted(p_number) && r_error.is_empty()) {
+			r_error = "Worker turn aborted.";
+		}
+		return report;
+	}
+
+	String _run_opencode_worker(const String &p_model, const String &p_prompt, const String &p_title, int p_number, String &r_error) {
 		Ref<LagoonicOpenCodeClient> client = host->get_client();
 		const String dir = host->get_project_dir();
 		if (client.is_null() || dir.is_empty()) {
 			r_error = "Server is not up; cannot run a crew worker.";
 			return String();
 		}
+		// Lagoonic sends no model with the prompt, so OpenCode uses the
+		// default model Lagoonic wrote in its config.
+		String model = host->get_default_model();
+		String provider_id;
+		String model_id;
+		if (!p_model.strip_edges().is_empty()) {
+			// The model the boss asked for, among OpenCode's providers.
+			const Array models = _opencode_models();
+			const String value = LagoonicModelMatch::best(models, p_model);
+			if (value.is_empty()) {
+				r_error = "\"" + p_model + "\" is not one of OpenCode's models: " + LagoonicModelMatch::describe(models) + ".";
+				return String();
+			}
+			provider_id = value.get_slice("/", 0);
+			model_id = value.substr(provider_id.length() + 1);
+			model = value;
+		}
+		_note_model(p_number, model.is_empty() ? String::utf8("predeterminado de OpenCode") : model);
 		const String title = "Crew worker #" + itos(p_number) + ": " + p_title.left(80);
 		String sid;
 		{
@@ -129,10 +311,13 @@ public:
 			r_error = "Could not create an ephemeral worker session.";
 			return String();
 		}
-		worker_mutex.lock();
-		worker_session = sid;
-		worker_abort_requested = false;
-		worker_mutex.unlock();
+		{
+			MutexLock lock(worker_mutex);
+			WorkerState *state = workers.getptr(p_number);
+			if (state != nullptr) {
+				state->session = sid;
+			}
+		}
 
 		Array parts;
 		Dictionary text_part;
@@ -144,7 +329,7 @@ public:
 		{
 			Mutex *m = host->get_client_mutex();
 			m->lock();
-			const Dictionary res = client->lagoonic_prompt_parts_async(sid, dir, parts, String(), String(), String());
+			const Dictionary res = client->lagoonic_prompt_parts_async(sid, dir, parts, provider_id, model_id, String());
 			m->unlock();
 			if (!bool(res.get("ok", false))) {
 				r_error = String(res.get("error", "Worker prompt failed."));
@@ -152,26 +337,36 @@ public:
 				m2->lock();
 				client->lagoonic_delete_session(dir, sid);
 				m2->unlock();
-				worker_mutex.lock();
-				worker_session = String();
-				worker_mutex.unlock();
 				return String();
 			}
 		}
-		// Wait for the worker's assistant text to stabilize (poll the
-		// ephemeral session; the SSE stream is fanned out to the boss chat
-		// only, so direct polling is the way to read a worker turn).
+		// The turn ends when OpenCode reports the session idle (SSE
+		// session.status, noted by the host). A worker is silent while it
+		// runs tools, so a pause in its text never means it is done; only
+		// without any status event (no SSE) does a long, tool-free pause
+		// count as the end. The report is the session's assistant text.
 		String last_text;
 		int stable_polls = 0;
-		for (int i = 0; i < 360; i++) { // 360 x 500 ms = 180 s budget.
-			worker_mutex.lock();
-			const bool abort_hit = worker_abort_requested;
-			worker_mutex.unlock();
+		bool tools_running = false;
+		for (int i = 0; i < WORKER_TURN_POLLS; i++) {
+			bool abort_hit = true;
+			bool status_seen = false;
+			bool idle = false;
+			{
+				MutexLock lock(worker_mutex);
+				const WorkerState *state = workers.getptr(p_number);
+				if (state != nullptr) {
+					abort_hit = state->abort_requested;
+					status_seen = state->status_seen;
+					idle = state->idle;
+				}
+			}
 			if (abort_hit) {
 				r_error = "Worker turn aborted.";
 				break;
 			}
 			String text;
+			tools_running = false;
 			Mutex *m = host->get_client_mutex();
 			m->lock();
 			const Array messages = client->lagoonic_list_messages(sid, dir);
@@ -192,13 +387,23 @@ public:
 					const Dictionary part = msg_parts[pi];
 					if (String(part.get("type", "")) == "text") {
 						text += String(part.get("text", ""));
+					} else if (String(part.get("type", "")) == "tool") {
+						const Variant state_v = part.get("state", Variant());
+						const String tool_status = state_v.get_type() == Variant::DICTIONARY ? String(Dictionary(state_v).get("status", "")) : String();
+						if (tool_status == "pending" || tool_status == "running") {
+							tools_running = true;
+						}
 					}
 				}
 			}
-			if (!text.is_empty() && text == last_text) {
+			if (status_seen && idle && !tools_running) {
+				report = text; // OpenCode says the turn is over.
+				break;
+			}
+			if (!text.is_empty() && text == last_text && !tools_running) {
 				stable_polls++;
-				if (stable_polls >= 6) { // 3 s without growth: turn is done.
-					report = text;
+				if (!status_seen && stable_polls >= WORKER_QUIET_POLLS) {
+					report = text; // No SSE: a long pause with no tool running.
 					break;
 				}
 			} else {
@@ -206,6 +411,14 @@ public:
 				last_text = text;
 			}
 			OS::get_singleton()->delay_usec(500000);
+		}
+		if (report.is_empty() && r_error.is_empty()) {
+			// Out of time: stop the worker before its session is deleted.
+			r_error = "The worker did not finish in time.";
+			Mutex *m = host->get_client_mutex();
+			m->lock();
+			client->lagoonic_abort(sid, dir);
+			m->unlock();
 		}
 		if (report.is_empty()) {
 			report = last_text;
@@ -216,31 +429,186 @@ public:
 			client->lagoonic_delete_session(dir, sid);
 			m->unlock();
 		}
-		worker_mutex.lock();
-		worker_session = String();
-		worker_mutex.unlock();
 		if (report.is_empty() && r_error.is_empty()) {
 			r_error = "Worker turn timed out with no answer.";
 		}
 		return report;
 	}
 
-	virtual void crew_abort_worker() override {
-		worker_mutex.lock();
-		worker_abort_requested = true;
-		const String sid = worker_session;
-		const Ref<LagoonicAcpRunner> acp = worker_runner;
-		worker_mutex.unlock();
+public:
+	explicit LagoonicHostCrewRunner(LagoonicRuntimeHost *p_host) :
+			host(p_host) {}
+
+	// Main thread, from every SSE frame: "busy", "retry" or "idle".
+	void note_session_status(const String &p_session_id, const String &p_state) {
+		if (p_session_id.is_empty()) {
+			return;
+		}
+		MutexLock lock(worker_mutex);
+		for (KeyValue<int, WorkerState> &kv : workers) {
+			WorkerState &state = kv.value;
+			if (state.session != p_session_id) {
+				continue;
+			}
+			state.status_seen = true;
+			if (p_state == "busy" || p_state == "retry") {
+				state.was_busy = true;
+			}
+			// Idle only ends the turn once the worker has been busy with it.
+			state.idle = state.was_busy && p_state == "idle";
+			return;
+		}
+	}
+
+	virtual void crew_emit_chat(const String &p_session_id, const String &p_text) override {
+		if (host != nullptr) {
+			host->call_deferred(SNAME("_crew_emit_chat"), p_session_id, p_text);
+		}
+	}
+
+	virtual void crew_emit_error(const String &p_session_id, const String &p_message) override {
+		if (host != nullptr) {
+			host->call_deferred(SNAME("_crew_emit_error"), p_session_id, p_message);
+		}
+	}
+
+	// Called from one thread per task (the round runs its tasks in parallel).
+	virtual String crew_model_catalog(const String &p_worker_id, const String &p_worker_name) override {
+		MutexLock lock(catalog_mutex);
+		if (const String *text = catalog.getptr(p_worker_id)) {
+			return *text;
+		}
+		if (!probing.has(p_worker_id) && host != nullptr) {
+			probing.insert(p_worker_id);
+			ProbeJob *job = memnew(ProbeJob);
+			job->self = this;
+			job->worker_id = p_worker_id;
+			Thread *thread = memnew(Thread);
+			thread->start(_probe_entry, job);
+			probe_threads.push_back(thread);
+		}
+		return "Asking " + p_worker_name + " for its models; call list_models again in a few seconds.";
+	}
+
+	~LagoonicHostCrewRunner() {
+		for (Thread *thread : probe_threads) {
+			thread->wait_to_finish();
+			memdelete(thread);
+		}
+	}
+
+	virtual String crew_run_worker(const String &p_worker_id, const String &p_model, const String &p_prompt, const String &p_title, int p_number, const String &p_boss_session_id, String &r_error) override {
+		(void)p_boss_session_id;
+		if (host == nullptr) {
+			r_error = "Runtime host is gone.";
+			return String();
+		}
+		{
+			MutexLock lock(worker_mutex);
+			workers.insert(p_number, WorkerState());
+		}
+		const String report = p_worker_id == "opencode" ? _run_opencode_worker(p_model, p_prompt, p_title, p_number, r_error) : _run_acp_worker(p_worker_id, p_model, p_prompt, p_number, r_error);
+		{
+			MutexLock lock(worker_mutex);
+			workers.erase(p_number);
+		}
+		return report;
+	}
+
+	// More instructions for a running task: OpenCode reads them in its
+	// session right away; ACP / codex runners take them as a steer.
+	virtual bool crew_message_task(int p_number, const String &p_message) override {
+		String session;
+		Ref<LagoonicAcpRunner> acp;
+		{
+			MutexLock lock(worker_mutex);
+			WorkerState *state = workers.getptr(p_number);
+			if (state == nullptr) {
+				return false;
+			}
+			session = state->session;
+			acp = state->runner;
+		}
+		const String text = String::utf8("Nuevas indicaciones del coordinador para esta misma tarea:\n") + p_message;
+		if (acp.is_valid()) {
+			acp->steer(p_message);
+			return true;
+		}
+		if (session.is_empty() || host == nullptr) {
+			return false;
+		}
+		Ref<LagoonicOpenCodeClient> client = host->get_client();
+		if (client.is_null()) {
+			return false;
+		}
+		Array parts;
+		Dictionary part;
+		part["type"] = String("text");
+		part["text"] = text;
+		parts.push_back(part);
+		Mutex *m = host->get_client_mutex();
+		m->lock();
+		const Dictionary res = client->lagoonic_prompt_parts_async(session, host->get_project_dir(), parts, String(), String(), String());
+		m->unlock();
+		return bool(res.get("ok", false));
+	}
+
+	// Stops one task's worker (the user or the boss stopped it).
+	virtual void crew_abort_task(int p_number) override {
+		String session;
+		Ref<LagoonicAcpRunner> acp;
+		{
+			MutexLock lock(worker_mutex);
+			WorkerState *state = workers.getptr(p_number);
+			if (state == nullptr) {
+				return;
+			}
+			state->abort_requested = true;
+			session = state->session;
+			acp = state->runner;
+		}
 		if (acp.is_valid()) {
 			acp->session_cancel(acp->get_acp_session_id());
 		}
-		if (host != nullptr && !sid.is_empty()) {
+		if (host != nullptr && !session.is_empty()) {
 			Ref<LagoonicOpenCodeClient> client = host->get_client();
 			if (client.is_valid()) {
 				Mutex *m = host->get_client_mutex();
 				m->lock();
-				client->lagoonic_abort(sid, host->get_project_dir());
+				client->lagoonic_abort(session, host->get_project_dir());
 				m->unlock();
+			}
+		}
+	}
+
+	// Stops every running worker.
+	virtual void crew_abort_worker() override {
+		Vector<String> sessions;
+		Vector<Ref<LagoonicAcpRunner>> runners;
+		{
+			MutexLock lock(worker_mutex);
+			for (KeyValue<int, WorkerState> &kv : workers) {
+				kv.value.abort_requested = true;
+				if (!kv.value.session.is_empty()) {
+					sessions.push_back(kv.value.session);
+				}
+				if (kv.value.runner.is_valid()) {
+					runners.push_back(kv.value.runner);
+				}
+			}
+		}
+		for (const Ref<LagoonicAcpRunner> &acp : runners) {
+			acp->session_cancel(acp->get_acp_session_id());
+		}
+		if (host != nullptr && !sessions.is_empty()) {
+			Ref<LagoonicOpenCodeClient> client = host->get_client();
+			if (client.is_valid()) {
+				Mutex *m = host->get_client_mutex();
+				for (const String &sid : sessions) {
+					m->lock();
+					client->lagoonic_abort(sid, host->get_project_dir());
+					m->unlock();
+				}
 			}
 		}
 	}
@@ -299,6 +667,10 @@ public:
 
 void LagoonicRuntimeHost::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("ensure_server", "project_dir", "default_model", "secret_env"), &LagoonicRuntimeHost::ensure_server);
+	ClassDB::bind_method(D_METHOD("set_next_attachments", "files"), &LagoonicRuntimeHost::set_next_attachments);
+	ClassDB::bind_method(D_METHOD("refresh_usage"), &LagoonicRuntimeHost::refresh_usage);
+	ClassDB::bind_method(D_METHOD("get_usage"), &LagoonicRuntimeHost::get_usage);
+	ClassDB::bind_method(D_METHOD("is_reading_usage"), &LagoonicRuntimeHost::is_reading_usage);
 	ClassDB::bind_method(D_METHOD("send_prompt", "session_id", "text", "mode", "model", "variant"), &LagoonicRuntimeHost::send_prompt, DEFVAL(String()));
 	ClassDB::bind_method(D_METHOD("abort"), &LagoonicRuntimeHost::abort);
 	ClassDB::bind_method(D_METHOD("respond_permission", "permission_id", "reply"), &LagoonicRuntimeHost::respond_permission);
@@ -347,6 +719,9 @@ LagoonicRuntimeHost::LagoonicRuntimeHost() {
 }
 
 LagoonicRuntimeHost::~LagoonicRuntimeHost() {
+	if (usage_thread.is_started()) {
+		usage_thread.wait_to_finish();
+	}
 	if (crew_poll_hooked && SceneTree::get_singleton() != nullptr) {
 		SceneTree::get_singleton()->disconnect(SNAME("process_frame"), callable_mp(this, &LagoonicRuntimeHost::_poll_crew_server));
 	}
@@ -532,15 +907,505 @@ Error LagoonicRuntimeHost::ensure_server(const String &p_project_dir, const Stri
 	return OK;
 }
 
-Error LagoonicRuntimeHost::send_prompt(const String &p_session_id, const String &p_text, int p_mode, const String &p_model, const String &p_variant) {
+// ---------------------------------------------------------- usage
+
+void LagoonicRuntimeHost::refresh_usage() {
+	if (!usage_running.set_if_clear()) {
+		return; // Already reading.
+	}
+	if (usage_thread.is_started()) {
+		usage_thread.wait_to_finish();
+	}
+	usage_thread.start(&LagoonicRuntimeHost::_usage_thread_main, this);
+}
+
+Dictionary LagoonicRuntimeHost::get_usage() const {
+	MutexLock lock(usage_mutex);
+	return usage_cache.duplicate(true);
+}
+
+void LagoonicRuntimeHost::_usage_thread_main(void *p_userdata) {
+	LagoonicRuntimeHost *self = static_cast<LagoonicRuntimeHost *>(p_userdata);
+	self->_read_usage();
+	self->usage_running.clear();
+}
+
+// kind: "session" (5 h), "weekly" or "monthly"; group: models that share it
+// (Antigravity), "" for the whole plan.
+static Dictionary _usage_window(const String &p_label, double p_used, int64_t p_resets_at, const String &p_kind = String(), const String &p_group = String()) {
+	Dictionary w;
+	w["label"] = p_label;
+	w["kind"] = p_kind;
+	w["group"] = p_group;
+	w["used_percent"] = p_used;
+	w["resets_at"] = p_resets_at; // Unix seconds; 0 = unknown.
+	return w;
+}
+
+static String _usage_duration_label(int64_t p_minutes) {
+	if (p_minutes <= 0) {
+		return String::utf8("Límite");
+	}
+	if (p_minutes % 10080 == 0) {
+		return p_minutes == 10080 ? String::utf8("Semanal") : vformat(String::utf8("%d semanas"), int(p_minutes / 10080));
+	}
+	if (p_minutes % 1440 == 0) {
+		return p_minutes == 1440 ? String::utf8("Diario") : vformat(String::utf8("%d días"), int(p_minutes / 1440));
+	}
+	if (p_minutes % 60 == 0) {
+		return vformat(String::utf8("%d horas"), int(p_minutes / 60));
+	}
+	return vformat(String::utf8("%d min"), int(p_minutes));
+}
+
+// Blocking HTTPS GET with a bearer key (usage thread only). Returns the body.
+static String _https_get(const String &p_host, const String &p_path, const String &p_bearer, int &r_status, const Vector<String> &p_extra_headers = Vector<String>(), int64_t *r_retry_after = nullptr) {
+	r_status = 0;
+	Ref<HTTPClient> http = HTTPClient::create();
+	if (http->connect_to_host(p_host, 443, TLSOptions::client()) != OK) {
+		return String();
+	}
+	const uint64_t deadline = OS::get_singleton()->get_ticks_msec() + 15000;
+	while (http->get_status() == HTTPClient::STATUS_CONNECTING || http->get_status() == HTTPClient::STATUS_RESOLVING) {
+		http->poll();
+		if (OS::get_singleton()->get_ticks_msec() > deadline) {
+			return String();
+		}
+		OS::get_singleton()->delay_usec(20000);
+	}
+	if (http->get_status() != HTTPClient::STATUS_CONNECTED) {
+		return String();
+	}
+	Vector<String> headers;
+	headers.push_back("Authorization: Bearer " + p_bearer);
+	headers.push_back("Accept: application/json");
+	bool has_agent = false;
+	for (const String &h : p_extra_headers) {
+		has_agent = has_agent || h.to_lower().begins_with("user-agent:");
+	}
+	if (!has_agent) {
+		headers.push_back("User-Agent: Lagoonic");
+	}
+	headers.append_array(p_extra_headers);
+	if (http->request(HTTPClient::METHOD_GET, p_path, headers, nullptr, 0) != OK) {
+		return String();
+	}
+	while (http->get_status() == HTTPClient::STATUS_REQUESTING) {
+		http->poll();
+		if (OS::get_singleton()->get_ticks_msec() > deadline) {
+			return String();
+		}
+		OS::get_singleton()->delay_usec(20000);
+	}
+	if (!http->has_response()) {
+		return String();
+	}
+	r_status = http->get_response_code();
+	if (r_retry_after != nullptr) {
+		List<String> response_headers;
+		http->get_response_headers(&response_headers);
+		for (const String &h : response_headers) {
+			if (h.to_lower().begins_with("retry-after:")) {
+				*r_retry_after = h.get_slice(":", 1).strip_edges().to_int();
+			}
+		}
+	}
+	PackedByteArray body;
+	while (http->get_status() == HTTPClient::STATUS_BODY) {
+		http->poll();
+		const PackedByteArray chunk = http->read_response_body_chunk();
+		if (chunk.is_empty()) {
+			OS::get_singleton()->delay_usec(10000);
+		} else {
+			body.append_array(chunk);
+		}
+		if (OS::get_singleton()->get_ticks_msec() > deadline || body.size() > 1000000) {
+			break;
+		}
+	}
+	return String::utf8((const char *)body.ptr(), body.size());
+}
+
+// The OAuth access token of Claude Code, or "" (r_note says why).
+static String _claude_oauth_token(String &r_note) {
+	String json;
+	if (OS::get_singleton()->get_name() == "macOS") {
+		List<String> args;
+		args.push_back("find-generic-password");
+		args.push_back("-s");
+		args.push_back("Claude Code-credentials");
+		args.push_back("-w");
+		String out;
+		int exit_code = -1;
+		if (OS::get_singleton()->execute("/usr/bin/security", args, &out, &exit_code) == OK && exit_code == 0) {
+			json = out.strip_edges();
+		}
+	}
+	if (json.is_empty()) {
+		const String file = LagoonicCodingAgents::home_dir().path_join(".claude").path_join(".credentials.json");
+		if (FileAccess::exists(file)) {
+			json = FileAccess::get_file_as_string(file);
+		}
+	}
+	if (json.is_empty()) {
+		r_note = String::utf8("No encontré la sesión de Claude Code; inicia sesión en Claude Code.");
+		return String();
+	}
+	const Variant parsed = JSON::parse_string(json);
+	const Dictionary oauth = parsed.get_type() == Variant::DICTIONARY ? Dictionary(Dictionary(parsed).get("claudeAiOauth", Dictionary())) : Dictionary();
+	const String token = oauth.get("accessToken", "");
+	const double expires = oauth.get("expiresAt", 0.0); // Milliseconds.
+	if (token.is_empty()) {
+		r_note = String::utf8("Claude Code usa una clave de API, no un plan: no hay límites que mostrar.");
+		return String();
+	}
+	if (expires > 0 && expires < Time::get_singleton()->get_unix_time_from_system() * 1000.0) {
+		r_note = String::utf8("La sesión de Claude Code caducó; abre Claude Code para renovarla.");
+		return String();
+	}
+	return token;
+}
+
+Dictionary LagoonicRuntimeHost::_claude_oauth_usage() {
+	String note;
+	const String token = _claude_oauth_token(note);
+	if (token.is_empty() && note.begins_with(String::utf8("No encontré"))) {
+		return Dictionary(); // Claude Code not signed in: fall back to /usage.
+	}
+	const int64_t now_unix = int64_t(Time::get_singleton()->get_unix_time_from_system());
+	if (!token.is_empty() && now_unix < claude_next_ask) {
+		// Too soon for Anthropic: the last reading, with when it refreshes.
+		Dictionary cached = claude_last_good.is_empty() ? Dictionary() : claude_last_good.duplicate(true);
+		if (cached.is_empty()) {
+			cached["name"] = String("Claude Code");
+			cached["windows"] = Array();
+		}
+		const Dictionary next = Time::get_singleton()->get_datetime_dict_from_unix_time(claude_next_ask + int64_t(Time::get_singleton()->get_time_zone_from_system().get("bias", 0)) * 60);
+		cached["note"] = vformat(String::utf8("Anthropic limita estas consultas: se actualiza a las %02d:%02d."), int(next.get("hour", 0)), int(next.get("minute", 0)));
+		return cached;
+	}
+	Dictionary entry;
+	entry["name"] = String("Claude Code");
+	entry["updated_msec"] = (int64_t)OS::get_singleton()->get_ticks_msec();
+	Array windows;
+	if (!token.is_empty()) {
+		claude_next_ask = now_unix + 15 * 60;
+		int64_t retry_after = 0;
+		Vector<String> extra;
+		extra.push_back("anthropic-beta: oauth-2025-04-20");
+		extra.push_back("User-Agent: claude-code/2.1.0");
+		int status = 0;
+		const String body = _https_get("api.anthropic.com", "/api/oauth/usage", token, status, extra, &retry_after);
+		if (retry_after > 0) {
+			claude_next_ask = now_unix + retry_after;
+		}
+		const Variant v = JSON::parse_string(body);
+		if (status == 200 && v.get_type() == Variant::DICTIONARY) {
+			const Dictionary data = v;
+			const char *keys[2] = { "five_hour", "seven_day" };
+			const char *labels[2] = { "5 horas", "Semanal" };
+			const char *kinds[2] = { "session", "weekly" };
+			for (int k = 0; k < 2; k++) {
+				const Variant w_v = data.get(keys[k], Variant());
+				if (w_v.get_type() != Variant::DICTIONARY) {
+					continue;
+				}
+				const Dictionary w = w_v;
+				const Variant used_v = w.get("utilization", w.get("used_percentage", Variant()));
+				if (used_v.get_type() != Variant::INT && used_v.get_type() != Variant::FLOAT) {
+					continue;
+				}
+				int64_t resets = 0;
+				const String reset = w.get("resets_at", "");
+				if (!reset.is_empty()) {
+					resets = Time::get_singleton()->get_unix_time_from_datetime_string(reset.get_slice(".", 0).get_slice("+", 0).trim_suffix("Z"));
+				}
+				windows.push_back(_usage_window(String::utf8(labels[k]), double(used_v), resets, kinds[k]));
+			}
+		} else {
+			if (status == 429) {
+				const Dictionary next = Time::get_singleton()->get_datetime_dict_from_unix_time(claude_next_ask + int64_t(Time::get_singleton()->get_time_zone_from_system().get("bias", 0)) * 60);
+				note = vformat(String::utf8("Anthropic limita estas consultas: vuelvo a preguntar a las %02d:%02d."), int(next.get("hour", 0)), int(next.get("minute", 0)));
+			} else {
+				note = status == 401 ? String::utf8("La sesión de Claude Code caducó; abre Claude Code para renovarla.") : vformat(String::utf8("Anthropic no respondió (%d)."), status);
+			}
+		}
+	}
+	entry["windows"] = windows;
+	if (!windows.is_empty()) {
+		claude_last_good = entry.duplicate(true);
+		return entry;
+	}
+	if (!claude_last_good.is_empty()) {
+		// Keep the last good reading on screen.
+		Dictionary cached = claude_last_good.duplicate(true);
+		cached["note"] = note;
+		return cached;
+	}
+	entry["note"] = note.is_empty() ? String::utf8("Anthropic no informó límites.") : note;
+	return entry;
+}
+
+void LagoonicRuntimeHost::_read_usage() {
+	static const String npm_prefix = LagoonicCodingAgents::npm_global_prefix();
+	const Vector<String> dirs = LagoonicCodingAgents::host_search_dirs(npm_prefix);
+	String path_value;
+	for (int i = 0; i < dirs.size(); i++) {
+		if (!dirs[i].is_empty()) {
+			path_value += (path_value.is_empty() ? "" : (LagoonicCodingAgents::is_windows() ? ";" : ":")) + dirs[i];
+		}
+	}
+	Dictionary env;
+	env["PATH"] = path_value;
+	String cwd = get_project_dir();
+	if (cwd.is_empty()) {
+		cwd = OS::get_singleton()->get_user_data_dir();
+	}
+	const uint64_t now = OS::get_singleton()->get_ticks_msec();
+
+	// Codex: account/rateLimits/read of its own app-server.
+	const String codex_bin = lagoonic_find_on_host("codex", dirs);
+	if (!codex_bin.is_empty()) {
+		Ref<LagoonicAcpRunner> runner;
+		runner.instantiate();
+		const Dictionary limits = runner->probe_codex_rate_limits(codex_bin, cwd, env);
+		Dictionary entry;
+		entry["name"] = String("Codex");
+		entry["updated_msec"] = (int64_t)now;
+		Array windows;
+		const Dictionary rate = limits.get("rateLimits", Dictionary());
+		for (const char *key : { "primary", "secondary" }) {
+			const Variant w_v = rate.get(key, Variant());
+			if (w_v.get_type() != Variant::DICTIONARY) {
+				continue;
+			}
+			const Dictionary w = w_v;
+			const int64_t minutes = int64_t(w.get("windowDurationMins", 0));
+			const String kind = minutes >= 40000 ? String("monthly") : (minutes >= 1440 ? String("weekly") : String("session"));
+			windows.push_back(_usage_window(_usage_duration_label(minutes), double(w.get("usedPercent", 0)), int64_t(w.get("resetsAt", 0)), kind));
+		}
+		entry["windows"] = windows;
+		const Dictionary account = limits.get("account", Dictionary());
+		String plan = String(rate.get("planType", account.get("planType", "")));
+		entry["plan"] = plan.capitalize();
+		if (limits.has("error")) {
+			entry["note"] = String(limits["error"]);
+		} else if (windows.is_empty()) {
+			entry["note"] = String::utf8("Codex no informó límites (¿sesión iniciada con ChatGPT?).");
+		}
+		MutexLock lock(usage_mutex);
+		usage_cache["codex"] = entry;
+	}
+
+	// Antigravity: `agy -p /usage --output-format json` (its own command, no
+	// model call): groups of models, each with a weekly and a 5-hour bucket.
+	const String agy_bin = lagoonic_find_on_host("agy", dirs);
+	if (!agy_bin.is_empty()) {
+		List<String> agy_args;
+		for (const char *a : { "-p", "/usage", "--output-format", "json", "--print-timeout", "20s" }) {
+			agy_args.push_back(a);
+		}
+		String out;
+		int exit_code = -1;
+		OS::get_singleton()->set_environment("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+		OS::get_singleton()->execute(agy_bin, agy_args, &out, &exit_code, true);
+		Dictionary entry;
+		entry["name"] = String("Antigravity");
+		entry["updated_msec"] = (int64_t)now;
+		Array windows;
+		// The JSON is the last line that parses (the CLI may print notes first).
+		Dictionary parsed;
+		const Vector<String> out_lines = out.split("\n");
+		for (int i = out_lines.size() - 1; i >= 0 && parsed.is_empty(); i--) {
+			const Variant v = out_lines[i].strip_edges().begins_with("{") ? JSON::parse_string(out_lines[i]) : Variant();
+			if (v.get_type() == Variant::DICTIONARY) {
+				parsed = v;
+			}
+		}
+		if (parsed.is_empty()) {
+			const Variant v = JSON::parse_string(out);
+			if (v.get_type() == Variant::DICTIONARY) {
+				parsed = v;
+			}
+		}
+		const Dictionary data = Dictionary(Dictionary(parsed.get("command", Dictionary())).get("data", Dictionary()));
+		const Array groups = data.get("groups", Array());
+		for (int g = 0; g < groups.size(); g++) {
+			const Dictionary group = groups[g];
+			const String group_name = group.get("name", "");
+			const Array buckets = group.get("buckets", Array());
+			for (int b = 0; b < buckets.size(); b++) {
+				const Dictionary bucket = buckets[b];
+				const String window = bucket.get("window", "");
+				const String when = window == "5h" ? String("5 horas") : (window == "weekly" ? String::utf8("Semanal") : String(bucket.get("name", window)));
+				const double remaining = double(bucket.get("remaining_fraction", 1.0));
+				int64_t resets = 0;
+				const String reset_time = bucket.get("reset_time", "");
+				if (!reset_time.is_empty()) {
+					resets = Time::get_singleton()->get_unix_time_from_datetime_string(reset_time.trim_suffix("Z"));
+				}
+				windows.push_back(_usage_window(when, (1.0 - remaining) * 100.0, resets, window == "5h" ? String("session") : String("weekly"), group_name));
+			}
+		}
+		entry["windows"] = windows;
+		if (windows.is_empty()) {
+			entry["note"] = out.contains("Authentication required") ? String::utf8("Inicia sesión en agy para ver tu cuota.") : String::utf8("Antigravity no informó su cuota (actualiza agy a 1.1.11 o más).");
+		}
+		MutexLock lock(usage_mutex);
+		usage_cache["antigravity"] = entry;
+	}
+
+	// OpenCode Go: opencode.ai/zen/go/v1/usage with the key Lagoonic keeps.
+	usage_mutex.lock();
+	const String go_key = opencode_go_key;
+	usage_mutex.unlock();
+	if (!go_key.is_empty()) {
+		Dictionary entry;
+		entry["name"] = String("OpenCode Go");
+		entry["updated_msec"] = (int64_t)now;
+		int status = 0;
+		const String body = _https_get("opencode.ai", "/zen/go/v1/usage", go_key, status);
+		Array windows;
+		const Variant v = JSON::parse_string(body);
+		if (status == 200 && v.get_type() == Variant::DICTIONARY) {
+			const Dictionary usage = Dictionary(v).get("usage", Dictionary());
+			const char *keys[3] = { "rolling", "weekly", "monthly" };
+			const char *labels[3] = { "5 horas", "Semanal", "Mensual" };
+			for (int k = 0; k < 3; k++) {
+				const Variant w_v = usage.get(keys[k], Variant());
+				if (w_v.get_type() != Variant::DICTIONARY) {
+					continue;
+				}
+				const Dictionary w = w_v;
+				const String reset = w.get("resetsAt", "");
+				int64_t resets = 0;
+				if (!reset.is_empty()) {
+					resets = Time::get_singleton()->get_unix_time_from_datetime_string(reset.get_slice(".", 0).trim_suffix("Z"));
+				}
+				static const char *kinds[3] = { "session", "weekly", "monthly" };
+				windows.push_back(_usage_window(String::utf8(labels[k]), double(w.get("percent", 0)), resets, kinds[k]));
+			}
+		}
+		entry["windows"] = windows;
+		if (windows.is_empty()) {
+			entry["note"] = status == 401 ? String::utf8("La clave de OpenCode Go no vale; revísala en Configuración › Proveedores.") : (status == 403 ? String::utf8("Esta cuenta no tiene plan OpenCode Go.") : vformat(String::utf8("OpenCode Go no respondió (%d)."), status));
+		}
+		MutexLock lock(usage_mutex);
+		usage_cache["opencode"] = entry;
+	}
+
+	// Claude: its OAuth usage endpoint, with the token Claude Code keeps in the
+	// macOS keychain (or ~/.claude/.credentials.json). The user allowed this;
+	// the token is used for this request only, never stored or shown.
+	Dictionary claude_api = _claude_oauth_usage();
+	if (!claude_api.is_empty()) {
+		MutexLock lock(usage_mutex);
+		usage_cache["claude"] = claude_api;
+	}
+
+	// Claude Code: its /usage command, answered locally by the ACP adapter
+	// (no model call): "**5-hour limit** — **37%** · Resets ..." per window.
+	String bin, error;
+	PackedStringArray args;
+	String claude_path = path_value;
+	if (claude_api.is_empty() && _resolve_acp("claude", bin, args, claude_path, error)) {
+		Ref<LagoonicAcpRunner> runner;
+		runner.instantiate();
+		const Dictionary result = runner->run_turn(bin, args, cwd, env, Array(), "/usage", Array(), true, true, "usage");
+		const String text = result.get("text", "");
+		Dictionary entry;
+		entry["name"] = String("Claude Code");
+		entry["updated_msec"] = (int64_t)now;
+		Array windows;
+		String plan;
+		const Vector<String> lines = text.split("\n");
+		for (const String &raw : lines) {
+			const String line = raw.strip_edges();
+			if (line.begins_with("> Claude ") && line.contains("subscription usage")) {
+				plan = line.trim_prefix("> Claude ").get_slice(" subscription usage", 0).capitalize();
+			}
+			// **Label** — **37%** · Resets ...
+			if (line.begins_with("**") && line.contains(String::utf8("—")) && line.contains("%**")) {
+				const String label = line.get_slice("**", 1).replace("\\", "");
+				const String after = line.get_slice(String::utf8("—"), 1);
+				const String percent = after.get_slice("**", 1).trim_suffix("%");
+				if (percent.is_valid_float()) {
+					const String lower = label.to_lower();
+					Dictionary w = _usage_window(label, percent.to_float(), 0, lower.contains("week") ? String("weekly") : (lower.contains("month") ? String("monthly") : String("session")));
+					const String resets = after.get_slice(String::utf8("· Resets"), 1).strip_edges();
+					if (!resets.is_empty() && after.contains(String::utf8("· Resets"))) {
+						w["resets_text"] = resets.replace("\\", "");
+					}
+					windows.push_back(w);
+				}
+			}
+		}
+		entry["plan"] = plan;
+		entry["windows"] = windows;
+		if (windows.is_empty()) {
+			entry["note"] = text.is_empty() ? String(result.get("error", "Claude Code no respondió.")) : String::utf8("Claude Code no muestra sus límites por esta vía; consulta claude.ai/settings/usage.");
+		}
+		MutexLock lock(usage_mutex);
+		usage_cache["claude"] = entry;
+	}
+}
+
+String LagoonicRuntimeHost::_attachments_note(const PackedStringArray &p_files) {
+	if (p_files.is_empty()) {
+		return String();
+	}
+	String note = String::utf8("\n\nArchivos adjuntos (léelos si los necesitas):");
+	for (const String &f : p_files) {
+		note += "\n- " + f;
+	}
+	return note;
+}
+
+Array LagoonicRuntimeHost::_attachment_images(const PackedStringArray &p_files) {
+	Array images;
+	for (const String &f : p_files) {
+		const String ext = f.get_extension().to_lower();
+		String mime;
+		if (ext == "png") {
+			mime = "image/png";
+		} else if (ext == "jpg" || ext == "jpeg") {
+			mime = "image/jpeg";
+		} else if (ext == "webp") {
+			mime = "image/webp";
+		} else if (ext == "gif") {
+			mime = "image/gif";
+		} else {
+			continue;
+		}
+		// Big images go by path only: inline they would blow the request.
+		Ref<FileAccess> file = FileAccess::open(f, FileAccess::READ);
+		if (file.is_null() || file->get_length() == 0 || file->get_length() > 8 * 1024 * 1024) {
+			continue;
+		}
+		const Vector<uint8_t> bytes = file->get_buffer(file->get_length());
+		Dictionary image;
+		image["mime"] = mime;
+		image["base64"] = CryptoCore::b64_encode_str(bytes.ptr(), bytes.size());
+		image["name"] = f.get_file();
+		images.push_back(image);
+	}
+	return images;
+}
+
+Error LagoonicRuntimeHost::send_prompt(const String &p_session_id, const String &p_text_in, int p_mode, const String &p_model, const String &p_variant) {
+	// Files dropped on the chat go with this message only.
+	const PackedStringArray attachments = next_attachments;
+	next_attachments.clear();
+	const String p_text = p_text_in + _attachments_note(attachments);
 	if (p_text.strip_edges().is_empty()) {
 		return ERR_INVALID_PARAMETER;
 	}
+	const Array images = _attachment_images(attachments);
 	// The boss chosen in Configuracion > Equipo answers the chat; only
 	// OpenCode goes through the server below.
 	const String boss = get_crew_boss();
 	if (!boss.is_empty() && boss != "opencode") {
-		return _send_acp(boss, p_session_id, p_text, p_mode);
+		return _send_acp(boss, p_session_id, p_text, p_mode, images);
 	}
 	// Lazy (re)start, like supervisor.ts onUnexpectedExit -> next message.
 	if (!is_server_up() || !supervisor->check_health()) {
@@ -582,6 +1447,16 @@ Error LagoonicRuntimeHost::send_prompt(const String &p_session_id, const String 
 	text_part["type"] = String("text");
 	text_part["text"] = p_text;
 	parts.push_back(text_part);
+	for (int i = 0; i < images.size(); i++) {
+		// OpenCode reads images as file parts with a data URL.
+		const Dictionary image = images[i];
+		Dictionary file_part;
+		file_part["type"] = String("file");
+		file_part["mime"] = image["mime"];
+		file_part["filename"] = image["name"];
+		file_part["url"] = "data:" + String(image["mime"]) + ";base64," + String(image["base64"]);
+		parts.push_back(file_part);
+	}
 	_append_boss_instruction(parts);
 	const Dictionary res = client->lagoonic_prompt_parts_async(session, dir, parts, provider, model_id, agent, p_variant);
 	client_mutex.unlock();
@@ -1128,7 +2003,24 @@ Array LagoonicRuntimeHost::load_history(const String &p_session_id) {
 	return events;
 }
 
-void LagoonicRuntimeHost::set_crew(const String &p_boss_id, const Array &p_workers) {
+void LagoonicRuntimeHost::set_crew(const String &p_boss_id, const Array &p_workers_in) {
+	// The boss can always hand work to copies of itself, even with no other
+	// agent in the team: it does not depend on them to delegate.
+	Array p_workers = p_workers_in.duplicate();
+	const String boss_for_self = p_boss_id.is_empty() ? get_crew_boss() : p_boss_id;
+	if (!boss_for_self.is_empty()) {
+		bool has_self = false;
+		for (int i = 0; i < p_workers.size(); i++) {
+			has_self = has_self || String(Dictionary(p_workers[i]).get("id", "")) == boss_for_self;
+		}
+		const LagoonicCodingAgents::AgentInfo *info = LagoonicCodingAgents::get_agent(boss_for_self);
+		if (!has_self && info != nullptr) {
+			Dictionary self_worker;
+			self_worker["id"] = boss_for_self;
+			self_worker["name"] = String::utf8(info->name);
+			p_workers.push_back(self_worker);
+		}
+	}
 	state_mutex.lock();
 	const String dir = project_dir;
 	if (!p_boss_id.is_empty()) {
@@ -1270,7 +2162,26 @@ String lagoonic_find_on_host(const String &p_bin, const Vector<String> &p_dirs) 
 
 } // namespace
 
-bool LagoonicRuntimeHost::_resolve_acp(const String &p_agent_id, String &r_bin, PackedStringArray &r_args, String &r_path, String &r_error) const {
+String LagoonicRuntimeHost::get_default_model() const {
+	state_mutex.lock();
+	const String model = default_model;
+	state_mutex.unlock();
+	return model;
+}
+
+void LagoonicRuntimeHost::_add_acp_env(const String &p_agent_id, Dictionary &r_env) {
+	const LagoonicCodingAgents::AgentInfo *agent = LagoonicCodingAgents::get_agent(p_agent_id);
+	if (agent == nullptr || agent->acp_env == nullptr) {
+		return;
+	}
+	const String pair = String::utf8(agent->acp_env);
+	const int eq = pair.find("=");
+	if (eq > 0) {
+		r_env[pair.substr(0, eq)] = pair.substr(eq + 1);
+	}
+}
+
+bool LagoonicRuntimeHost::_resolve_acp(const String &p_agent_id, String &r_bin, PackedStringArray &r_args, String &r_path, String &r_error, bool p_autonomous) const {
 	const LagoonicCodingAgents::AgentInfo *agent = LagoonicCodingAgents::get_agent(p_agent_id);
 	if (agent == nullptr || agent->acp == nullptr) {
 		r_error = vformat(String::utf8("%s no se puede usar en el chat."), p_agent_id);
@@ -1279,7 +2190,8 @@ bool LagoonicRuntimeHost::_resolve_acp(const String &p_agent_id, String &r_bin, 
 	// `npm prefix -g` is a subprocess: ask once per editor run.
 	static const String npm_prefix = LagoonicCodingAgents::npm_global_prefix();
 	const Vector<String> dirs = LagoonicCodingAgents::host_search_dirs(npm_prefix);
-	const Vector<String> command = String::utf8(agent->acp).split(" ", false);
+	const char *acp_command = (p_autonomous && agent->acp_auto != nullptr) ? agent->acp_auto : agent->acp;
+	const Vector<String> command = String::utf8(acp_command).split(" ", false);
 	r_bin = lagoonic_find_on_host(command[0], dirs);
 	if (r_bin.is_empty()) {
 		String how;
@@ -1330,6 +2242,7 @@ void LagoonicRuntimeHost::probe_acp_options(const String &p_agent_id, const Stri
 	if (!path_value.is_empty()) {
 		probe_env["PATH"] = path_value;
 	}
+	_add_acp_env(p_agent_id, probe_env);
 	probe_cwd = p_cwd.is_empty() ? get_project_dir() : p_cwd;
 	if (probe_cwd.is_empty()) {
 		probe_cwd = OS::get_singleton()->get_user_data_dir();
@@ -1391,7 +2304,7 @@ Array LagoonicRuntimeHost::_acp_mcp_servers(const String &dir, const String &pat
 	// The boss also gets the crew tools (start_worker, list_workers) over HTTP.
 	state_mutex.lock();
 	const String crew_url = crew_url_cache;
-	const String crew_auth = crew_auth_cache;
+	const String crew_auth = crew_boss_auth_cache;
 	state_mutex.unlock();
 	if (p_with_crew && !crew_url.is_empty() && !crew->crew_worker_names().is_empty()) {
 		Array headers;
@@ -1439,18 +2352,29 @@ void LagoonicRuntimeHost::_append_boss_instruction(Array &r_parts) const {
 	r_parts.push_back(part);
 }
 
+// How long a wake-up waits for the boss to finish answering the user.
+static constexpr int WAKE_WAIT_MSEC = 30 * 60 * 1000;
+
 String LagoonicRuntimeHost::acp_wake_boss(const String &p_boss_id, const String &p_session_id, const String &p_wake_text) {
 	// Crew round thread: the wake-up is a normal boss turn, run here so the
 	// orchestrator's loop sees the tasks the boss queues from the reports.
-	if (acp_busy.is_set()) {
-		return "The boss is still answering; send a message to continue.";
-	}
 	if (acp_runner.is_null()) {
 		return "The boss is not connected; send a message to continue.";
+	}
+	// The boss may be answering the user right now (stopping a task mid-turn
+	// ends the round during that turn): wait for its turn to end, then the
+	// reports go as its next turn. set_if_clear claims the boss atomically.
+	const uint64_t waited_since = OS::get_singleton()->get_ticks_msec();
+	while (!acp_busy.set_if_clear()) {
+		if (crew->is_failed() || OS::get_singleton()->get_ticks_msec() - waited_since > uint64_t(WAKE_WAIT_MSEC)) {
+			return "The boss is still answering; send a message to continue.";
+		}
+		OS::get_singleton()->delay_usec(250000);
 	}
 	String bin, path_value, error;
 	PackedStringArray args;
 	if (!_resolve_acp(p_boss_id, bin, args, path_value, error)) {
+		acp_busy.clear();
 		return error;
 	}
 	state_mutex.lock();
@@ -1461,6 +2385,7 @@ String LagoonicRuntimeHost::acp_wake_boss(const String &p_boss_id, const String 
 	if (!path_value.is_empty()) {
 		env["PATH"] = path_value;
 	}
+	_add_acp_env(p_boss_id, env);
 	acp_busy.set();
 	acp_runner->set_chosen_options(choices);
 	acp_runner->set_requested_mode(acp_mode == 2 ? String("plan") : (acp_mode == 1 ? String("default") : String()));
@@ -1486,16 +2411,42 @@ String LagoonicRuntimeHost::acp_worker_turn(const String &p_worker_id, const Str
 	// text is the report. Workers get lagoonic-mcp but no crew tools.
 	String bin, path_value;
 	PackedStringArray args;
-	if (!_resolve_acp(p_worker_id, bin, args, path_value, r_error)) {
-		return String();
-	}
 	const String dir = get_project_dir();
-	Dictionary env;
-	if (!path_value.is_empty()) {
-		env["PATH"] = path_value;
+	Dictionary result;
+	if (p_worker_id == "codex") {
+		// Codex workers talk to `codex app-server` (Codex's own server, as
+		// Orca does): the codex-acp adapter lags behind Codex, and the
+		// models it does not know (gpt-6-luna) fail with a 400.
+		static const String npm_prefix = LagoonicCodingAgents::npm_global_prefix();
+		const Vector<String> dirs = LagoonicCodingAgents::host_search_dirs(npm_prefix);
+		bin = lagoonic_find_on_host("codex", dirs);
+		if (bin.is_empty()) {
+			r_error = String::utf8("Codex CLI no está instalado. Instálalo con: npm install -g @openai/codex");
+			return String();
+		}
+		for (int i = 0; i < dirs.size(); i++) {
+			if (!dirs[i].is_empty()) {
+				path_value += (path_value.is_empty() ? "" : (LagoonicCodingAgents::is_windows() ? ";" : ":")) + dirs[i];
+			}
+		}
+		Dictionary env;
+		if (!path_value.is_empty()) {
+			env["PATH"] = path_value;
+		}
+		result = p_runner->run_codex_turn(bin, dir, env, _acp_mcp_servers(dir, path_value, false), p_prompt, "crew-" + p_worker_id);
+	} else {
+		// Workers act on their own: the agent's no-approval command, as Orca.
+		if (!_resolve_acp(p_worker_id, bin, args, path_value, r_error, true)) {
+			return String();
+		}
+		Dictionary env;
+		if (!path_value.is_empty()) {
+			env["PATH"] = path_value;
+		}
+		_add_acp_env(p_worker_id, env);
+		result = p_runner->run_turn(bin, args, dir, env, _acp_mcp_servers(dir, path_value, false),
+				p_prompt, Array(), true, true, "crew-" + p_worker_id);
 	}
-	const Dictionary result = p_runner->run_turn(bin, args, dir, env, _acp_mcp_servers(dir, path_value, false),
-			p_prompt, Array(), true, true, "crew-" + p_worker_id);
 	if (!bool(result.get("ok", false))) {
 		r_error = String(result.get("error", ""));
 		if (r_error.is_empty()) {
@@ -1527,6 +2478,7 @@ void LagoonicRuntimeHost::_ensure_crew_server() {
 		state_mutex.lock();
 		crew_url_cache = crew_server->get_url();
 		crew_auth_cache = crew_server->get_authorization();
+		crew_boss_auth_cache = crew_server->get_boss_authorization();
 		state_mutex.unlock();
 	}
 	if (!crew_poll_hooked && SceneTree::get_singleton() != nullptr) {
@@ -1542,7 +2494,7 @@ void LagoonicRuntimeHost::_poll_crew_server() {
 	}
 }
 
-Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_session_id, const String &p_text, int p_mode) {
+Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_session_id, const String &p_text, int p_mode, const Array &p_images) {
 	const LagoonicCodingAgents::AgentInfo *agent = LagoonicCodingAgents::get_agent(p_boss_id);
 	if (agent == nullptr || agent->acp == nullptr) {
 		_emit_error(vformat(String::utf8("%s no se puede usar en el chat."), p_boss_id));
@@ -1597,6 +2549,7 @@ Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_se
 	if (!path_value.is_empty()) {
 		acp_env["PATH"] = path_value;
 	}
+	_add_acp_env(p_boss_id, acp_env);
 	acp_mcp_servers = mcp_servers;
 	acp_cwd = dir;
 	session = _chat_for_turn(p_boss_id, session);
@@ -1608,6 +2561,16 @@ Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_se
 	_chat_begin_turn(session, p_text, p_text, resume, transcript);
 	acp_runner->set_resume(resume, transcript);
 	acp_prompt = _boss_prompt(p_text);
+	acp_prompt_extra.clear();
+	for (int i = 0; i < p_images.size(); i++) {
+		// ACP image content block, next to the text.
+		const Dictionary image = p_images[i];
+		Dictionary block;
+		block["type"] = String("image");
+		block["mimeType"] = image["mime"];
+		block["data"] = image["base64"];
+		acp_prompt_extra.push_back(block);
+	}
 	acp_session = session;
 	acp_auto_approve = (p_mode == 0);
 	acp_mode = p_mode;
@@ -1619,7 +2582,7 @@ Error LagoonicRuntimeHost::_send_acp(const String &p_boss_id, const String &p_se
 void LagoonicRuntimeHost::_acp_thread_main(void *p_userdata) {
 	LagoonicRuntimeHost *self = static_cast<LagoonicRuntimeHost *>(p_userdata);
 	const Dictionary result = self->acp_runner->run_turn(self->acp_bin, self->acp_args, self->acp_cwd, self->acp_env,
-			self->acp_mcp_servers, self->acp_prompt, Array(), self->acp_auto_approve, false, self->acp_session);
+			self->acp_mcp_servers, self->acp_prompt, self->acp_prompt_extra, self->acp_auto_approve, false, self->acp_session);
 	callable_mp(self, &LagoonicRuntimeHost::_on_acp_finished).call_deferred(result);
 }
 
@@ -1723,6 +2686,18 @@ String LagoonicRuntimeHost::get_opencode_bin() const {
 
 void LagoonicRuntimeHost::_on_sse_frame(const Dictionary &p_frame) {
 	// Already on the main thread (client re-emits via call_deferred).
+	if (crew_runner_impl != nullptr) {
+		// Crew workers' sessions are dropped by the mapper: note their
+		// status here so the round knows when a worker is done.
+		const String frame_type = String(p_frame.get("type", ""));
+		if (frame_type == "session.status" || frame_type == "session.idle") {
+			const Variant props_v = p_frame.get("properties", Variant());
+			const Dictionary props = props_v.get_type() == Variant::DICTIONARY ? Dictionary(props_v) : Dictionary();
+			const Variant status_v = props.get("status", Variant());
+			const String state = frame_type == "session.idle" ? String("idle") : (status_v.get_type() == Variant::DICTIONARY ? String(Dictionary(status_v).get("type", "")) : String());
+			crew_runner_impl->note_session_status(String(props.get("sessionID", "")), state);
+		}
+	}
 	const Dictionary result = mapper->lagoonic_feed(p_frame);
 	const Array events = result.get("events", Array());
 	for (int i = 0; i < events.size(); i++) {

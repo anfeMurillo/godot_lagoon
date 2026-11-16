@@ -154,6 +154,13 @@ private:
 	Label *queued_label = nullptr; // "N mensajes en cola" while an ACP agent works.
 
 	Button *attach_button = nullptr;
+	// Archivos que se enviaran con el proximo mensaje (rutas absolutas):
+	// arrastrados desde Finder/Explorador o desde el panel FileSystem.
+	PackedStringArray pending_attachments;
+	class HFlowContainer *attachments_row = nullptr;
+	void _rebuild_attachments();
+	void _remove_attachment(int p_index);
+	void _on_os_files_dropped(const PackedStringArray &p_files);
 	TextEdit *input = nullptr;
 	Button *send_button = nullptr;
 	Button *stop_button = nullptr;
@@ -321,6 +328,9 @@ protected:
 
 	// Acepta ficheros del FileSystemDock ("files") y rutas de nodos
 	// ("nodes"); las escenas llegan como ficheros .tscn.
+	// Adds files (absolute or res:// paths) to the next message.
+	void add_attachments(const PackedStringArray &p_paths);
+	PackedStringArray get_pending_attachments() const { return pending_attachments; }
 	virtual bool can_drop_data(const Point2 &p_point, const Variant &p_data) const override;
 	virtual void drop_data(const Point2 &p_point, const Variant &p_data) override;
 

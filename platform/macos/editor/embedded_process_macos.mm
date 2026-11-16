@@ -393,5 +393,21 @@ void LayerHost::gui_input(const Ref<InputEvent> &p_event) {
 	}
 }
 
+void LayerHost::input(const Ref<InputEvent> &p_event) {
+	Ref<InputEventMouse> mouse = p_event;
+	if (mouse.is_null() || !process->is_embedding_completed() || !has_focus()) {
+		return;
+	}
+	if (process->get_mouse_mode() == DisplayServerEnums::MOUSE_MODE_VISIBLE || DisplayServer::get_singleton()->mouse_get_mode() == DisplayServerEnums::MOUSE_MODE_VISIBLE) {
+		return; // Visible mouse: the GUI routes it by position as usual.
+	}
+	gui_input(p_event);
+	if (get_viewport() != nullptr) {
+		get_viewport()->set_input_as_handled();
+	}
+}
+
 LayerHost::LayerHost(EmbeddedProcessMacOS *p_process) :
-		process(p_process) {}
+		process(p_process) {
+	set_process_input(true);
+}

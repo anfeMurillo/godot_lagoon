@@ -31,6 +31,7 @@
 #include "lagoonic_agent_dock.h"
 
 #include "lagoonic_agent_settings.h"
+#include "../runtime/lagoonic_coding_agents.h"
 
 #include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
@@ -43,41 +44,10 @@
 #include "servers/display/display_server.h"
 #include "servers/text/text_server.h"
 
-// Catalogo estatico de los 19 agentes (Core/lagoonic-desktop/src/main/
-// coding-agents.ts). Los comandos install/run/docs salen de ahi; Lagoonic
-// nunca ejecuta instaladores, solo muestra el comando copiable.
-struct LagoonicAgentCatalogEntry {
-	const char *id;
-	const char *name;
-	const char *vendor;
-	const char *install;
-	const char *run;
-	const char *docs_url;
-	const char *acp; // Adapter ACP para el chat; "" = sin chat.
-	bool can_connect; // false = nada que conectar (goose).
-};
+// Los agentes salen del registro comun (runtime/lagoonic_coding_agents):
+// install/run/docs de cada uno. Lagoonic nunca ejecuta instaladores, solo
+// muestra el comando copiable.
 
-static const LagoonicAgentCatalogEntry LAGOONIC_AGENT_CATALOG[19] = {
-	{ "opencode", "OpenCode", "SST", "npm install -g opencode-ai", "opencode", "https://opencode.ai/docs/", "integrado", true },
-	{ "claude", "Claude Code", "Anthropic", "npm install -g @anthropic-ai/claude-code", "claude", "https://docs.anthropic.com/en/docs/claude-code/mcp", "claude-agent-acp", true },
-	{ "codex", "Codex CLI", "OpenAI", "npm install -g @openai/codex", "codex", "https://developers.openai.com/codex/mcp", "codex-acp", true },
-	{ "antigravity", "Antigravity CLI", "Google", "curl -fsSL https://antigravity.google/cli/install.sh | bash", "agy", "https://antigravity.google/docs", "", true },
-	{ "qwen", "Qwen Code", "Alibaba", "npm install -g @qwen-code/qwen-code", "qwen", "https://github.com/QwenLM/qwen-code", "qwen --acp", true },
-	{ "kimi", "Kimi Code", "Moonshot AI", "npm install -g @moonshot-ai/kimi-code", "kimi", "https://github.com/MoonshotAI/kimi-cli", "kimi acp", true },
-	{ "minimax", "MiniMax Mini-Agent", "MiniMax", "curl -LsSf https://astral.sh/uv/install.sh | sh && uv tool install git+https://github.com/MiniMax-AI/Mini-Agent.git", "mini-agent --workspace .", "https://github.com/MiniMax-AI/Mini-Agent", "", true },
-	{ "grok", "Grok Build", "xAI", "curl -fsSL https://x.ai/cli/install.sh | bash", "grok", "https://docs.x.ai/build/overview", "", true },
-	{ "kiro", "Kiro CLI", "Amazon", "curl --proto \"=https\" --tlsv1.2 -sSf https://desktop-release.q.us-east-1.amazonaws.com/latest/kirocli-aarch64-apple-darwin.zip -o kirocli.zip && unzip -o kirocli.zip && ./kirocli/install.sh", "kiro-cli", "https://kiro.dev/docs/cli/", "", true },
-	{ "deepseek", "Codewhale (DeepSeek TUI)", "DeepSeek", "npm install -g codewhale", "codewhale", "https://github.com/Hmbown/DeepSeek-TUI", "", true },
-	{ "kilo", "Kilo Code", "Kilo", "npm install -g @kilocode/cli", "kilo", "https://kilo.ai/docs/automate/mcp/using-in-cli", "", true },
-	{ "copilot", "GitHub Copilot CLI", "GitHub (Microsoft)", "npm install -g @github/copilot", "copilot", "https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers", "", true },
-	{ "cursor", "Cursor", "Anysphere", "curl https://cursor.com/install -fsS | bash", "agent", "https://cursor.com/docs/cli/mcp", "", true },
-	{ "goose", "Goose", "Block", "curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash", "goose session", "https://github.com/block/goose", "goose acp", false },
-	{ "cline", "Cline", "Cline", "npm install -g cline", "cline", "https://docs.cline.bot/cline-cli/getting-started", "", true },
-	{ "amp", "Amp", "Sourcegraph", "npm install -g @sourcegraph/amp", "amp", "https://ampcode.com/manual", "", true },
-	{ "droid", "Droid", "Factory", "curl -fsSL https://app.factory.ai/cli | sh", "droid", "https://docs.factory.com/cli/configuration/mcp", "", true },
-	{ "mistral", "Mistral Vibe", "Mistral AI", "curl -LsSf https://mistral.ai/vibe/install.sh | bash", "vibe", "https://github.com/mistralai/mistral-vibe", "", true },
-	{ "auggie", "Auggie", "Augment", "npm install -g @augmentcode/auggie", "auggie", "https://docs.augmentcode.com/cli/overview", "", true },
-};
 
 struct LagoonicProviderCatalogEntry {
 	const char *id;
@@ -676,25 +646,28 @@ LagoonicAgentDock::LagoonicAgentDock() {
 	agents_box->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	agents_scroll->add_child(agents_box);
 
-	for (int i = 0; i < 19; i++) {
-		const LagoonicAgentCatalogEntry &entry = LAGOONIC_AGENT_CATALOG[i];
-		_ensure_agent_row(entry.id, entry.name);
+	for (int i = 0; i < LagoonicCodingAgents::AGENT_COUNT; i++) {
+		const LagoonicCodingAgents::AgentInfo &entry = *LagoonicCodingAgents::get_agent_at(i);
+		const String entry_name = String::utf8(entry.name);
+		_ensure_agent_row(entry.id, entry_name);
 		Dictionary info;
-		info["detected"] = String(entry.id) == "opencode"; // Integrado: siempre presente.
-		info["installed"] = String(entry.id) == "opencode";
+		info["detected"] = entry.built_in; // Integrado: siempre presente.
+		info["installed"] = entry.built_in;
 		info["connected"] = false;
-		info["has_chat"] = String(entry.acp) != "";
-		info["install"] = String(entry.install);
-		info["run"] = String(entry.run);
-		info["docs_url"] = String(entry.docs_url);
-		info["can_connect"] = entry.can_connect;
+		// OpenCode chats through Lagoonic's own server, without an adapter.
+		const String acp_command = entry.built_in ? String("integrado") : (entry.acp != nullptr ? String::utf8(entry.acp) : String());
+		info["has_chat"] = !acp_command.is_empty();
+		info["install"] = String::utf8(entry.install);
+		info["run"] = String::utf8(entry.run);
+		info["docs_url"] = String::utf8(entry.docs_url);
+		info["can_connect"] = entry.registration != LagoonicCodingAgents::REG_NONE && entry.registration != LagoonicCodingAgents::REG_MANUAL;
 		AgentRow &row = agent_rows[entry.id];
-		row.run_command = entry.run;
+		row.run_command = String::utf8(entry.run);
 		if (row.title != nullptr) {
-			row.title->set_text(vformat("%s (%s)", entry.name, entry.vendor));
+			row.title->set_text(vformat("%s (%s)", entry_name, String::utf8(entry.vendor)));
 		}
-		if (row.chat != nullptr && String(entry.acp) != "") {
-			row.chat->set_text(vformat(TTRC("Chat ACP: %s"), entry.acp));
+		if (row.chat != nullptr && !acp_command.is_empty()) {
+			row.chat->set_text(vformat(TTRC("Chat ACP: %s"), acp_command));
 		}
 		_refresh_agent_row(row, info);
 	}

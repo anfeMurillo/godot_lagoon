@@ -66,6 +66,7 @@ class LagoonicSettingsPanel : public Control {
 	Button *accent_reset = nullptr;
 	CheckButton *animations_toggle = nullptr;
 	OptionButton *style_option = nullptr;
+	OptionButton *team_view_option = nullptr;
 
 	// Editor de color (tema propio o acento).
 	Control *editor_layer = nullptr;
@@ -169,6 +170,7 @@ class LagoonicSettingsPanel : public Control {
 
 	void _sync_editor();
 	void _on_style_selected(int p_index);
+	void _on_team_view_selected(int p_index);
 	void _on_scale_selected(int p_index);
 	void _on_network_selected(int p_index);
 	void _on_updates_selected(int p_index);

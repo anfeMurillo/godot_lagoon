@@ -77,7 +77,18 @@ public:
 	virtual Vector<String> crew_worker_names() const = 0;
 	// Queues a task for `p_worker` (empty = default). Returns the message
 	// for the boss, or "" and sets `r_error` when the task is refused.
-	virtual String crew_start_worker(const String &p_title, const String &p_spec, const String &p_worker, String &r_error) = 0;
+	// `p_from_boss`: the call carries the boss-only token (an ACP boss), so it
+	// can never come from a worker, even while one is running.
+	virtual String crew_start_worker(const String &p_title, const String &p_spec, const String &p_worker, const String &p_model, bool p_from_boss, String &r_error) = 0;
+	// The models a worker offers ("" = every worker), as text for the boss.
+	virtual String crew_list_models(const String &p_worker) = 0;
+	// Stops task p_number (0 = every running/queued task). Returns the
+	// message for the boss, or "" and sets r_error.
+	virtual String crew_stop_worker(int p_number, String &r_error) = 0;
+	// Removes finished, failed and stopped tasks from the list. Returns the message.
+	virtual String crew_clear_workers() = 0;
+	// Adds instructions to task p_number while it runs (or before it starts).
+	virtual String crew_message_worker(int p_number, const String &p_message, String &r_error) = 0;
 	// One Dictionary per round task: {number, status, worker_name, title}.
 	virtual Vector<Dictionary> crew_list_workers() const = 0;
 	virtual ~LagoonicCrewTools() {}
@@ -93,7 +104,7 @@ public:
 private:
 	struct ClientState {
 		Ref<StreamPeerTCP> peer;
-		String pending; // Buffered, not yet fully received HTTP request.
+		Vector<uint8_t> pending; // Raw bytes of the not yet fully received HTTP request.
 		bool responded = false;
 	};
 
@@ -101,14 +112,16 @@ private:
 	Vector<ClientState> clients;
 	LagoonicCrewTools *tools = nullptr; // Not owned; the orchestrator.
 
-	String token;
+	String token; // Shared: OpenCode's config, read by its boss and its workers.
+	String boss_token; // Only ACP bosses (Claude Code, Codex...) get this one.
+	mutable bool request_from_boss = false; // Set per request on the main thread.
 	int port = 0;
 	bool running = false;
 
 	void _accept_clients();
 	void _service_client(int p_idx);
 	void _close_client(int p_idx);
-	bool _request_complete(const String &p_pending, int &r_header_end, int &r_total_len) const;
+	bool _request_complete(const Vector<uint8_t> &p_pending, int &r_header_end, int &r_total_len) const;
 	void _answer(int p_idx, int p_status, const String &p_status_text, const String &p_body, const String &p_content_type);
 	void _handle_request(int p_idx, const String &p_raw);
 
@@ -136,6 +149,7 @@ public:
 	int get_port() const { return port; }
 	String get_url() const;
 	String get_authorization() const;
+	String get_boss_authorization() const;
 
 	Error start();
 	void stop();

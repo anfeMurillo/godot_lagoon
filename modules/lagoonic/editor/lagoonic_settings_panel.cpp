@@ -39,6 +39,7 @@ namespace {
 
 const char *LANGUAGE_SETTING = "interface/editor/localization/editor_language";
 const char *STYLE_SETTING = "interface/theme/style";
+const char *TEAM_VIEW_SETTING = "lagoonic/team/view"; // orbit | list | graph (panel Equipo).
 const char *SCALE_SETTING = "interface/editor/appearance/display_scale";
 const char *NETWORK_SETTING = "network/connection/network_mode";
 const char *UPDATES_SETTING = "network/connection/check_for_updates";
@@ -370,7 +371,21 @@ VBoxContainer *LagoonicSettingsPanel::_build_themes() {
 	style_option->add_item(String::utf8("Clásico"));
 	style_option->set_item_metadata(1, "Classic");
 	style_option->connect(SNAME("item_selected"), callable_mp(this, &LagoonicSettingsPanel::_on_style_selected));
+
+	HBoxContainer *team_row = _setting_row(content, String::utf8("Vista del equipo"), String::utf8("Cómo muestra el panel Equipo al líder y sus ayudantes."));
+	team_view_option = _right(team_row, memnew(OptionButton), 200);
+	team_view_option->add_item(String::utf8("Órbitas"));
+	team_view_option->set_item_metadata(0, "orbit");
+	team_view_option->add_item(String::utf8("Lista"));
+	team_view_option->set_item_metadata(1, "list");
+	team_view_option->add_item(String::utf8("Nodos"));
+	team_view_option->set_item_metadata(2, "graph");
+	team_view_option->connect(SNAME("item_selected"), callable_mp(this, &LagoonicSettingsPanel::_on_team_view_selected));
 	return content;
+}
+
+void LagoonicSettingsPanel::_on_team_view_selected(int p_index) {
+	_editor_set(TEAM_VIEW_SETTING, team_view_option->get_item_metadata(p_index));
 }
 
 void LagoonicSettingsPanel::_on_style_selected(int p_index) {
@@ -517,6 +532,10 @@ void LagoonicSettingsPanel::_sync_from_palette() {
 	}
 	if (style_option != nullptr) {
 		style_option->select(String(_editor_get(STYLE_SETTING, "Modern")) == "Classic" ? 1 : 0);
+	}
+	if (team_view_option != nullptr) {
+		const String view = _editor_get(TEAM_VIEW_SETTING, "orbit");
+		team_view_option->select(view == "list" ? 1 : (view == "graph" ? 2 : 0));
 	}
 	if (editor_card != nullptr) {
 		editor_card->add_theme_style_override(SceneStringName(panel), _rounded(cur.surface, 16, cur.border, 1));

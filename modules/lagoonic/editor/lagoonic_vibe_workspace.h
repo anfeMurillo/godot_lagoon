@@ -109,6 +109,9 @@ private:
 	void _restore_bentos();
 	Array _get_changes();
 	Dictionary _get_team();
+	Dictionary _get_usage();
+	void _refresh_usage();
+	void _stop_team_task(int p_number); // 0 = todas; -1 = limpiar las terminadas.
 	void _check_team_started();
 	// Tarjeta Juego: aloja la vista de juego integrada del editor.
 	MarginContainer *game_holder = nullptr;

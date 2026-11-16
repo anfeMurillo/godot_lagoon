@@ -40,6 +40,8 @@
 class Button;
 class GridContainer;
 class Label;
+class PanelContainer;
+class ScrollContainer;
 class LagoonicChatView;
 class LineEdit;
 class ProgressBar;
@@ -125,29 +127,154 @@ public:
 	LagoonicContextPanel();
 };
 
-// Equipo: el lider del chat y los ayudantes que lanza, enlazados a el, con
-// el estado de cada tarea en vivo (en cola, trabajando, termino, fallo).
+// Equipo en orbitas: una constelacion con el lider al centro, sus agentes en
+// la primera orbita y cada tarea como un satelite de su agente. Los nodos son
+// solo logos; el anillo de cada uno dice su estado y el tooltip, el resto.
+class LagoonicTeamOrbit : public Control {
+	GDCLASS(LagoonicTeamOrbit, Control);
+
+	struct Hit {
+		Vector2 pos;
+		float radius = 0;
+		int task = 0; // 0 = no es una tarea.
+		String tooltip;
+	};
+
+	Dictionary team;
+	Vector<Hit> hits;
+	int selected_task = 0;
+	float time = 0; // Segundos de animacion.
+	Callable on_select; // (number: int)
+
+	bool _animating() const;
+	String _hit_tooltip(const Point2 &p_pos) const;
+
+protected:
+	void _notification(int p_what);
+	static void _bind_methods() {}
+
+public:
+	void set_team(const Dictionary &p_team);
+	void set_selected_task(int p_number);
+	void set_on_select(const Callable &p_callable) { on_select = p_callable; }
+	virtual String get_tooltip(const Point2 &p_pos) const override;
+	virtual void gui_input(const Ref<InputEvent> &p_event) override;
+
+	LagoonicTeamOrbit();
+};
+
+// Equipo: el lider del chat y los ayudantes que lanza, con el modelo real de
+// cada uno, el estado en vivo y botones para detener una tarea o todas. Tres
+// vistas: orbitas (por defecto), lista y grafo de nodos (GraphEdit, como el
+// editor de Godot), que se eligen en Configuracion > Temas.
 class LagoonicTeamPanel : public VBoxContainer {
 	GDCLASS(LagoonicTeamPanel, VBoxContainer);
 
 	Callable provider; // () -> {boss_name, busy, workers: [{id, name}], tasks: [...], now_msec}
+	Callable stopper; // (number: int) -> detiene esa tarea; 0 = todas; -1 = limpia las terminadas.
 	Label *summary = nullptr;
+	Button *stop_all = nullptr;
+	Button *clear_done = nullptr;
+	Button *center_button = nullptr;
+	enum View {
+		VIEW_LIST,
+		VIEW_GRAPH,
+		VIEW_ORBIT,
+	};
+	View view = VIEW_LIST;
+	LagoonicTeamOrbit *orbit = nullptr;
+
+	// Vista en lista.
+	ScrollContainer *list_scroll = nullptr;
 	VBoxContainer *list = nullptr;
+	HashSet<int> open_reports;
+
+	// Vista en grafo.
+	class GraphEdit *graph = nullptr;
+	PanelContainer *details = nullptr;
+	Label *details_title = nullptr;
+	Label *details_meta = nullptr;
+	Label *details_report = nullptr;
+	Button *details_stop = nullptr;
+	String layout_signature; // Que nodos hay; si cambia, se recoloca y centra.
+	int selected_task = 0;
+
 	Timer *timer = nullptr;
 	String signature; // Lo que hay pintado; solo se reconstruye si cambia.
 	HashMap<int, Label *> status_labels; // tarea -> linea de estado (tiempo en vivo).
-	HashSet<int> open_reports;
+	Dictionary last_team;
 
 	void _refresh();
 	void _rebuild(const Dictionary &p_team);
+	void _rebuild_list(const Dictionary &p_team);
+	void _rebuild_graph(const Dictionary &p_team);
+	void _layout_graph();
+	void _center_graph();
 	void _update_times(const Dictionary &p_team);
+	void _update_details();
+	void _set_view(int p_view);
+	void _apply_view_setting(); // Configuracion > Temas > Vista del equipo.
+	void _on_orbit_selected(int p_number);
+	void _on_node_selected(Node *p_node);
 	void _on_report_toggled(int p_number);
-	static String _status_text(const Dictionary &p_task, uint64_t p_now);
+	void _on_stop(int p_number);
+	void _on_stop_selected() { _on_stop(selected_task); }
+
+protected:
+	void _notification(int p_what);
+	static void _bind_methods();
 
 public:
-	void setup(const Callable &p_provider);
+	static String _status_text(const Dictionary &p_task, uint64_t p_now);
+	void setup(const Callable &p_provider, const Callable &p_stopper = Callable());
 
 	LagoonicTeamPanel();
+};
+
+// Anillos de uso: el exterior (mas ancho) es la sesion de 5 h, el de dentro
+// la semanal y, si la hay, uno mas adentro la mensual. Cada anillo se llena
+// con lo que queda; en el centro, lo que queda de la sesion.
+class LagoonicUsageRings : public Control {
+	GDCLASS(LagoonicUsageRings, Control);
+
+	double remaining[3] = { -1, -1, -1 }; // session, weekly, monthly; -1 = no ring.
+
+protected:
+	void _notification(int p_what);
+	static void _bind_methods() {}
+
+public:
+	// p_kind: 0 session, 1 weekly, 2 monthly; p_remaining 0..100 or -1.
+	void set_remaining(int p_kind, double p_remaining);
+
+	LagoonicUsageRings();
+};
+
+// Uso: cuanto le queda a cada agente de su plan (ventanas de 5 h, semanal...),
+// leido con las vias propias de cada CLI. Se actualiza solo cada pocos minutos.
+class LagoonicUsagePanel : public VBoxContainer {
+	GDCLASS(LagoonicUsagePanel, VBoxContainer);
+
+	Callable provider; // () -> {usage: {agent_id: {...}}, reading: bool}
+	Callable refresher; // () -> pide leer de nuevo.
+	Label *summary = nullptr;
+	Button *refresh_button = nullptr;
+	VBoxContainer *list = nullptr;
+	Timer *timer = nullptr;
+	String signature;
+	uint64_t last_refresh_msec = 0;
+
+	void _refresh();
+	void _on_refresh_pressed();
+	void _rebuild(const Dictionary &p_usage);
+
+protected:
+	static void _bind_methods();
+
+public:
+	void setup(const Callable &p_provider, const Callable &p_refresher);
+
+	LagoonicUsagePanel();
 };
 
 // Escena: el arbol de la escena abierta, el mismo control que usa el editor

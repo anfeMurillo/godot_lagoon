@@ -29,6 +29,7 @@
 /**************************************************************************/
 
 #include "lagoonic_acp_runner.h"
+#include "lagoonic_model_match.h"
 
 #include "core/io/json.h"
 #include "core/object/class_db.h"
@@ -508,6 +509,7 @@ void LagoonicAcpRunner::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("resolve_permission", "approval_id", "approved"), &LagoonicAcpRunner::resolve_permission);
 	ClassDB::bind_method(D_METHOD("close"), &LagoonicAcpRunner::close);
 	ClassDB::bind_method(D_METHOD("poll", "timeout_ms"), &LagoonicAcpRunner::poll, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("run_codex_turn", "codex_bin", "cwd", "env", "mcp_servers", "prompt", "session_id"), &LagoonicAcpRunner::run_codex_turn, DEFVAL("lagoonic"));
 	ClassDB::bind_method(D_METHOD("run_turn", "adapter_bin", "args", "cwd", "env", "mcp_servers", "prompt", "prompt_blocks", "auto_approve", "silent", "session_id"), &LagoonicAcpRunner::run_turn, DEFVAL(Array()), DEFVAL(false), DEFVAL(false), DEFVAL("lagoonic"));
 
 	ClassDB::bind_method(D_METHOD("set_session_id", "session_id"), &LagoonicAcpRunner::set_session_id);
@@ -1199,6 +1201,28 @@ void LagoonicAcpRunner::_handle_line(const String &p_raw) {
 			if (message.has("error") && Variant(message["error"]).get_type() == Variant::DICTIONARY) {
 				Dictionary err = message["error"];
 				String emsg = _dstr(err, "message");
+				// "Internal error" alone hides the cause: adapters put the
+				// provider's answer in error.data (codex-acp: data.message,
+				// itself JSON like {"error": {"message": "..."}}).
+				String detail;
+				const Variant data = err.get("data", Variant());
+				if (data.get_type() == Variant::STRING) {
+					detail = data;
+				} else if (data.get_type() == Variant::DICTIONARY) {
+					detail = _dstr(Dictionary(data), "message");
+				}
+				const Variant inner = detail.strip_edges().begins_with("{") ? JSON::parse_string(detail) : Variant();
+				if (inner.get_type() == Variant::DICTIONARY) {
+					const Dictionary inner_error = _ddict(Dictionary(inner), "error");
+					const String inner_message = _dstr(inner_error, "message");
+					if (!inner_message.is_empty()) {
+						detail = inner_message;
+					}
+				}
+				detail = detail.strip_edges();
+				if (!detail.is_empty() && detail != emsg) {
+					emsg = emsg.is_empty() ? detail : emsg + ": " + detail;
+				}
 				slot->done = true;
 				slot->ok = false;
 				slot->error = emsg.is_empty() ? String("Agent error. / Error del agente.") : emsg;
@@ -1212,6 +1236,10 @@ void LagoonicAcpRunner::_handle_line(const String &p_raw) {
 }
 
 void LagoonicAcpRunner::_handle_notification(const String &p_method, const Dictionary &p_params) {
+	if (codex_dialect) {
+		_handle_codex_notification(p_method, p_params);
+		return;
+	}
 	if (p_method != "session/update") {
 		return;
 	}
@@ -1235,6 +1263,10 @@ void LagoonicAcpRunner::_handle_notification(const String &p_method, const Dicti
 }
 
 void LagoonicAcpRunner::_handle_request(const Variant &p_id, const String &p_method, const Dictionary &p_params) {
+	if (codex_dialect) {
+		_handle_codex_request(p_id, p_method, p_params);
+		return;
+	}
 	if (p_method != "session/request_permission") {
 		_reply_error(p_id, -32601, "Method not supported: " + p_method);
 		return;
@@ -1582,13 +1614,15 @@ void LagoonicAcpRunner::set_requested_mode(const String &p_mode) {
 }
 
 Dictionary LagoonicAcpRunner::session_prompt(const String &p_acp_session_id, const String &p_prompt_text, const Array &p_prompt_blocks, int p_timeout_ms) {
-	Array prompt = p_prompt_blocks;
-	if (prompt.is_empty()) {
+	// The text always goes first; the blocks (images...) follow it.
+	Array prompt;
+	if (!p_prompt_text.is_empty()) {
 		Dictionary block;
 		block["type"] = "text";
 		block["text"] = p_prompt_text;
 		prompt.push_back(block);
 	}
+	prompt.append_array(p_prompt_blocks);
 	Dictionary params;
 	params["sessionId"] = p_acp_session_id;
 	params["prompt"] = prompt;
@@ -1666,6 +1700,7 @@ Dictionary LagoonicAcpRunner::run_turn(const String &p_adapter_bin, const Packed
 	Dictionary out;
 	auto_approve = p_auto_approve;
 	silent = p_silent;
+	session_model = String();
 	set_session_id(p_session_id);
 	Error err = spawn(p_adapter_bin, p_args, p_cwd, p_env);
 	if (err != OK) {
@@ -1702,6 +1737,10 @@ Dictionary LagoonicAcpRunner::run_turn(const String &p_adapter_bin, const Packed
 	}
 	if (ok) {
 		Array options = parse_options(session_info);
+		ok = _choose_requested_model(options);
+	}
+	if (ok) {
+		Array options = parse_options(session_info);
 		if (requested_mode == "plan") {
 			bool offers_plan = false;
 			for (int i = 0; i < options.size(); i++) {
@@ -1717,6 +1756,7 @@ Dictionary LagoonicAcpRunner::run_turn(const String &p_adapter_bin, const Packed
 		}
 		if (ok) {
 			options = _apply_options(sid, options);
+			_set_session_model(describe_model(options));
 			if (!silent && !options.is_empty()) {
 				Dictionary event;
 				event["type"] = "acp_options";
@@ -1730,6 +1770,12 @@ Dictionary LagoonicAcpRunner::run_turn(const String &p_adapter_bin, const Packed
 	if (ok) {
 		prompt_result = session_prompt(sid, prompt, p_prompt_blocks, 0);
 		ok = !prompt_result.has("error");
+		// Instructions added while it worked go as the next prompt of the
+		// same session (ACP cannot add to a prompt in flight).
+		for (String extra = _take_steer(); ok && !extra.is_empty() && !stopped; extra = _take_steer()) {
+			prompt_result = session_prompt(sid, String::utf8("Nuevas indicaciones del coordinador para esta misma tarea:\n") + extra, Array(), 0);
+			ok = !prompt_result.has("error");
+		}
 	}
 	String stop_reason = _dstr(prompt_result, "stopReason");
 	out["ok"] = ok;
@@ -1738,6 +1784,8 @@ Dictionary LagoonicAcpRunner::run_turn(const String &p_adapter_bin, const Packed
 	}
 	out["text"] = mapper->get_text();
 	out["report"] = mapper->get_worker_report(3);
+	out["model"] = session_model;
+	out["models"] = offered_models;
 	out["acp_session_id"] = sid;
 	out["resumed"] = resumed;
 	if (!ok) {
@@ -1745,6 +1793,486 @@ Dictionary LagoonicAcpRunner::run_turn(const String &p_adapter_bin, const Packed
 	}
 	out["log"] = get_log_tail();
 	close();
+	return out;
+}
+
+// --- steering ---------------------------------------------------------
+
+void LagoonicAcpRunner::steer(const String &p_text) {
+	if (p_text.strip_edges().is_empty()) {
+		return;
+	}
+	MutexLock lock(steer_mutex);
+	steer_queue.push_back(p_text.strip_edges());
+}
+
+String LagoonicAcpRunner::_take_steer() {
+	MutexLock lock(steer_mutex);
+	String text;
+	for (const String &t : steer_queue) {
+		text += (text.is_empty() ? "" : "\n\n") + t;
+	}
+	steer_queue.clear();
+	return text;
+}
+
+// --- model ------------------------------------------------------------
+
+String LagoonicAcpRunner::describe_model(const Array &p_options) {
+	String model;
+	String effort;
+	for (int i = 0; i < p_options.size(); i++) {
+		if (p_options[i].get_type() != Variant::DICTIONARY) {
+			continue;
+		}
+		const Dictionary option = p_options[i];
+		const String category = _dstr(option, "category");
+		const String current = _dstr(option, "current");
+		if (current.is_empty()) {
+			continue;
+		}
+		// The value's display name when the agent gives one.
+		String label = current;
+		const Array values = _darr(option, "values");
+		for (int v = 0; v < values.size(); v++) {
+			if (values[v].get_type() == Variant::DICTIONARY && _dstr(Dictionary(values[v]), "value") == current) {
+				const String name = _dstr(Dictionary(values[v]), "name");
+				if (!name.is_empty()) {
+					label = name;
+				}
+				break;
+			}
+		}
+		if (category == "model" && model.is_empty()) {
+			model = label;
+		} else if ((category == "thought_level" || _dstr(option, "id").contains("effort")) && effort.is_empty()) {
+			effort = label;
+		}
+	}
+	if (!model.is_empty() && !effort.is_empty()) {
+		return model + String::utf8(" · ") + effort;
+	}
+	return model;
+}
+
+bool LagoonicAcpRunner::_choose_requested_model(const Array &p_options) {
+	offered_models.clear();
+	Dictionary model_option;
+	Dictionary effort_option;
+	for (int i = 0; i < p_options.size(); i++) {
+		const Dictionary option = p_options[i];
+		const String category = _dstr(option, "category");
+		if (category == "model" && model_option.is_empty()) {
+			model_option = option;
+		} else if ((category == "thought_level" || _dstr(option, "id").contains("effort")) && effort_option.is_empty()) {
+			effort_option = option;
+		}
+	}
+	const Array values = _darr(model_option, "values");
+	for (int i = 0; i < values.size(); i++) {
+		const Dictionary v = values[i];
+		Dictionary row;
+		row["value"] = _dstr(v, "value");
+		row["name"] = _dstr(v, "name");
+		offered_models.push_back(row);
+	}
+	if (requested_model.strip_edges().is_empty()) {
+		return true;
+	}
+	if (model_option.is_empty()) {
+		_set_error("This agent does not let Lagoonic choose its model; it uses its own default. / Este agente no deja elegir su modelo.");
+		return false;
+	}
+	const String value = LagoonicModelMatch::best(offered_models, requested_model);
+	if (value.is_empty()) {
+		_set_error("\"" + requested_model + "\" is not one of this agent's models: " + LagoonicModelMatch::describe(offered_models) + ".");
+		return false;
+	}
+	chosen_options[_dstr(model_option, "id")] = value;
+	Vector<String> words;
+	String effort;
+	LagoonicModelMatch::split_request(requested_model, words, effort);
+	if (!effort.is_empty() && !effort_option.is_empty()) {
+		const Array efforts = _darr(effort_option, "values");
+		for (int i = 0; i < efforts.size(); i++) {
+			const Dictionary e = efforts[i];
+			if (_dstr(e, "value").to_lower() == effort || _dstr(e, "name").to_lower() == effort) {
+				chosen_options[_dstr(effort_option, "id")] = _dstr(e, "value");
+				break;
+			}
+		}
+	}
+	return true;
+}
+
+Array LagoonicAcpRunner::_codex_model_list() {
+	Array out;
+	bool ok = false;
+	Dictionary params;
+	const Dictionary result = _call("model/list", params, DEFAULT_TIMEOUT_MS, ok);
+	if (!ok) {
+		return out;
+	}
+	const Array data = _darr(result, "data");
+	for (int i = 0; i < data.size(); i++) {
+		if (data[i].get_type() != Variant::DICTIONARY) {
+			continue;
+		}
+		const Dictionary m = data[i];
+		Dictionary row;
+		row["value"] = _dstr(m, "id");
+		row["name"] = _dstr(m, "displayName");
+		Array efforts;
+		const Array supported = _darr(m, "supportedReasoningEfforts");
+		for (int e = 0; e < supported.size(); e++) {
+			if (supported[e].get_type() == Variant::DICTIONARY) {
+				efforts.push_back(_dstr(Dictionary(supported[e]), "reasoningEffort"));
+			}
+		}
+		row["efforts"] = efforts;
+		out.push_back(row);
+	}
+	return out;
+}
+
+Dictionary LagoonicAcpRunner::probe_codex_rate_limits(const String &p_codex_bin, const String &p_cwd, const Dictionary &p_env) {
+	Dictionary out;
+	const bool was_silent = silent;
+	silent = true;
+	codex_dialect = true;
+	PackedStringArray args;
+	args.push_back("app-server");
+	if (spawn(p_codex_bin, args, p_cwd, p_env) == OK) {
+		Dictionary client_info;
+		client_info["name"] = "lagoonic";
+		client_info["version"] = "1";
+		Dictionary capabilities;
+		capabilities["experimentalApi"] = true;
+		Dictionary init_params;
+		init_params["clientInfo"] = client_info;
+		init_params["capabilities"] = capabilities;
+		bool ok = false;
+		_call("initialize", init_params, DEFAULT_TIMEOUT_MS, ok);
+		if (ok) {
+			_notify("initialized", Dictionary());
+			const Dictionary account = _call("account/read", Dictionary(), DEFAULT_TIMEOUT_MS, ok);
+			if (ok) {
+				out["account"] = _ddict(account, "account");
+			}
+			const Dictionary limits = _call("account/rateLimits/read", Dictionary(), DEFAULT_TIMEOUT_MS, ok);
+			if (ok) {
+				out["rateLimits"] = _ddict(limits, "rateLimits");
+			} else {
+				out["error"] = last_error;
+			}
+		} else {
+			out["error"] = last_error;
+		}
+	} else {
+		out["error"] = last_error;
+	}
+	close();
+	codex_dialect = false;
+	silent = was_silent;
+	return out;
+}
+
+Array LagoonicAcpRunner::probe_codex_models(const String &p_codex_bin, const String &p_cwd, const Dictionary &p_env) {
+	Array models;
+	const bool was_silent = silent;
+	silent = true;
+	codex_dialect = true;
+	PackedStringArray args;
+	args.push_back("app-server");
+	if (spawn(p_codex_bin, args, p_cwd, p_env) == OK) {
+		Dictionary client_info;
+		client_info["name"] = "lagoonic";
+		client_info["version"] = "1";
+		Dictionary capabilities;
+		capabilities["experimentalApi"] = true;
+		Dictionary init_params;
+		init_params["clientInfo"] = client_info;
+		init_params["capabilities"] = capabilities;
+		bool ok = false;
+		_call("initialize", init_params, DEFAULT_TIMEOUT_MS, ok);
+		if (ok) {
+			_notify("initialized", Dictionary());
+			models = _codex_model_list();
+		}
+	}
+	close();
+	codex_dialect = false;
+	silent = was_silent;
+	return models;
+}
+
+void LagoonicAcpRunner::_set_session_model(const String &p_model) {
+	session_model = p_model;
+	if (!p_model.is_empty() && model_callback.is_valid()) {
+		model_callback.call(p_model);
+	}
+}
+
+// --- codex app-server ---------------------------------------------------
+
+void LagoonicAcpRunner::_handle_codex_notification(const String &p_method, const Dictionary &p_params) {
+	if (p_method == "item/agentMessage/delta") {
+		codex_delta_text += _dstr(p_params, "delta");
+	} else if (p_method == "item/completed") {
+		const Dictionary item = _ddict(p_params, "item");
+		if (_dstr(item, "type") == "agentMessage") {
+			const String text = _dstr(item, "text").strip_edges();
+			if (!text.is_empty()) {
+				codex_final_text += (codex_final_text.is_empty() ? "" : "\n\n") + text;
+			}
+		}
+	} else if (p_method == "turn/completed") {
+		const Dictionary turn = _ddict(p_params, "turn");
+		codex_turn_status = _dstr(turn, "status");
+		// The report is the final answer (phase "final_answer"); the
+		// progress notes before it ("Voy a consultar...") are not.
+		String final_answer;
+		const Array items = _darr(turn, "items");
+		for (int i = 0; i < items.size(); i++) {
+			if (items[i].get_type() != Variant::DICTIONARY) {
+				continue;
+			}
+			const Dictionary item = items[i];
+			if (_dstr(item, "type") == "agentMessage" && _dstr(item, "phase") == "final_answer") {
+				const String text = _dstr(item, "text").strip_edges();
+				if (!text.is_empty()) {
+					final_answer += (final_answer.is_empty() ? "" : "\n\n") + text;
+				}
+			}
+		}
+		if (!final_answer.is_empty()) {
+			codex_final_text = final_answer;
+		}
+		const Variant error_v = turn.get("error", Variant());
+		if (error_v.get_type() == Variant::DICTIONARY) {
+			codex_turn_error = _dstr(Dictionary(error_v), "message");
+		} else if (error_v.get_type() == Variant::STRING) {
+			codex_turn_error = error_v;
+		}
+		codex_turn_done = true;
+	} else if (p_method == "error") {
+		// Retries report here too; the turn's own error wins when it ends.
+		const Dictionary error = _ddict(p_params, "error");
+		const String message = _dstr(error, "message");
+		if (!message.is_empty() && !bool(p_params.get("willRetry", false))) {
+			codex_turn_error = message;
+		}
+	}
+}
+
+void LagoonicAcpRunner::_handle_codex_request(const Variant &p_id, const String &p_method, const Dictionary &p_params) {
+	(void)p_params;
+	// Worker turns run with approvalPolicy "never"; answer any approval
+	// that still arrives like the autonomous mode does.
+	if (p_method.ends_with("/requestApproval")) {
+		Dictionary result;
+		result["decision"] = "accept";
+		_reply(p_id, result);
+	} else if (p_method == "execCommandApproval" || p_method == "applyPatchApproval") {
+		Dictionary result;
+		result["decision"] = "approved";
+		_reply(p_id, result);
+	} else {
+		_reply_error(p_id, -32601, "Method not supported: " + p_method);
+	}
+}
+
+Dictionary LagoonicAcpRunner::run_codex_turn(const String &p_codex_bin, const String &p_cwd, const Dictionary &p_env, const Array &p_mcp_servers, const String &p_prompt, const String &p_session_id) {
+	Dictionary out;
+	auto_approve = true;
+	silent = true;
+	codex_dialect = true;
+	codex_turn_done = false;
+	codex_turn_status = String();
+	codex_turn_error = String();
+	codex_delta_text = String();
+	codex_final_text = String();
+	last_error = String();
+	session_model = String();
+	set_session_id(p_session_id);
+	PackedStringArray args;
+	args.push_back("app-server");
+	if (spawn(p_codex_bin, args, p_cwd, p_env) != OK) {
+		codex_dialect = false;
+		out["ok"] = false;
+		out["error"] = last_error;
+		out["log"] = get_log_tail();
+		return out;
+	}
+
+	bool ok = false;
+	Dictionary client_info;
+	client_info["name"] = "lagoonic";
+	client_info["title"] = "Lagoonic";
+	client_info["version"] = "1";
+	Dictionary capabilities;
+	capabilities["experimentalApi"] = true;
+	Dictionary init_params;
+	init_params["clientInfo"] = client_info;
+	init_params["capabilities"] = capabilities;
+	_call("initialize", init_params, DEFAULT_TIMEOUT_MS, ok);
+
+	String thread_id;
+	String requested_model_value;
+	if (ok) {
+		_notify("initialized", Dictionary());
+		// The ACP mcpServers become Codex config overrides
+		// (mcp_servers.<name>.command/args/env or .url/.http_headers).
+		Dictionary config;
+		for (int i = 0; i < p_mcp_servers.size(); i++) {
+			if (p_mcp_servers[i].get_type() != Variant::DICTIONARY) {
+				continue;
+			}
+			const Dictionary server = p_mcp_servers[i];
+			const String name = _dstr(server, "name");
+			if (name.is_empty()) {
+				continue;
+			}
+			const String prefix = "mcp_servers." + name + ".";
+			if (server.has("url")) {
+				config[prefix + "url"] = _dstr(server, "url");
+				Dictionary headers;
+				const Array header_list = _darr(server, "headers");
+				for (int h = 0; h < header_list.size(); h++) {
+					if (header_list[h].get_type() == Variant::DICTIONARY) {
+						const Dictionary header = header_list[h];
+						headers[_dstr(header, "name")] = _dstr(header, "value");
+					}
+				}
+				if (!headers.is_empty()) {
+					config[prefix + "http_headers"] = headers;
+				}
+			} else {
+				config[prefix + "command"] = _dstr(server, "command");
+				config[prefix + "args"] = _darr(server, "args");
+				Dictionary env;
+				const Array env_list = _darr(server, "env");
+				for (int e = 0; e < env_list.size(); e++) {
+					if (env_list[e].get_type() == Variant::DICTIONARY) {
+						const Dictionary entry = env_list[e];
+						env[_dstr(entry, "name")] = _dstr(entry, "value");
+					}
+				}
+				if (!env.is_empty()) {
+					config[prefix + "env"] = env;
+				}
+			}
+		}
+		// Workers act on their own: no approvals, writes inside the
+		// project, network for downloads (assets, packages).
+		config["sandbox_workspace_write.network_access"] = true;
+		// The model the boss asked for, among the ones Codex offers.
+		if (!requested_model.strip_edges().is_empty()) {
+			offered_models = _codex_model_list();
+			const String value = LagoonicModelMatch::best(offered_models, requested_model);
+			if (value.is_empty()) {
+				_set_error("\"" + requested_model + "\" is not one of Codex's models: " + LagoonicModelMatch::describe(offered_models) + ".");
+				ok = false;
+			} else {
+				Vector<String> words;
+				String effort;
+				LagoonicModelMatch::split_request(requested_model, words, effort);
+				for (int i = 0; i < offered_models.size(); i++) {
+					const Dictionary m = offered_models[i];
+					if (String(m.get("value", "")) == value && !effort.is_empty() && Array(m.get("efforts", Array())).has(effort)) {
+						config["model_reasoning_effort"] = effort;
+					}
+				}
+				requested_model_value = value;
+			}
+		}
+		Dictionary thread_params;
+		thread_params["cwd"] = p_cwd;
+		if (!requested_model_value.is_empty()) {
+			thread_params["model"] = requested_model_value;
+		}
+		thread_params["approvalPolicy"] = "never";
+		thread_params["sandbox"] = "workspace-write";
+		thread_params["config"] = config;
+		const Dictionary thread_result = ok ? _call("thread/start", thread_params, DEFAULT_TIMEOUT_MS, ok) : Dictionary();
+		if (ok) {
+			thread_id = _dstr(_ddict(thread_result, "thread"), "id");
+			// Codex states the model and effort it will use for this thread.
+			String model = _dstr(thread_result, "model");
+			const String effort = _dstr(thread_result, "reasoningEffort");
+			if (!model.is_empty() && !effort.is_empty()) {
+				model += String::utf8(" · ") + effort;
+			}
+			_set_session_model(model);
+			acp_session_id = thread_id;
+			if (thread_id.is_empty()) {
+				_set_error("Codex did not open a conversation. / Codex no abrió la conversación.");
+				ok = false;
+			}
+		}
+	}
+	if (ok) {
+		Array input;
+		Dictionary block;
+		block["type"] = "text";
+		block["text"] = p_prompt;
+		input.push_back(block);
+		Dictionary turn_params;
+		turn_params["threadId"] = thread_id;
+		turn_params["input"] = input;
+		const Dictionary turn_result = _call("turn/start", turn_params, DEFAULT_TIMEOUT_MS, ok);
+		codex_turn_id = _dstr(_ddict(turn_result, "turn"), "id");
+	}
+	if (ok) {
+		// turn/start answers at once; the work ends with turn/completed.
+		while (!codex_turn_done && !stopped && running) {
+			_pump_once();
+			// New instructions join the turn in progress (turn/steer).
+			const String extra = _take_steer();
+			if (!extra.is_empty() && !codex_turn_id.is_empty()) {
+				Array steer_input;
+				Dictionary steer_block;
+				steer_block["type"] = "text";
+				steer_block["text"] = extra;
+				steer_input.push_back(steer_block);
+				Dictionary steer_params;
+				steer_params["threadId"] = thread_id;
+				steer_params["expectedTurnId"] = codex_turn_id;
+				steer_params["input"] = steer_input;
+				bool steer_ok = false;
+				_call("turn/steer", steer_params, DEFAULT_TIMEOUT_MS, steer_ok);
+				if (!steer_ok) {
+					steer(extra); // Retry on the next pass.
+				}
+			}
+			OS::get_singleton()->delay_usec(2000);
+		}
+		if (stopped) {
+			_set_error("Stopped by user. / Detenido por el usuario.");
+			ok = false;
+		} else if (!codex_turn_done) {
+			if (last_error.is_empty()) {
+				_set_error("Codex stopped before finishing. / Codex se detuvo antes de terminar.");
+			}
+			ok = false;
+		} else if (codex_turn_status != "completed") {
+			_set_error(codex_turn_error.is_empty() ? ("Codex turn " + codex_turn_status + ".") : codex_turn_error);
+			ok = false;
+		}
+	}
+	const String text = codex_final_text.is_empty() ? codex_delta_text.strip_edges() : codex_final_text;
+	out["ok"] = ok;
+	out["text"] = text;
+	out["report"] = text;
+	out["model"] = session_model;
+	out["models"] = offered_models;
+	out["acp_session_id"] = thread_id;
+	if (!ok) {
+		out["error"] = last_error;
+	}
+	out["log"] = get_log_tail();
+	close();
+	codex_dialect = false;
 	return out;
 }
 

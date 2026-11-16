@@ -57,6 +57,8 @@
 #include "editor/themes/editor_scale.h"
 #include "servers/display/display_server.h"
 #include "scene/gui/flow_container.h"
+#include "scene/main/scene_tree.h"
+#include "scene/main/window.h"
 #include "scene/gui/texture_rect.h"
 #include "scene/resources/font.h"
 #include "scene/resources/style_box_flat.h"
@@ -837,7 +839,7 @@ void LagoonicChatView::_update_send_state() {
 	if (send_button == nullptr) {
 		return;
 	}
-	const bool empty = input == nullptr || input->get_text().strip_edges().is_empty();
+	const bool empty = (input == nullptr || input->get_text().strip_edges().is_empty()) && pending_attachments.is_empty();
 	// While the agent works the user can still write to steer it.
 	send_button->set_disabled(!connected || empty);
 	if (minimal && stop_button != nullptr) {
@@ -1044,17 +1046,31 @@ void LagoonicChatView::_on_send_pressed() {
 	}
 	// Sending while the agent works steers it: the message goes to the
 	// agent now (OpenCode) or as soon as its current step ends (ACP agents).
-	const String text = input->get_text().strip_edges();
-	if (text.is_empty()) {
+	String text = input->get_text().strip_edges();
+	const PackedStringArray files = pending_attachments;
+	if (text.is_empty() && files.is_empty()) {
 		return;
 	}
+	if (text.is_empty()) {
+		text = String::utf8("Mira los archivos adjuntos.");
+	}
 	stick_to_bottom = true;
-	add_user_message(text);
+	String shown = text;
+	if (!files.is_empty()) {
+		PackedStringArray names;
+		for (const String &f : files) {
+			names.push_back(f.get_file());
+		}
+		shown += String::utf8("\n\nAdjuntos: ") + String(", ").join(names);
+	}
+	add_user_message(shown);
 	input->clear();
+	pending_attachments.clear();
+	_rebuild_attachments();
 	clear_file_guard();
 	clear_error();
 	set_busy(true);
-	_fire(SNAME("send_requested"), text);
+	_fire(SNAME("send_requested"), text, files);
 }
 
 void LagoonicChatView::_on_stop_pressed() {
@@ -1424,6 +1440,70 @@ void LagoonicChatView::_poll() {
 	_fire(SNAME("poll_tick"));
 }
 
+void LagoonicChatView::_on_os_files_dropped(const PackedStringArray &p_files) {
+	if (!is_visible_in_tree() || DisplayServer::get_singleton() == nullptr) {
+		return;
+	}
+	// Only a drop over the chat: elsewhere it is the editor's (import to the project).
+	if (!get_screen_rect().has_point(DisplayServer::get_singleton()->mouse_get_position())) {
+		return;
+	}
+	add_attachments(p_files);
+	if (input != nullptr) {
+		input->grab_focus();
+	}
+}
+
+void LagoonicChatView::add_attachments(const PackedStringArray &p_paths) {
+	for (const String &raw : p_paths) {
+		String path = raw.strip_edges();
+		if (path.is_empty()) {
+			continue;
+		}
+		if (path.begins_with("res://") && ProjectSettings::get_singleton() != nullptr) {
+			path = ProjectSettings::get_singleton()->globalize_path(path);
+		}
+		if (!pending_attachments.has(path)) {
+			pending_attachments.push_back(path);
+		}
+	}
+	_rebuild_attachments();
+	_update_send_state();
+}
+
+void LagoonicChatView::_remove_attachment(int p_index) {
+	if (p_index >= 0 && p_index < pending_attachments.size()) {
+		pending_attachments.remove_at(p_index);
+	}
+	_rebuild_attachments();
+	_update_send_state();
+}
+
+void LagoonicChatView::_rebuild_attachments() {
+	if (attachments_row == nullptr) {
+		return;
+	}
+	for (int i = attachments_row->get_child_count() - 1; i >= 0; i--) {
+		Node *c = attachments_row->get_child(i);
+		attachments_row->remove_child(c);
+		c->queue_free();
+	}
+	attachments_row->set_visible(!pending_attachments.is_empty());
+	for (int i = 0; i < pending_attachments.size(); i++) {
+		const String path = pending_attachments[i];
+		Button *chip = memnew(Button);
+		chip->set_text(path.get_file() + String::utf8("  ×"));
+		chip->set_tooltip_text(path + String::utf8("\nQuitar este adjunto."));
+		chip->set_theme_type_variation(LagoonicVibeTheme::GHOST_BUTTON);
+		chip->set_focus_mode(Control::FOCUS_NONE);
+		const String ext = path.get_extension().to_lower();
+		const bool image = ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "webp" || ext == "gif";
+		chip->set_button_icon(get_editor_theme_icon(image ? SNAME("Image") : SNAME("File")));
+		chip->connect(SceneStringName(pressed), callable_mp(this, &LagoonicChatView::_remove_attachment).bind(i));
+		attachments_row->add_child(chip);
+	}
+}
+
 bool LagoonicChatView::can_drop_data(const Point2 &p_point, const Variant &p_data) const {
 	if (p_data.get_type() != Variant::DICTIONARY) {
 		return false;
@@ -1442,6 +1522,7 @@ void LagoonicChatView::drop_data(const Point2 &p_point, const Variant &p_data) {
 	if (type == "files" && data.has("files")) {
 		const PackedStringArray files = data["files"];
 		if (!files.is_empty()) {
+			add_attachments(files);
 			_fire(SNAME("attachments_dropped"), files);
 		}
 		return;
@@ -2722,6 +2803,21 @@ void LagoonicChatView::_notification(int p_notification) {
 	switch (p_notification) {
 		case NOTIFICATION_ENTER_TREE: {
 			refresh_icons();
+			// Files dragged from Finder/Explorer land on the window: the chat
+			// takes the ones dropped over it (the editor then leaves them
+			// alone, see EditorNode::_dropped_files).
+			add_to_group(SNAME("_lagoonic_os_drop_target"));
+			Window *root = get_tree() != nullptr ? get_tree()->get_root() : nullptr;
+			if (root != nullptr && !root->is_connected(SNAME("files_dropped"), callable_mp(this, &LagoonicChatView::_on_os_files_dropped))) {
+				root->connect(SNAME("files_dropped"), callable_mp(this, &LagoonicChatView::_on_os_files_dropped));
+			}
+		} break;
+
+		case NOTIFICATION_EXIT_TREE: {
+			Window *root = get_tree() != nullptr ? get_tree()->get_root() : nullptr;
+			if (root != nullptr && root->is_connected(SNAME("files_dropped"), callable_mp(this, &LagoonicChatView::_on_os_files_dropped))) {
+				root->disconnect(SNAME("files_dropped"), callable_mp(this, &LagoonicChatView::_on_os_files_dropped));
+			}
 		} break;
 
 		case NOTIFICATION_THEME_CHANGED: {
@@ -2762,7 +2858,7 @@ void LagoonicChatView::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("refresh_icons"), &LagoonicChatView::refresh_icons);
 	ClassDB::bind_method(D_METHOD("get_crew_view"), &LagoonicChatView::get_crew_view);
 
-	ADD_SIGNAL(MethodInfo("send_requested", PropertyInfo(Variant::STRING, "text")));
+	ADD_SIGNAL(MethodInfo("send_requested", PropertyInfo(Variant::STRING, "text"), PropertyInfo(Variant::PACKED_STRING_ARRAY, "attachments")));
 	ADD_SIGNAL(MethodInfo("abort_requested"));
 	ADD_SIGNAL(MethodInfo("permission_replied",
 			PropertyInfo(Variant::STRING, "request_id"),
@@ -2789,7 +2885,7 @@ void LagoonicChatView::_bind_methods() {
 }
 
 LagoonicChatView::LagoonicChatView() {
-	signal_argc[SNAME("send_requested")] = 1;
+	signal_argc[SNAME("send_requested")] = 2;
 	signal_argc[SNAME("abort_requested")] = 0;
 	signal_argc[SNAME("permission_replied")] = 2;
 	signal_argc[SNAME("undo_file_requested")] = 1;
@@ -3141,6 +3237,11 @@ LagoonicChatView::LagoonicChatView() {
 	composer_box->add_theme_constant_override(SNAME("separation"), 6);
 	composer->add_child(composer_box);
 
+	attachments_row = memnew(HFlowContainer);
+	attachments_row->set_visible(false);
+	attachments_row->add_theme_constant_override(SNAME("h_separation"), 4);
+	attachments_row->add_theme_constant_override(SNAME("v_separation"), 4);
+	composer_box->add_child(attachments_row);
 	HBoxContainer *input_row = memnew(HBoxContainer);
 	input_row->add_theme_constant_override(SNAME("separation"), 8);
 	composer_box->add_child(input_row);

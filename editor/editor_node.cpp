@@ -7039,6 +7039,17 @@ PopupMenu *EditorNode::get_export_as_menu() {
 }
 
 void EditorNode::_dropped_files(const Vector<String> &p_files) {
+	// Lagoonic: files dropped on the agent chat are attached to the message,
+	// not copied into the project.
+	if (DisplayServer::get_singleton() != nullptr && get_tree() != nullptr) {
+		const Point2i mouse = DisplayServer::get_singleton()->mouse_get_position();
+		for (Node *n : get_tree()->get_nodes_in_group(SNAME("_lagoonic_os_drop_target"))) {
+			const Control *c = Object::cast_to<Control>(n);
+			if (c != nullptr && c->is_visible_in_tree() && c->get_screen_rect().has_point(mouse)) {
+				return;
+			}
+		}
+	}
 	String to_path = FileSystemDock::get_singleton()->get_folder_path_at_mouse_position();
 	if (to_path.is_empty()) {
 		to_path = FileSystemDock::get_singleton()->get_current_directory();

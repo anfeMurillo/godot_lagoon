@@ -124,6 +124,24 @@ class LagoonicRuntimeHost : public RefCounted {
 	Array acp_mcp_servers;
 	String acp_cwd;
 	String acp_prompt;
+	Array acp_prompt_extra; // Image blocks that go with acp_prompt.
+	PackedStringArray next_attachments; // Files for the next send_prompt.
+
+	// How much of each agent's plan is left (panel Uso), asked through each
+	// CLI's own way (codex app-server, Claude Code /usage). Never reads the
+	// agents' credentials.
+	mutable Mutex usage_mutex;
+	Dictionary usage_cache; // agent id -> {name, plan, windows: [{label, used_percent, resets_at}], note, updated_msec}
+	String opencode_go_key;
+	Thread usage_thread;
+	SafeFlag usage_running;
+	static void _usage_thread_main(void *p_userdata);
+	void _read_usage();
+	Dictionary _claude_oauth_usage(); // {} when Claude Code is not signed in.
+	// Anthropic rate-limits its usage endpoint hard: ask at most every 15 min,
+	// never before its Retry-After, and keep showing the last good reading.
+	int64_t claude_next_ask = 0; // Unix seconds.
+	Dictionary claude_last_good;
 	String acp_session;
 	bool acp_auto_approve = false;
 	int acp_mode = 0; // Last chat mode, reused by crew wake-ups.
@@ -135,6 +153,7 @@ class LagoonicRuntimeHost : public RefCounted {
 	bool server_has_crew = false; // OpenCode's config already lists it.
 	String crew_url_cache; // Guarded by state_mutex (read from the round thread).
 	String crew_auth_cache;
+	String crew_boss_auth_cache; // ACP bosses only; never in OpenCode's config.
 	String acp_agent; // Boss id of the running/last ACP turn.
 	Dictionary acp_choices; // Option id -> value chosen in the chat.
 
@@ -152,8 +171,15 @@ class LagoonicRuntimeHost : public RefCounted {
 
 	// Adapter of a chat agent on this machine; false (with r_error) when
 	// the agent has none or it is not installed.
-	bool _resolve_acp(const String &p_agent_id, String &r_bin, PackedStringArray &r_args, String &r_path, String &r_error) const;
-	Error _send_acp(const String &p_boss_id, const String &p_session_id, const String &p_text, int p_mode);
+	// p_autonomous: the agent's own no-approval command (acp_auto) for crew workers.
+	bool _resolve_acp(const String &p_agent_id, String &r_bin, PackedStringArray &r_args, String &r_path, String &r_error, bool p_autonomous = false) const;
+	// Adds the agent's chat environment (acp_env, e.g. KIMI_CODE_NO_AUTO_UPDATE=1).
+	static void _add_acp_env(const String &p_agent_id, Dictionary &r_env);
+	Error _send_acp(const String &p_boss_id, const String &p_session_id, const String &p_text, int p_mode, const Array &p_images = Array());
+	// The attached files as a note for the agent, and the images among them as
+	// {mime, base64, name} (small enough to send inline).
+	static String _attachments_note(const PackedStringArray &p_files);
+	static Array _attachment_images(const PackedStringArray &p_files);
 	Array _acp_mcp_servers(const String &p_dir, const String &p_path_value, bool p_with_crew) const;
 	String _boss_prompt(const String &p_text) const;
 	void _append_boss_instruction(Array &r_parts) const;
@@ -255,6 +281,19 @@ public:
 	bool poll_connection();
 	String get_session() const;
 	String get_project_dir() const;
+	// The model OpenCode uses when a prompt names none ("provider/model", or blank).
+	String get_default_model() const;
+	// Starts reading every installed agent's usage in the background.
+	void refresh_usage();
+	// The OpenCode Go key Lagoonic keeps (Configuracion > Proveedores), to ask
+	// opencode.ai how much of the Go plan is left.
+	void set_opencode_go_key(const String &p_key) { usage_mutex.lock(); opencode_go_key = p_key; usage_mutex.unlock(); }
+	// Last usage read: agent id -> {name, plan, windows, note, updated_msec}.
+	Dictionary get_usage() const;
+	bool is_reading_usage() const { return usage_running.is_set(); }
+	// Files (absolute paths) that go with the next send_prompt: images inline,
+	// every file also by path so the agent can read it.
+	void set_next_attachments(const PackedStringArray &p_files) { next_attachments = p_files; }
 	// Project folder without starting OpenCode (ACP bosses do not need it).
 	void set_project_dir(const String &p_project_dir);
 	// Boss that answers the chat ("opencode" or a chat agent id).

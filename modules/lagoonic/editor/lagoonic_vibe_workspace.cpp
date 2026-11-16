@@ -28,6 +28,7 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
+#include "scene/main/timer.h"
 #include "lagoonic_vibe_workspace.h"
 
 #include "lagoonic_agent_dock.h"
@@ -183,6 +184,7 @@ static const LagoonicBentoType LAGOONIC_BENTOS[] = {
 	{ "files", "Archivos", "Folder", "Explora tu proyecto y menciona archivos" },
 	{ "context", "Contexto", "Performance", "Modelo, mensajes y tiempo de este chat" },
 	{ "team", "Equipo", "Groups", "El líder y los ayudantes que lanza, en vivo" },
+	{ "usage", "Uso", "ProgressBar", "Cuánto te queda en cada agente" },
 	{ "scene", "Escena", "PackedScene", "Las piezas de la escena abierta, como en el editor" },
 	{ "inspector", "Propiedades", "Tools", "Cambia a mano los valores del elemento elegido" },
 	{ "game", "Juego", "Play", "Tu juego en marcha, aquí mismo" },
@@ -238,12 +240,40 @@ void LagoonicVibeWorkspace::_on_add_panel_selected(int p_index) {
 	}
 }
 
+Dictionary LagoonicVibeWorkspace::_get_usage() {
+	_ensure_runtime_host();
+	Dictionary d;
+	d["usage"] = runtime_host.is_valid() ? runtime_host->get_usage() : Dictionary();
+	d["reading"] = runtime_host.is_valid() && runtime_host->is_reading_usage();
+	return d;
+}
+
+void LagoonicVibeWorkspace::_refresh_usage() {
+	_ensure_runtime_host();
+	if (runtime_host.is_valid()) {
+		// The OpenCode Go key Lagoonic keeps (Configuracion > Proveedores).
+		runtime_host->set_opencode_go_key(String(LagoonicAgentSettings::secret_env().get("OPENCODE_API_KEY", "")));
+		runtime_host->refresh_usage();
+	}
+}
+
+void LagoonicVibeWorkspace::_stop_team_task(int p_number) {
+	if (runtime_host.is_valid() && runtime_host->get_crew().is_valid()) {
+		if (p_number < 0) {
+			runtime_host->get_crew()->clear_finished(); // -1: Limpiar terminadas.
+		} else {
+			runtime_host->get_crew()->stop_task(p_number);
+		}
+	}
+}
+
 Dictionary LagoonicVibeWorkspace::_get_team() {
 	_ensure_runtime_host();
 	Dictionary d;
 	const String boss = LagoonicAgentSettings::get_boss();
 	const LagoonicCodingAgents::AgentInfo *info = LagoonicCodingAgents::get_agent(boss);
 	d["boss_name"] = info != nullptr ? String::utf8(info->name) : String("OpenCode");
+	d["boss_id"] = boss.is_empty() ? String("opencode") : boss;
 	d["workers"] = LagoonicAgentSettings::crew_workers();
 	d["busy"] = agent_dock != nullptr && agent_dock->get_chat_view() != nullptr && agent_dock->get_chat_view()->is_busy();
 	d["now_msec"] = OS::get_singleton()->get_ticks_msec();
@@ -668,7 +698,11 @@ void LagoonicVibeWorkspace::_open_bento(const String &p_id, bool p_save) {
 		bento->set_content(panel);
 	} else if (p_id == "team") {
 		LagoonicTeamPanel *panel = memnew(LagoonicTeamPanel);
-		panel->setup(callable_mp(this, &LagoonicVibeWorkspace::_get_team));
+		panel->setup(callable_mp(this, &LagoonicVibeWorkspace::_get_team), callable_mp(this, &LagoonicVibeWorkspace::_stop_team_task));
+		bento->set_content(panel);
+	} else if (p_id == "usage") {
+		LagoonicUsagePanel *panel = memnew(LagoonicUsagePanel);
+		panel->setup(callable_mp(this, &LagoonicVibeWorkspace::_get_usage), callable_mp(this, &LagoonicVibeWorkspace::_refresh_usage));
 		bento->set_content(panel);
 	} else if (p_id == "scene") {
 		bento->set_content(memnew(LagoonicScenePanel));
@@ -1191,6 +1225,8 @@ void LagoonicVibeWorkspace::_on_agent_event(const StringName &p_event, const Var
 			: String("res://");
 
 	if (p_event == SNAME("send_requested")) {
+		// Files dropped on the chat go with this message.
+		runtime_host->set_next_attachments(p_b.get_type() == Variant::PACKED_STRING_ARRAY ? PackedStringArray(p_b) : PackedStringArray());
 		const String session = (chat != nullptr) ? chat->get_current_session() : String();
 		const int mode = (chat != nullptr) ? chat->get_mode() : 0;
 		String model = (chat != nullptr) ? chat->get_current_model() : String();
@@ -1318,6 +1354,13 @@ void LagoonicVibeWorkspace::_bind_methods() {
 }
 
 LagoonicVibeWorkspace::LagoonicVibeWorkspace() {
+	// El panel Equipo aparece en cuanto el lider reparte una tarea, aunque el
+	// chat no este a la vista (su tick solo corre mientras se ve).
+	Timer *team_timer = memnew(Timer);
+	team_timer->set_wait_time(0.5);
+	team_timer->set_autostart(true);
+	team_timer->connect("timeout", callable_mp(this, &LagoonicVibeWorkspace::_check_team_started));
+	add_child(team_timer);
 	singleton = this;
 	set_name("LagoonicVibeWorkspace");
 	set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);

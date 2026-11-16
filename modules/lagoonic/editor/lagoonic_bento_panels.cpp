@@ -36,7 +36,10 @@
 
 #include "core/config/project_settings.h"
 #include "core/object/callable_mp.h"
+#include "core/object/class_db.h"
+#include "core/os/os.h"
 #include "core/os/time.h"
+#include "core/io/json.h"
 #include "editor/docks/filesystem_dock.h"
 #include "editor/editor_data.h"
 #include "editor/editor_node.h"
@@ -44,8 +47,14 @@
 #include "editor/scene/scene_tree_editor.h"
 #include "editor/file_system/editor_file_system.h"
 #include "editor/themes/editor_scale.h"
+#include "lagoonic_agent_logos.gen.h"
 #include "scene/gui/button.h"
+#include "scene/resources/image_texture.h"
+#include "editor/settings/editor_settings.h"
+#include "scene/gui/graph_edit.h"
+#include "scene/gui/graph_node.h"
 #include "scene/gui/color_rect.h"
+#include "scene/gui/flow_container.h"
 #include "scene/gui/grid_container.h"
 #include "scene/gui/label.h"
 #include "scene/gui/line_edit.h"
@@ -529,6 +538,82 @@ static String _team_duration(uint64_t p_msec) {
 	return vformat("%d h %d min", int(secs / 3600), int((secs % 3600) / 60));
 }
 
+// Logo of a coding agent (editor/agent_logos, baked in by SCsub), or null.
+static Ref<Texture2D> _team_logo(const String &p_agent_id) {
+	static HashMap<String, Ref<Texture2D>> cache;
+	if (const Ref<Texture2D> *hit = cache.getptr(p_agent_id)) {
+		return *hit;
+	}
+	Ref<Texture2D> texture;
+	for (int i = 0; LAGOONIC_AGENT_LOGOS[i].id != nullptr; i++) {
+		if (p_agent_id != LAGOONIC_AGENT_LOGOS[i].id) {
+			continue;
+		}
+		Vector<uint8_t> bytes;
+		bytes.resize(LAGOONIC_AGENT_LOGOS[i].size);
+		memcpy(bytes.ptrw(), LAGOONIC_AGENT_LOGOS[i].data, LAGOONIC_AGENT_LOGOS[i].size);
+		Ref<Image> image;
+		image.instantiate();
+		if (image->load_png_from_buffer(bytes) == OK) {
+			texture = ImageTexture::create_from_image(image);
+		}
+		break;
+	}
+	cache[p_agent_id] = texture;
+	return texture;
+}
+
+// The agent's logo as a silhouette in the theme's text color, like the
+// editor's icons; the initial of its name when there is no logo.
+static Control *_team_badge(const String &p_agent_id, const String &p_name, float p_px) {
+	const int px = int(p_px * EDSCALE);
+	const Color tint = LagoonicVibeTheme::current().text;
+	const Ref<Texture2D> logo = _team_logo(p_agent_id);
+	if (logo.is_valid()) {
+		TextureRect *image = memnew(TextureRect);
+		image->set_texture(logo);
+		image->set_expand_mode(TextureRect::EXPAND_IGNORE_SIZE);
+		image->set_stretch_mode(TextureRect::STRETCH_KEEP_ASPECT_CENTERED);
+		image->set_custom_minimum_size(Size2(px, px));
+		image->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+		image->set_self_modulate(tint);
+		image->set_tooltip_text(p_name);
+		return image;
+	}
+	Label *initial = memnew(Label);
+	initial->set_text(p_name.strip_edges().left(1).to_upper());
+	initial->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
+	initial->set_vertical_alignment(VERTICAL_ALIGNMENT_CENTER);
+	initial->set_custom_minimum_size(Size2(px, px));
+	initial->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+	initial->add_theme_color_override(SceneStringName(font_color), tint);
+	initial->add_theme_font_size_override(SceneStringName(font_size), MAX(8, int(px * 0.75f)));
+	initial->set_tooltip_text(p_name);
+	return initial;
+}
+
+static String _team_boss_state(const Dictionary &p_team);
+
+static bool _team_task_live(const String &p_status) {
+	return p_status == "running" || p_status == "queued";
+}
+
+static Color _team_status_color(const String &p_status, const LagoonicVibeTheme::Palette &p) {
+	if (p_status == "running") {
+		return p.accent.lerp(Color(1, 1, 1), 0.2f);
+	}
+	if (p_status == "succeeded") {
+		return Color(0.4, 0.82, 0.5);
+	}
+	if (p_status == "failed") {
+		return Color(0.95, 0.45, 0.45);
+	}
+	if (p_status == "stopped" || p_status == "cancelled") {
+		return Color(0.95, 0.7, 0.35);
+	}
+	return p.text_muted;
+}
+
 String LagoonicTeamPanel::_status_text(const Dictionary &p_task, uint64_t p_now) {
 	const String status = p_task.get("status", "queued");
 	const uint64_t started = p_task.get("started_msec", 0);
@@ -542,15 +627,306 @@ String LagoonicTeamPanel::_status_text(const Dictionary &p_task, uint64_t p_now)
 	if (status == "failed") {
 		return String::utf8("No pudo terminar");
 	}
+	if (status == "stopped") {
+		return String::utf8("Detenida");
+	}
 	if (status == "cancelled") {
 		return String::utf8("Cancelada");
 	}
 	return String::utf8("En cola");
 }
 
-void LagoonicTeamPanel::setup(const Callable &p_provider) {
+// ---- Orbitas: constelacion con el lider al centro.
+
+LagoonicTeamOrbit::LagoonicTeamOrbit() {
+	set_clip_contents(true);
+	set_mouse_filter(MOUSE_FILTER_STOP);
+	set_process_internal(true);
+}
+
+void LagoonicTeamOrbit::set_team(const Dictionary &p_team) {
+	team = p_team;
+	queue_redraw();
+}
+
+void LagoonicTeamOrbit::set_selected_task(int p_number) {
+	selected_task = p_number;
+	queue_redraw();
+}
+
+bool LagoonicTeamOrbit::_animating() const {
+	const Array tasks = team.get("tasks", Array());
+	for (int i = 0; i < tasks.size(); i++) {
+		if (String(Dictionary(tasks[i]).get("status", "")) == "running") {
+			return true;
+		}
+	}
+	return false;
+}
+
+String LagoonicTeamOrbit::_hit_tooltip(const Point2 &p_pos) const {
+	for (int i = hits.size() - 1; i >= 0; i--) {
+		if (hits[i].pos.distance_to(p_pos) <= hits[i].radius + 3 * EDSCALE) {
+			return hits[i].tooltip;
+		}
+	}
+	return String();
+}
+
+String LagoonicTeamOrbit::get_tooltip(const Point2 &p_pos) const {
+	return _hit_tooltip(p_pos);
+}
+
+void LagoonicTeamOrbit::gui_input(const Ref<InputEvent> &p_event) {
+	const Ref<InputEventMouseButton> mb = p_event;
+	if (mb.is_null() || !mb->is_pressed() || mb->get_button_index() != MouseButton::LEFT) {
+		return;
+	}
+	int picked = 0;
+	for (int i = hits.size() - 1; i >= 0; i--) {
+		if (hits[i].task > 0 && hits[i].pos.distance_to(mb->get_position()) <= hits[i].radius + 3 * EDSCALE) {
+			picked = hits[i].task;
+			break;
+		}
+	}
+	selected_task = picked;
+	queue_redraw();
+	if (on_select.is_valid()) {
+		on_select.call(picked);
+	}
+	accept_event();
+}
+
+// Un nodo: disco con el logo del agente en el color del tema y un anillo que
+// dice el estado (un arco que gira mientras trabaja).
+static void _orbit_node(Control *p_canvas, const Vector2 &p_pos, float p_radius, const String &p_agent_id, const String &p_name, const Color &p_ring, bool p_running, bool p_selected, float p_time) {
+	const LagoonicVibeTheme::Palette p = LagoonicVibeTheme::current();
+	p_canvas->draw_circle(p_pos, p_radius, p.bg.lerp(p.surface, 0.6f), true, -1, true);
+	const float ring_w = MAX(1.5f, p_radius * 0.12f);
+	if (p_running) {
+		p_canvas->draw_arc(p_pos, p_radius, 0, Math::TAU, 48, Color(p_ring, 0.25f), ring_w, true);
+		const float start = p_time * 2.4f;
+		p_canvas->draw_arc(p_pos, p_radius, start, start + Math::PI * 0.7f, 24, p_ring, ring_w, true);
+	} else {
+		p_canvas->draw_arc(p_pos, p_radius, 0, Math::TAU, 48, p_ring, ring_w, true);
+	}
+	if (p_selected) {
+		p_canvas->draw_arc(p_pos, p_radius + ring_w * 2.2f, 0, Math::TAU, 48, Color(p.text, 0.7f), MAX(1.0f, ring_w * 0.6f), true);
+	}
+	const Ref<Texture2D> logo = _team_logo(p_agent_id);
+	const float side = p_radius * 1.15f;
+	if (logo.is_valid()) {
+		p_canvas->draw_texture_rect(logo, Rect2(p_pos - Vector2(side, side) * 0.5f, Vector2(side, side)), false, p.text);
+	} else {
+		const Ref<Font> font = p_canvas->get_theme_font(SceneStringName(font), SNAME("Label"));
+		const int size = MAX(8, int(p_radius * 0.9f));
+		const String initial = p_name.strip_edges().left(1).to_upper();
+		const Vector2 text_size = font->get_string_size(initial, HORIZONTAL_ALIGNMENT_LEFT, -1, size);
+		p_canvas->draw_string(font, p_pos + Vector2(-text_size.x * 0.5f, size * 0.35f), initial, HORIZONTAL_ALIGNMENT_LEFT, -1, size, p.text);
+	}
+}
+
+void LagoonicTeamOrbit::_notification(int p_what) {
+	if (p_what == NOTIFICATION_INTERNAL_PROCESS) {
+		if (is_visible_in_tree() && _animating()) {
+			time += get_process_delta_time();
+			queue_redraw();
+		}
+		return;
+	}
+	if (p_what != NOTIFICATION_DRAW) {
+		return;
+	}
+	hits.clear();
+	const LagoonicVibeTheme::Palette p = LagoonicVibeTheme::current();
+	const Vector2 size = get_size();
+	const Vector2 center = size * 0.5f;
+	const float span = MIN(size.x, size.y);
+	if (span <= 0) {
+		return;
+	}
+	const uint64_t now = team.get("now_msec", 0);
+	const Array workers = team.get("workers", Array());
+	const Array tasks = team.get("tasks", Array());
+
+	// Agentes: los ayudantes elegidos y quien tenga tareas.
+	Vector<String> agent_ids;
+	HashMap<String, String> agent_names;
+	for (int i = 0; i < workers.size(); i++) {
+		const Dictionary w = workers[i];
+		const String id = w.get("id", "");
+		if (!id.is_empty() && !agent_ids.has(id)) {
+			agent_ids.push_back(id);
+			agent_names[id] = w.get("name", id);
+		}
+	}
+	for (int i = 0; i < tasks.size(); i++) {
+		const Dictionary t = tasks[i];
+		const String id = t.get("worker_id", "");
+		if (!id.is_empty() && !agent_ids.has(id)) {
+			agent_ids.push_back(id);
+			agent_names[id] = t.get("worker_name", id);
+		}
+	}
+
+	const float boss_r = span * 0.075f;
+	const float agent_r = span * 0.05f;
+	const float task_r = span * 0.028f;
+	const float orbit_r = span * 0.27f;
+	const float sat_r = span * 0.12f;
+	const Color line = Color(p.accent, 0.35f);
+
+	// Orbita de los agentes (gira muy despacio mientras hay trabajo).
+	draw_arc(center, orbit_r, 0, Math::TAU, 96, Color(p.text, 0.10f), 1.0f * EDSCALE, true);
+	const float spin = time * 0.05f;
+
+	struct Placed {
+		Vector2 pos;
+		String id;
+	};
+	Vector<Placed> agents;
+	for (int a = 0; a < agent_ids.size(); a++) {
+		const float angle = -Math::PI * 0.5f + Math::TAU * a / MAX(1, agent_ids.size()) + spin;
+		Placed placed;
+		placed.pos = center + Vector2(Math::cos(angle), Math::sin(angle)) * orbit_r;
+		placed.id = agent_ids[a];
+		agents.push_back(placed);
+		draw_line(center, placed.pos, line, 1.2f * EDSCALE, true);
+	}
+
+	// Satelites: las tareas de cada agente en su propia orbita.
+	for (const Placed &agent : agents) {
+		Vector<Dictionary> own;
+		for (int i = 0; i < tasks.size(); i++) {
+			const Dictionary t = tasks[i];
+			if (String(t.get("worker_id", "")) == agent.id) {
+				own.push_back(t);
+			}
+		}
+		if (own.is_empty()) {
+			continue;
+		}
+		draw_arc(agent.pos, sat_r, 0, Math::TAU, 64, Color(p.text, 0.08f), 1.0f * EDSCALE, true);
+		// Las tareas miran hacia fuera de la constelacion.
+		const float outward = (agent.pos - center).angle();
+		bool any_running = false;
+		for (const Dictionary &t : own) {
+			any_running = any_running || String(t.get("status", "")) == "running";
+		}
+		const float drift = any_running ? time * 0.35f : 0.0f;
+		for (int k = 0; k < own.size(); k++) {
+			const Dictionary t = own[k];
+			const float spread = Math::PI * 1.2f;
+			const float angle = own.size() == 1 ? outward + drift : outward - spread * 0.5f + spread * k / (own.size() - 1) + drift;
+			const Vector2 pos = agent.pos + Vector2(Math::cos(angle), Math::sin(angle)) * sat_r;
+			const String status = t.get("status", "queued");
+			const int number = t.get("number", 0);
+			draw_line(agent.pos, pos, Color(line, 0.25f), 1.0f * EDSCALE, true);
+			_orbit_node(this, pos, task_r, agent.id, agent_names[agent.id], _team_status_color(status, p), status == "running", number == selected_task, time);
+			Hit hit;
+			hit.pos = pos;
+			hit.radius = task_r;
+			hit.task = number;
+			String tip = vformat(String::utf8("Tarea %d · %s\n%s · %s"), number, String(t.get("title", "")), agent_names[agent.id], LagoonicTeamPanel::_status_text(t, now));
+			const String model = t.get("model", "");
+			if (!model.is_empty()) {
+				tip += String::utf8("\nModelo: ") + model;
+			}
+			hit.tooltip = tip;
+			hits.push_back(hit);
+		}
+	}
+
+	// Agentes encima de sus lineas.
+	for (const Placed &agent : agents) {
+		bool busy = false;
+		String model;
+		int count = 0;
+		for (int i = 0; i < tasks.size(); i++) {
+			const Dictionary t = tasks[i];
+			if (String(t.get("worker_id", "")) != agent.id) {
+				continue;
+			}
+			count++;
+			busy = busy || _team_task_live(t.get("status", ""));
+			if (model.is_empty()) {
+				model = t.get("model", "");
+			}
+		}
+		_orbit_node(this, agent.pos, agent_r, agent.id, agent_names[agent.id], busy ? _team_status_color("running", p) : Color(p.text, 0.35f), false, false, time);
+		Hit hit;
+		hit.pos = agent.pos;
+		hit.radius = agent_r;
+		hit.tooltip = agent_names[agent.id] + (model.is_empty() ? String() : String::utf8("\nModelo: ") + model) + "\n" + (count == 0 ? String::utf8("Disponible") : vformat(String::utf8("%d tarea(s)"), count));
+		hits.push_back(hit);
+	}
+
+	// El lider, al centro.
+	const String boss_name = team.get("boss_name", "OpenCode");
+	_orbit_node(this, center, boss_r, team.get("boss_id", "opencode"), boss_name, p.accent, false, false, time);
+	Hit boss;
+	boss.pos = center;
+	boss.radius = boss_r;
+	boss.tooltip = String::utf8("Líder · ") + boss_name + "\n" + _team_boss_state(team);
+	hits.push_back(boss);
+}
+
+void LagoonicTeamPanel::_notification(int p_what) {
+	if (p_what == NOTIFICATION_THEME_CHANGED) {
+		// Logos y colores siguen al tema: se repinta todo.
+		signature = String();
+		callable_mp(this, &LagoonicTeamPanel::_refresh).call_deferred();
+	}
+}
+
+void LagoonicTeamPanel::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("setup", "provider", "stopper"), &LagoonicTeamPanel::setup, DEFVAL(Callable()));
+}
+
+void LagoonicTeamPanel::setup(const Callable &p_provider, const Callable &p_stopper) {
 	provider = p_provider;
+	stopper = p_stopper;
 	callable_mp(this, &LagoonicTeamPanel::_refresh).call_deferred();
+}
+
+void LagoonicTeamPanel::_set_view(int p_view) {
+	view = View(CLAMP(p_view, 0, 2));
+	list_scroll->set_visible(view == VIEW_LIST);
+	graph->set_visible(view == VIEW_GRAPH);
+	orbit->set_visible(view == VIEW_ORBIT);
+	center_button->set_visible(view == VIEW_GRAPH);
+	if (view == VIEW_LIST) {
+		details->set_visible(false);
+	}
+	signature = String(); // La otra vista se construye desde cero.
+	layout_signature = String();
+	_refresh();
+}
+
+void LagoonicTeamPanel::_apply_view_setting() {
+	String saved = "orbit";
+	EditorSettings *es = EditorSettings::get_singleton();
+	if (es != nullptr && es->has_setting("lagoonic/team/view")) {
+		saved = es->get_setting("lagoonic/team/view");
+	}
+	const View wanted = saved == "graph" ? VIEW_GRAPH : (saved == "list" ? VIEW_LIST : VIEW_ORBIT);
+	if (wanted != view || (!list_scroll->is_visible() && !graph->is_visible() && !orbit->is_visible())) {
+		_set_view(int(wanted));
+	}
+}
+
+void LagoonicTeamPanel::_on_orbit_selected(int p_number) {
+	selected_task = p_number;
+	orbit->set_selected_task(p_number);
+	_update_details();
+}
+
+void LagoonicTeamPanel::_on_stop(int p_number) {
+	if (stopper.is_valid()) {
+		stopper.call(p_number);
+	}
+	signature = String(); // Fuerza reconstruir con el nuevo estado.
+	_refresh();
 }
 
 void LagoonicTeamPanel::_on_report_toggled(int p_number) {
@@ -559,8 +935,17 @@ void LagoonicTeamPanel::_on_report_toggled(int p_number) {
 	} else {
 		open_reports.insert(p_number);
 	}
-	signature = String(); // Fuerza reconstruir.
+	signature = String();
 	_refresh();
+}
+
+void LagoonicTeamPanel::_on_node_selected(Node *p_node) {
+	if (p_node == nullptr) {
+		return;
+	}
+	const String name = p_node->get_name();
+	selected_task = name.begins_with("task_") ? name.trim_prefix("task_").to_int() : 0;
+	_update_details();
 }
 
 void LagoonicTeamPanel::_refresh() {
@@ -572,7 +957,8 @@ void LagoonicTeamPanel::_refresh() {
 		return;
 	}
 	const Dictionary team = got;
-	// Firma de lo que cambia la estructura (no el tiempo que corre).
+	last_team = team;
+	// Firma de lo que cambia la vista (no el tiempo que corre).
 	String sig = String(team.get("boss_name", "")) + "|" + itos(int(bool(team.get("busy", false)))) + "|";
 	const Array workers = team.get("workers", Array());
 	for (int i = 0; i < workers.size(); i++) {
@@ -581,13 +967,16 @@ void LagoonicTeamPanel::_refresh() {
 	const Array tasks = team.get("tasks", Array());
 	for (int i = 0; i < tasks.size(); i++) {
 		const Dictionary t = tasks[i];
-		sig += "|" + itos(int(t.get("number", 0))) + ":" + String(t.get("status", ""));
+		sig += "|" + itos(int(t.get("number", 0))) + ":" + String(t.get("status", "")) + ":" + String(t.get("model", ""));
 	}
 	if (sig != signature) {
 		signature = sig;
 		_rebuild(team);
 	} else {
 		_update_times(team);
+	}
+	if (view != VIEW_LIST) {
+		_update_details();
 	}
 }
 
@@ -607,34 +996,18 @@ void LagoonicTeamPanel::_update_times(const Dictionary &p_team) {
 }
 
 void LagoonicTeamPanel::_rebuild(const Dictionary &p_team) {
-	for (int i = list->get_child_count() - 1; i >= 0; i--) {
-		Node *c = list->get_child(i);
-		list->remove_child(c);
-		c->queue_free();
-	}
 	status_labels.clear();
-	const LagoonicVibeTheme::Palette p = LagoonicVibeTheme::current();
-	const uint64_t now = p_team.get("now_msec", 0);
 	const Array workers = p_team.get("workers", Array());
 	const Array tasks = p_team.get("tasks", Array());
-	const bool busy = p_team.get("busy", false);
-	const Color green = Color(0.4, 0.82, 0.5);
-	const Color red = Color(0.95, 0.45, 0.45);
-	const Color active = p.accent.lerp(Color(1, 1, 1), 0.2f);
-
 	int running = 0;
 	int queued = 0;
 	int done = 0;
-	HashSet<String> busy_workers;
 	for (int i = 0; i < tasks.size(); i++) {
-		const Dictionary t = tasks[i];
-		const String status = t.get("status", "");
+		const String status = Dictionary(tasks[i]).get("status", "");
 		if (status == "running") {
 			running++;
-			busy_workers.insert(t.get("worker_id", ""));
 		} else if (status == "queued") {
 			queued++;
-			busy_workers.insert(t.get("worker_id", ""));
 		} else {
 			done++;
 		}
@@ -642,11 +1015,11 @@ void LagoonicTeamPanel::_rebuild(const Dictionary &p_team) {
 	if (workers.is_empty() && tasks.is_empty()) {
 		summary->set_text(String::utf8("Tu líder trabaja solo. Añade ayudantes en Configuración › Equipo y verás aquí cada tarea que les reparta."));
 	} else if (tasks.is_empty()) {
-		summary->set_text(String::utf8("Cuando el líder reparta una tarea a un ayudante, aparecerá aquí enlazada a él."));
+		summary->set_text(String::utf8("Cuando el líder reparta una tarea a un ayudante, aparecerá aquí."));
 	} else if (running + queued > 0) {
 		PackedStringArray parts;
 		if (running > 0) {
-			parts.push_back(vformat(String::utf8("%d trabajando"), running));
+			parts.push_back(vformat(String::utf8("%d trabajando a la vez"), running));
 		}
 		if (queued > 0) {
 			parts.push_back(vformat(String::utf8("%d en cola"), queued));
@@ -658,8 +1031,50 @@ void LagoonicTeamPanel::_rebuild(const Dictionary &p_team) {
 	} else {
 		summary->set_text(done == 1 ? String::utf8("1 tarea repartida, ya terminada") : vformat(String::utf8("%d tareas repartidas, todas terminadas"), done));
 	}
+	stop_all->set_visible(running + queued > 0 && stopper.is_valid());
+	clear_done->set_visible(done > 0 && stopper.is_valid());
+	if (view == VIEW_GRAPH) {
+		_rebuild_graph(p_team);
+	} else if (view == VIEW_ORBIT) {
+		orbit->set_team(p_team);
+	} else {
+		_rebuild_list(p_team);
+	}
+}
 
-	// --- Lider ---
+static String _team_boss_state(const Dictionary &p_team) {
+	const Array tasks = p_team.get("tasks", Array());
+	for (int i = 0; i < tasks.size(); i++) {
+		if (_team_task_live(Dictionary(tasks[i]).get("status", ""))) {
+			return String::utf8("Esperando a su equipo");
+		}
+	}
+	return bool(p_team.get("busy", false)) ? String::utf8("Trabajando") : String::utf8("Listo");
+}
+
+static Button *_team_stop_button() {
+	Button *stop = memnew(Button);
+	stop->set_text(String::utf8("Detener"));
+	stop->set_flat(true);
+	stop->set_focus_mode(Control::FOCUS_NONE);
+	stop->set_h_size_flags(Control::SIZE_SHRINK_BEGIN);
+	stop->set_tooltip_text(String::utf8("Detiene esta tarea. Lo que ya escribió se queda en el proyecto."));
+	return stop;
+}
+
+// ---- Vista en lista (por defecto): el lider arriba y sus tareas colgando.
+
+void LagoonicTeamPanel::_rebuild_list(const Dictionary &p_team) {
+	for (int i = list->get_child_count() - 1; i >= 0; i--) {
+		Node *c = list->get_child(i);
+		list->remove_child(c);
+		c->queue_free();
+	}
+	const LagoonicVibeTheme::Palette p = LagoonicVibeTheme::current();
+	const uint64_t now = p_team.get("now_msec", 0);
+	const Array workers = p_team.get("workers", Array());
+	const Array tasks = p_team.get("tasks", Array());
+
 	PanelContainer *boss_card = memnew(PanelContainer);
 	{
 		Ref<StyleBoxFlat> sb;
@@ -672,9 +1087,14 @@ void LagoonicTeamPanel::_rebuild(const Dictionary &p_team) {
 		boss_card->add_theme_style_override(SceneStringName(panel), sb);
 	}
 	list->add_child(boss_card);
+	HBoxContainer *boss_row = memnew(HBoxContainer);
+	boss_row->add_theme_constant_override(SNAME("separation"), int(10 * EDSCALE));
+	boss_card->add_child(boss_row);
+	boss_row->add_child(_team_badge(p_team.get("boss_id", ""), p_team.get("boss_name", "OpenCode"), 30));
 	VBoxContainer *boss_box = memnew(VBoxContainer);
 	boss_box->add_theme_constant_override(SNAME("separation"), int(2 * EDSCALE));
-	boss_card->add_child(boss_box);
+	boss_box->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	boss_row->add_child(boss_box);
 	Label *boss_caption = memnew(Label);
 	boss_caption->set_text(String::utf8("Líder"));
 	boss_caption->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
@@ -686,16 +1106,10 @@ void LagoonicTeamPanel::_rebuild(const Dictionary &p_team) {
 	boss_box->add_child(boss_name);
 	Label *boss_state = memnew(Label);
 	boss_state->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
-	if (running + queued > 0) {
-		boss_state->set_text(String::utf8("Esperando a su equipo"));
-	} else if (busy) {
-		boss_state->set_text(String::utf8("Trabajando"));
-	} else {
-		boss_state->set_text(String::utf8("Listo"));
-	}
+	boss_state->set_text(_team_boss_state(p_team));
 	boss_box->add_child(boss_state);
 
-	// --- Tareas, colgando del lider por una linea ---
+	HashSet<String> busy_workers;
 	if (!tasks.is_empty()) {
 		HBoxContainer *branch = memnew(HBoxContainer);
 		branch->add_theme_constant_override(SNAME("separation"), int(10 * EDSCALE));
@@ -718,26 +1132,26 @@ void LagoonicTeamPanel::_rebuild(const Dictionary &p_team) {
 			const Dictionary t = tasks[i];
 			const String status = t.get("status", "queued");
 			const int number = t.get("number", 0);
-			Color dot_color = p.text_muted;
+			if (_team_task_live(status)) {
+				busy_workers.insert(t.get("worker_id", ""));
+			}
+			const Color color = _team_status_color(status, p);
 			String mark = String::utf8("○");
 			if (status == "running") {
-				dot_color = active;
 				mark = String::utf8("●");
 			} else if (status == "succeeded") {
-				dot_color = green;
 				mark = String::utf8("✓");
 			} else if (status == "failed") {
-				dot_color = red;
 				mark = String::utf8("!");
-			} else if (status == "cancelled") {
-				mark = String::utf8("×");
+			} else if (status == "stopped" || status == "cancelled") {
+				mark = String::utf8("■");
 			}
 			PanelContainer *card = memnew(PanelContainer);
 			{
 				Ref<StyleBoxFlat> sb;
 				sb.instantiate();
 				sb->set_bg_color(Color(p.text, status == "running" ? 0.07f : 0.04f));
-				sb->set_border_color(status == "running" ? Color(active, 0.5f) : Color(p.border, 0.6f));
+				sb->set_border_color(status == "running" ? Color(color, 0.5f) : Color(p.border, 0.6f));
 				sb->set_border_width_all(1);
 				sb->set_corner_radius_all(int(10 * EDSCALE));
 				sb->set_content_margin_individual(10 * EDSCALE, 8 * EDSCALE, 10 * EDSCALE, 8 * EDSCALE);
@@ -754,8 +1168,9 @@ void LagoonicTeamPanel::_rebuild(const Dictionary &p_team) {
 			Label *dot = memnew(Label);
 			dot->set_text(mark);
 			dot->set_custom_minimum_size(Size2(14 * EDSCALE, 0));
-			dot->add_theme_color_override(SceneStringName(font_color), dot_color);
+			dot->add_theme_color_override(SceneStringName(font_color), color);
 			head->add_child(dot);
+			head->add_child(_team_badge(t.get("worker_id", ""), t.get("worker_name", ""), 18));
 			Label *who = memnew(Label);
 			who->set_text(t.get("worker_name", ""));
 			who->set_h_size_flags(Control::SIZE_EXPAND_FILL);
@@ -773,17 +1188,30 @@ void LagoonicTeamPanel::_rebuild(const Dictionary &p_team) {
 			title->set_custom_minimum_size(Size2(1, 0));
 			box->add_child(title);
 
+			const String model = t.get("model", "");
+			if (!model.is_empty()) {
+				box->add_child(_bento_muted(String::utf8("Modelo: ") + model));
+			}
+
+			HBoxContainer *foot = memnew(HBoxContainer);
+			box->add_child(foot);
 			Label *state = memnew(Label);
 			state->set_text(_status_text(t, now));
 			state->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
-			if (status == "failed") {
-				state->add_theme_color_override(SceneStringName(font_color), red);
+			state->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+			if (status != "queued") {
+				state->add_theme_color_override(SceneStringName(font_color), color);
 			}
-			box->add_child(state);
+			foot->add_child(state);
 			status_labels[number] = state;
+			if (_team_task_live(status) && stopper.is_valid()) {
+				Button *stop = _team_stop_button();
+				stop->connect(SceneStringName(pressed), callable_mp(this, &LagoonicTeamPanel::_on_stop).bind(number));
+				foot->add_child(stop);
+			}
 
 			const String report = String(t.get("report", "")).strip_edges();
-			if (!report.is_empty() && (status == "succeeded" || status == "failed")) {
+			if (!report.is_empty() && !_team_task_live(status)) {
 				const bool open = open_reports.has(number);
 				Button *toggle = memnew(Button);
 				toggle->set_flat(true);
@@ -793,14 +1221,12 @@ void LagoonicTeamPanel::_rebuild(const Dictionary &p_team) {
 				toggle->connect(SceneStringName(pressed), callable_mp(this, &LagoonicTeamPanel::_on_report_toggled).bind(number));
 				box->add_child(toggle);
 				if (open) {
-					Label *text = _bento_muted(report.length() > 1500 ? report.substr(0, 1500) + String::utf8("…") : report);
-					box->add_child(text);
+					box->add_child(_bento_muted(report.length() > 1500 ? report.substr(0, 1500) + String::utf8("…") : report));
 				}
 			}
 		}
 	}
 
-	// --- Ayudantes sin tarea ahora mismo ---
 	PackedStringArray idle;
 	for (int i = 0; i < workers.size(); i++) {
 		const Dictionary w = workers[i];
@@ -813,17 +1239,677 @@ void LagoonicTeamPanel::_rebuild(const Dictionary &p_team) {
 	}
 }
 
+// ---- Vista en grafo: lider -> agentes -> tareas.
+
+void LagoonicTeamPanel::_update_details() {
+	Dictionary task;
+	const Array tasks = last_team.get("tasks", Array());
+	for (int i = 0; i < tasks.size(); i++) {
+		if (int(Dictionary(tasks[i]).get("number", 0)) == selected_task) {
+			task = tasks[i];
+			break;
+		}
+	}
+	if (task.is_empty() || view == VIEW_LIST) {
+		details->set_visible(false);
+		return;
+	}
+	details->set_visible(true);
+	const String status = task.get("status", "queued");
+	const String model = task.get("model", "");
+	details_title->set_text(vformat(String::utf8("Tarea %d · %s"), int(task.get("number", 0)), String(task.get("title", ""))));
+	String meta = String(task.get("worker_name", "")) + String::utf8(" · ") + _status_text(task, uint64_t(last_team.get("now_msec", 0)));
+	if (!model.is_empty()) {
+		meta += String::utf8(" · Modelo: ") + model;
+	}
+	details_meta->set_text(meta);
+	const String report = String(task.get("report", "")).strip_edges();
+	details_report->set_text(report.is_empty() ? String::utf8("Aún no ha contado nada al líder.") : (report.length() > 1500 ? report.substr(0, 1500) + String::utf8("…") : report));
+	details_stop->set_visible(_team_task_live(status) && stopper.is_valid());
+}
+
+static GraphNode *_team_node(const String &p_name, const String &p_title, const Color &p_accent, bool p_highlight, const String &p_agent_id = String(), const String &p_agent_name = String()) {
+	GraphNode *node = memnew(GraphNode);
+	node->set_name(p_name);
+	node->set_title(p_title);
+	node->set_resizable(false);
+	node->set_custom_minimum_size(Size2(220 * EDSCALE, 0));
+	// El borde dice el estado, como los nodos del editor de Godot.
+	Ref<StyleBoxFlat> sb;
+	sb.instantiate();
+	const LagoonicVibeTheme::Palette p = LagoonicVibeTheme::current();
+	sb->set_bg_color(Color(p.text, p_highlight ? 0.08f : 0.05f));
+	sb->set_border_color(Color(p_accent, p_highlight ? 0.85f : 0.45f));
+	sb->set_border_width_all(p_highlight ? 2 : 1);
+	sb->set_corner_radius_individual(0, 0, int(8 * EDSCALE), int(8 * EDSCALE));
+	sb->set_content_margin_individual(10 * EDSCALE, 6 * EDSCALE, 10 * EDSCALE, 8 * EDSCALE);
+	node->add_theme_style_override(SceneStringName(panel), sb);
+	Ref<StyleBoxFlat> bar;
+	bar.instantiate();
+	bar->set_bg_color(Color(p_accent, p_highlight ? 0.35f : 0.18f));
+	bar->set_corner_radius_individual(int(8 * EDSCALE), int(8 * EDSCALE), 0, 0);
+	bar->set_content_margin_individual(10 * EDSCALE, 4 * EDSCALE, 10 * EDSCALE, 4 * EDSCALE);
+	node->add_theme_style_override(SNAME("titlebar"), bar);
+	node->add_theme_style_override(SNAME("titlebar_selected"), bar);
+	if (!p_agent_id.is_empty()) {
+		// El logo del agente, delante del titulo.
+		HBoxContainer *titlebar = node->get_titlebar_hbox();
+		Control *badge = _team_badge(p_agent_id, p_agent_name, 16);
+		titlebar->add_child(badge);
+		titlebar->move_child(badge, 0);
+		titlebar->add_theme_constant_override(SNAME("separation"), int(6 * EDSCALE));
+	}
+	return node;
+}
+
+static Label *_team_line(const String &p_text, bool p_muted) {
+	Label *l = memnew(Label);
+	l->set_text(p_text);
+	if (p_muted) {
+		l->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
+	}
+	l->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+	l->set_custom_minimum_size(Size2(200 * EDSCALE, 0));
+	return l;
+}
+
+void LagoonicTeamPanel::_rebuild_graph(const Dictionary &p_team) {
+	graph->clear_connections();
+	// Lo que el usuario movio a mano se respeta mientras los nodos sean los mismos.
+	HashMap<String, Vector2> kept;
+	for (int i = graph->get_child_count() - 1; i >= 0; i--) {
+		GraphNode *node = Object::cast_to<GraphNode>(graph->get_child(i));
+		if (node != nullptr) {
+			kept[node->get_name()] = node->get_position_offset();
+			graph->remove_child(node);
+			node->queue_free();
+		}
+	}
+	const LagoonicVibeTheme::Palette p = LagoonicVibeTheme::current();
+	const uint64_t now = p_team.get("now_msec", 0);
+	const Array workers = p_team.get("workers", Array());
+	const Array tasks = p_team.get("tasks", Array());
+
+	Vector<String> agent_ids;
+	HashMap<String, String> agent_names;
+	for (int i = 0; i < workers.size(); i++) {
+		const Dictionary w = workers[i];
+		const String id = w.get("id", "");
+		if (!id.is_empty() && !agent_ids.has(id)) {
+			agent_ids.push_back(id);
+			agent_names[id] = w.get("name", id);
+		}
+	}
+	for (int i = 0; i < tasks.size(); i++) {
+		const Dictionary t = tasks[i];
+		const String id = t.get("worker_id", "");
+		if (!id.is_empty() && !agent_ids.has(id)) {
+			agent_ids.push_back(id);
+			agent_names[id] = t.get("worker_name", id);
+		}
+	}
+
+	String layout = "boss";
+	GraphNode *boss = _team_node("boss", String::utf8("Líder"), p.accent, true, p_team.get("boss_id", ""), p_team.get("boss_name", "OpenCode"));
+	boss->add_child(_team_line(p_team.get("boss_name", "OpenCode"), false));
+	boss->add_child(_team_line(_team_boss_state(p_team), true));
+	boss->set_slot(0, false, 0, Color(), true, 0, p.accent);
+	graph->add_child(boss);
+
+	for (const String &agent : agent_ids) {
+		// Las tareas de este agente, la mas reciente arriba.
+		Vector<Dictionary> own;
+		for (int i = tasks.size() - 1; i >= 0; i--) {
+			const Dictionary t = tasks[i];
+			if (String(t.get("worker_id", "")) == agent) {
+				own.push_back(t);
+			}
+		}
+		bool agent_busy = false;
+		String model;
+		for (const Dictionary &t : own) {
+			agent_busy = agent_busy || _team_task_live(t.get("status", ""));
+			if (model.is_empty()) {
+				model = t.get("model", "");
+			}
+		}
+		const String agent_node = "agent_" + agent.validate_node_name();
+		GraphNode *worker = _team_node(agent_node, agent_names[agent], agent_busy ? _team_status_color("running", p) : p.text_muted, agent_busy, agent, agent_names[agent]);
+		worker->add_child(_team_line(model.is_empty() ? String::utf8("Modelo: lo dice al empezar") : String::utf8("Modelo: ") + model, true));
+		worker->add_child(_team_line(own.is_empty() ? String::utf8("Disponible") : vformat(String::utf8("%d tarea(s)"), own.size()), true));
+		worker->set_slot(0, true, 0, p.accent, !own.is_empty(), 0, p.accent);
+		graph->add_child(worker);
+		graph->connect_node("boss", 0, agent_node, 0);
+		layout += "," + agent_node;
+
+		for (const Dictionary &t : own) {
+			const int number = t.get("number", 0);
+			const String status = t.get("status", "queued");
+			const Color color = _team_status_color(status, p);
+			const String task_node = "task_" + itos(number);
+			GraphNode *node = _team_node(task_node, vformat(String::utf8("Tarea %d"), number), color, status == "running" || number == selected_task, agent, agent_names[agent]);
+			node->add_child(_team_line(t.get("title", ""), false));
+			Label *state = _team_line(_status_text(t, now), true);
+			state->add_theme_color_override(SceneStringName(font_color), color);
+			node->add_child(state);
+			status_labels[number] = state;
+			const String task_model = t.get("model", "");
+			if (!task_model.is_empty() && task_model != model) {
+				node->add_child(_team_line(String::utf8("Modelo: ") + task_model, true));
+			}
+			if (_team_task_live(status) && stopper.is_valid()) {
+				Button *stop = _team_stop_button();
+				stop->connect(SceneStringName(pressed), callable_mp(this, &LagoonicTeamPanel::_on_stop).bind(number));
+				node->add_child(stop);
+			}
+			node->set_slot(0, true, 0, p.accent, false, 0, Color());
+			graph->add_child(node);
+			graph->connect_node(agent_node, 0, task_node, 0);
+			layout += "," + task_node;
+		}
+	}
+
+	if (layout != layout_signature) {
+		// Nodos nuevos: se recolocan con su tamano real y se centra todo
+		// cuando ya tienen tamano (un frame despues).
+		layout_signature = layout;
+		callable_mp(this, &LagoonicTeamPanel::_layout_graph).call_deferred();
+	} else {
+		for (int i = 0; i < graph->get_child_count(); i++) {
+			GraphNode *node = Object::cast_to<GraphNode>(graph->get_child(i));
+			if (node != nullptr && kept.has(node->get_name())) {
+				node->set_position_offset(kept[node->get_name()]);
+			}
+		}
+	}
+}
+
+void LagoonicTeamPanel::_layout_graph() {
+	// Columnas lider -> agentes -> tareas con su tamano real: cada tarea
+	// debajo de la anterior con aire, cada agente frente a sus tareas y el
+	// lider a la mitad de sus agentes.
+	const float col_gap = 90 * EDSCALE;
+	const float task_gap = 28 * EDSCALE;
+	const float group_gap = 56 * EDSCALE;
+	GraphNode *boss = Object::cast_to<GraphNode>(graph->get_node_or_null(NodePath("boss")));
+	if (boss == nullptr) {
+		return;
+	}
+	float col_width[3] = { boss->get_combined_minimum_size().x, 0, 0 };
+	Vector<GraphNode *> agents;
+	HashMap<GraphNode *, Vector<GraphNode *>> agent_tasks;
+	List<GraphEdit::Connection> unused;
+	(void)unused;
+	for (int i = 0; i < graph->get_child_count(); i++) {
+		GraphNode *node = Object::cast_to<GraphNode>(graph->get_child(i));
+		if (node == nullptr) {
+			continue;
+		}
+		const String name = node->get_name();
+		if (name.begins_with("agent_")) {
+			agents.push_back(node);
+			agent_tasks[node] = Vector<GraphNode *>();
+			col_width[1] = MAX(col_width[1], node->get_combined_minimum_size().x);
+		} else if (name.begins_with("task_")) {
+			col_width[2] = MAX(col_width[2], node->get_combined_minimum_size().x);
+		}
+	}
+	// Las tareas siguen a su agente en el orden en que se anadieron.
+	GraphNode *current = nullptr;
+	for (int i = 0; i < graph->get_child_count(); i++) {
+		GraphNode *node = Object::cast_to<GraphNode>(graph->get_child(i));
+		if (node == nullptr) {
+			continue;
+		}
+		const String name = node->get_name();
+		if (name.begins_with("agent_")) {
+			current = node;
+		} else if (name.begins_with("task_") && current != nullptr) {
+			agent_tasks[current].push_back(node);
+		}
+	}
+	const float x_agent = col_width[0] + col_gap;
+	const float x_task = x_agent + col_width[1] + col_gap;
+	float y = 0;
+	float first_center = -1;
+	float last_center = 0;
+	for (GraphNode *agent : agents) {
+		const float agent_h = agent->get_combined_minimum_size().y;
+		float tasks_h = 0;
+		for (GraphNode *task : agent_tasks[agent]) {
+			tasks_h += task->get_combined_minimum_size().y;
+		}
+		tasks_h += MAX(0, agent_tasks[agent].size() - 1) * task_gap;
+		const float group_h = MAX(agent_h, tasks_h);
+		// El agente, centrado frente a su grupo de tareas.
+		agent->set_position_offset(Vector2(x_agent, y + (group_h - agent_h) * 0.5f));
+		const float center = y + group_h * 0.5f;
+		if (first_center < 0) {
+			first_center = center;
+		}
+		last_center = center;
+		float task_y = y + (group_h - tasks_h) * 0.5f;
+		for (GraphNode *task : agent_tasks[agent]) {
+			task->set_position_offset(Vector2(x_task, task_y));
+			task_y += task->get_combined_minimum_size().y + task_gap;
+		}
+		y += group_h + group_gap;
+	}
+	const float boss_h = boss->get_combined_minimum_size().y;
+	const float boss_center = agents.is_empty() ? boss_h * 0.5f : (first_center + last_center) * 0.5f;
+	boss->set_position_offset(Vector2(0, boss_center - boss_h * 0.5f));
+	_center_graph();
+}
+
+void LagoonicTeamPanel::_center_graph() {
+	// Encaja el grafo en el panel (hasta el 100 %) y lo centra en ambos ejes.
+	Rect2 bounds;
+	bool first = true;
+	for (int i = 0; i < graph->get_child_count(); i++) {
+		GraphNode *node = Object::cast_to<GraphNode>(graph->get_child(i));
+		if (node == nullptr) {
+			continue;
+		}
+		const Rect2 r(node->get_position_offset(), node->get_combined_minimum_size().max(node->get_size()));
+		bounds = first ? r : bounds.merge(r);
+		first = false;
+	}
+	const Vector2 view = graph->get_size();
+	if (first || view.x <= 0 || view.y <= 0) {
+		return;
+	}
+	const Vector2 room = view - Vector2(48, 48) * EDSCALE;
+	const float zoom = CLAMP(MIN(room.x / bounds.size.x, room.y / bounds.size.y), 0.5f, 1.0f);
+	graph->set_zoom(zoom);
+	graph->set_scroll_offset((bounds.get_center() * zoom) - view * 0.5f);
+}
+
 LagoonicTeamPanel::LagoonicTeamPanel() {
-	add_theme_constant_override(SNAME("separation"), int(10 * EDSCALE));
+	add_theme_constant_override(SNAME("separation"), int(8 * EDSCALE));
+
+	HBoxContainer *top = memnew(HBoxContainer);
+	top->add_theme_constant_override(SNAME("separation"), int(6 * EDSCALE));
+	add_child(top);
 	summary = _bento_muted(String());
-	add_child(summary);
+	summary->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	top->add_child(summary);
+	center_button = memnew(Button);
+	center_button->set_text(String::utf8("Centrar"));
+	center_button->set_flat(true);
+	center_button->set_tooltip_text(String::utf8("Recoloca y centra el grafo."));
+	center_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicTeamPanel::_layout_graph));
+	top->add_child(center_button);
+	stop_all = memnew(Button);
+	stop_all->set_text(String::utf8("Detener todo"));
+	stop_all->set_tooltip_text(String::utf8("Detiene todas las tareas en marcha o en cola."));
+	stop_all->set_visible(false);
+	stop_all->connect(SceneStringName(pressed), callable_mp(this, &LagoonicTeamPanel::_on_stop).bind(0));
+	top->add_child(stop_all);
+	clear_done = memnew(Button);
+	clear_done->set_text(String::utf8("Limpiar terminadas"));
+	clear_done->set_tooltip_text(String::utf8("Quita del equipo las tareas que ya terminaron, fallaron o se detuvieron. Sus archivos no se tocan."));
+	clear_done->set_visible(false);
+	clear_done->connect(SceneStringName(pressed), callable_mp(this, &LagoonicTeamPanel::_on_stop).bind(-1));
+	top->add_child(clear_done);
+
 	list = memnew(VBoxContainer);
 	list->add_theme_constant_override(SNAME("separation"), int(8 * EDSCALE));
-	add_child(_bento_scroll(list));
+	list_scroll = _bento_scroll(list);
+	add_child(list_scroll);
+
+	graph = memnew(GraphEdit);
+	graph->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+	graph->set_custom_minimum_size(Size2(0, 220 * EDSCALE));
+	graph->set_show_menu(false);
+	graph->set_show_grid_buttons(false);
+	graph->set_show_minimap_button(false);
+	graph->set_show_arrange_button(false);
+	graph->set_minimap_enabled(false);
+	graph->set_zoom_min(0.4);
+	graph->set_connection_lines_curvature(0.6);
+	graph->set_connection_lines_thickness(2 * EDSCALE);
+	graph->connect("node_selected", callable_mp(this, &LagoonicTeamPanel::_on_node_selected));
+	// Al cambiar el tamano del panel, el grafo se vuelve a centrar.
+	graph->connect(SceneStringName(resized), callable_mp(this, &LagoonicTeamPanel::_center_graph));
+	add_child(graph);
+
+	orbit = memnew(LagoonicTeamOrbit);
+	orbit->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+	orbit->set_custom_minimum_size(Size2(0, 260 * EDSCALE));
+	orbit->set_on_select(callable_mp(this, &LagoonicTeamPanel::_on_orbit_selected));
+	add_child(orbit);
+
+	details = memnew(PanelContainer);
+	details->set_visible(false);
+	{
+		const LagoonicVibeTheme::Palette p = LagoonicVibeTheme::current();
+		Ref<StyleBoxFlat> sb;
+		sb.instantiate();
+		sb->set_bg_color(Color(p.text, 0.04f));
+		sb->set_border_color(Color(p.border, 0.6f));
+		sb->set_border_width_all(1);
+		sb->set_corner_radius_all(int(8 * EDSCALE));
+		sb->set_content_margin_individual(10 * EDSCALE, 8 * EDSCALE, 10 * EDSCALE, 8 * EDSCALE);
+		details->add_theme_style_override(SceneStringName(panel), sb);
+	}
+	add_child(details);
+	VBoxContainer *details_box = memnew(VBoxContainer);
+	details_box->add_theme_constant_override(SNAME("separation"), int(4 * EDSCALE));
+	details->add_child(details_box);
+	HBoxContainer *details_head = memnew(HBoxContainer);
+	details_box->add_child(details_head);
+	details_title = memnew(Label);
+	details_title->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	details_title->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
+	details_title->set_custom_minimum_size(Size2(1, 0));
+	details_head->add_child(details_title);
+	details_stop = memnew(Button);
+	details_stop->set_text(String::utf8("Detener"));
+	details_stop->connect(SceneStringName(pressed), callable_mp(this, &LagoonicTeamPanel::_on_stop_selected));
+	details_head->add_child(details_stop);
+	details_meta = _bento_muted(String());
+	details_box->add_child(details_meta);
+	details_report = memnew(Label);
+	details_report->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+	details_report->set_custom_minimum_size(Size2(1, 0));
+	ScrollContainer *report_scroll = _bento_scroll(details_report);
+	report_scroll->set_custom_minimum_size(Size2(0, 90 * EDSCALE));
+	report_scroll->set_v_size_flags(Control::SIZE_FILL);
+	details_box->add_child(report_scroll);
+
 	timer = memnew(Timer);
 	timer->set_wait_time(0.5);
 	timer->set_autostart(true);
 	timer->connect("timeout", callable_mp(this, &LagoonicTeamPanel::_refresh));
+	add_child(timer);
+
+	// La vista sale de Configuracion > Temas (Orbitas por defecto) y cambia
+	// en cuanto el usuario la cambia alli.
+	list_scroll->set_visible(false);
+	graph->set_visible(false);
+	orbit->set_visible(false);
+	view = VIEW_ORBIT;
+	_apply_view_setting();
+	if (EditorSettings::get_singleton() != nullptr) {
+		EditorSettings::get_singleton()->connect(SNAME("settings_changed"), callable_mp(this, &LagoonicTeamPanel::_apply_view_setting));
+	}
+}
+
+// ---------------------------------------------------------------- Uso
+
+static constexpr uint64_t USAGE_REFRESH_MSEC = 5 * 60 * 1000;
+
+void LagoonicUsagePanel::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("setup", "provider", "refresher"), &LagoonicUsagePanel::setup);
+}
+
+void LagoonicUsagePanel::setup(const Callable &p_provider, const Callable &p_refresher) {
+	provider = p_provider;
+	refresher = p_refresher;
+	_on_refresh_pressed();
+}
+
+void LagoonicUsagePanel::_on_refresh_pressed() {
+	last_refresh_msec = OS::get_singleton()->get_ticks_msec();
+	if (refresher.is_valid()) {
+		refresher.call();
+	}
+	_refresh();
+}
+
+static String _usage_resets_text(const Dictionary &p_window) {
+	const int64_t at = p_window.get("resets_at", 0);
+	if (at > 0) {
+		const int64_t left = at - int64_t(Time::get_singleton()->get_unix_time_from_system());
+		if (left <= 0) {
+			return String::utf8("Se reinicia ya");
+		}
+		if (left < 3600) {
+			return vformat(String::utf8("Se reinicia en %d min"), int(left / 60) + 1);
+		}
+		if (left < 86400) {
+			return vformat(String::utf8("Se reinicia en %d h %d min"), int(left / 3600), int((left % 3600) / 60));
+		}
+		return vformat(String::utf8("Se reinicia en %d d %d h"), int(left / 86400), int((left % 86400) / 3600));
+	}
+	const String text = p_window.get("resets_text", "");
+	return text.is_empty() ? String() : String::utf8("Se reinicia ") + text;
+}
+
+void LagoonicUsagePanel::_refresh() {
+	if (!provider.is_valid() || !is_visible_in_tree()) {
+		return;
+	}
+	if (OS::get_singleton()->get_ticks_msec() - last_refresh_msec > USAGE_REFRESH_MSEC) {
+		_on_refresh_pressed();
+		return;
+	}
+	const Variant got = provider.call();
+	if (got.get_type() != Variant::DICTIONARY) {
+		return;
+	}
+	const Dictionary data = got;
+	const bool reading = data.get("reading", false);
+	refresh_button->set_disabled(reading);
+	refresh_button->set_button_icon(get_editor_theme_icon(SNAME("Reload")));
+	const Dictionary usage = data.get("usage", Dictionary());
+	// Los textos de reinicio cambian con el tiempo: se repinta cada minuto.
+	const String sig = JSON::stringify(usage) + itos(int(Time::get_singleton()->get_unix_time_from_system() / 60));
+	if (sig != signature) {
+		signature = sig;
+		_rebuild(usage);
+	}
+}
+
+static Color _usage_color(double p_remaining, const LagoonicVibeTheme::Palette &p) {
+	return p_remaining <= 10 ? Color(0.95, 0.45, 0.45) : (p_remaining <= 30 ? Color(0.95, 0.7, 0.35) : p.accent);
+}
+
+LagoonicUsageRings::LagoonicUsageRings() {
+	set_custom_minimum_size(Size2(120, 120) * EDSCALE);
+	set_mouse_filter(MOUSE_FILTER_PASS);
+}
+
+void LagoonicUsageRings::set_remaining(int p_kind, double p_remaining) {
+	if (p_kind >= 0 && p_kind < 3) {
+		remaining[p_kind] = p_remaining < 0 ? -1 : CLAMP(p_remaining, 0.0, 100.0);
+		queue_redraw();
+	}
+}
+
+void LagoonicUsageRings::_notification(int p_what) {
+	if (p_what != NOTIFICATION_DRAW) {
+		return;
+	}
+	const LagoonicVibeTheme::Palette p = LagoonicVibeTheme::current();
+	const Vector2 size = get_size();
+	const Vector2 center = size * 0.5f;
+	const float span = MIN(size.x, size.y);
+	// Exterior ancho (sesion), luego semanal y mensual, mas finos.
+	const float widths[3] = { span * 0.12f, span * 0.075f, span * 0.055f };
+	const float gap = span * 0.035f;
+	float outer = span * 0.5f - 1.0f;
+	for (int k = 0; k < 3; k++) {
+		const float radius = outer - widths[k] * 0.5f;
+		if (remaining[k] >= 0) {
+			draw_arc(center, radius, 0, Math::TAU, 96, Color(p.text, 0.09f), widths[k], true);
+			const float start = -Math::PI * 0.5f;
+			const float sweep = float(Math::TAU * remaining[k] / 100.0);
+			if (sweep > 0.01f) {
+				draw_arc(center, radius, start, start + sweep, MAX(8, int(96 * remaining[k] / 100.0)), _usage_color(remaining[k], p), widths[k], true);
+			}
+		}
+		outer -= widths[k] + gap;
+	}
+	// En el centro, lo que queda de la sesion (o de lo primero que haya);
+	// sin datos, un anillo tenue y una raya.
+	double shown = -1;
+	for (int k = 0; k < 3 && shown < 0; k++) {
+		shown = remaining[k];
+	}
+	if (shown < 0) {
+		draw_arc(center, span * 0.5f - 1.0f - widths[0] * 0.5f, 0, Math::TAU, 96, Color(p.text, 0.06f), widths[0], true);
+	}
+	{
+		const Ref<Font> font = get_theme_font(SceneStringName(font), SNAME("Label"));
+		const int font_size = MAX(10, int(span * 0.18f));
+		const String text = shown < 0 ? String::utf8("—") : itos(int(Math::round(shown))) + "%";
+		const Vector2 text_size = font->get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size);
+		draw_string(font, center + Vector2(-text_size.x * 0.5f, font_size * 0.35f), text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, shown < 0 ? p.text_muted : p.text);
+	}
+}
+
+void LagoonicUsagePanel::_rebuild(const Dictionary &p_usage) {
+	for (int i = list->get_child_count() - 1; i >= 0; i--) {
+		Node *c = list->get_child(i);
+		list->remove_child(c);
+		c->queue_free();
+	}
+	const LagoonicVibeTheme::Palette p = LagoonicVibeTheme::current();
+	if (p_usage.is_empty()) {
+		summary->set_text(String::utf8("Leyendo…"));
+		return;
+	}
+	summary->set_text(String::utf8("Anillo exterior: sesión · interior: semana · más adentro: mes"));
+	// Los proveedores de un solo juego de anillos van juntos en una fila; los
+	// que tienen varios grupos (Antigravity) ocupan la suya.
+	Array ids = p_usage.keys();
+	Array compact_ids;
+	Array wide_ids;
+	for (int i = 0; i < ids.size(); i++) {
+		const Array windows = Dictionary(p_usage[ids[i]]).get("windows", Array());
+		Vector<String> groups;
+		for (int w = 0; w < windows.size(); w++) {
+			const String g = Dictionary(windows[w]).get("group", "");
+			if (!groups.has(g)) {
+				groups.push_back(g);
+			}
+		}
+		(groups.size() > 1 ? wide_ids : compact_ids).push_back(ids[i]);
+	}
+	ids = compact_ids.duplicate(); // Array is shared by reference: copy before appending.
+	ids.append_array(wide_ids);
+	HFlowContainer *compact_row = nullptr;
+	for (int i = 0; i < ids.size(); i++) {
+		const String id = ids[i];
+		const Dictionary entry = p_usage[id];
+		const String name = entry.get("name", id);
+		const bool compact = compact_ids.has(id);
+		if (i > 0 && !compact) {
+			ColorRect *rule = memnew(ColorRect);
+			rule->set_color(Color(p.text, 0.06f));
+			rule->set_custom_minimum_size(Size2(0, MAX(1, int(EDSCALE))));
+			list->add_child(rule);
+		}
+		// Bloque del proveedor: en la fila compartida, o en el panel entero.
+		VBoxContainer *block_box = memnew(VBoxContainer);
+		block_box->add_theme_constant_override(SNAME("separation"), int(8 * EDSCALE));
+		if (compact) {
+			if (compact_row == nullptr) {
+				compact_row = memnew(HFlowContainer);
+				compact_row->add_theme_constant_override(SNAME("h_separation"), int(28 * EDSCALE));
+				compact_row->add_theme_constant_override(SNAME("v_separation"), int(14 * EDSCALE));
+				list->add_child(compact_row);
+			}
+			block_box->set_custom_minimum_size(Size2(130 * EDSCALE, 0));
+			compact_row->add_child(block_box);
+		} else {
+			list->add_child(block_box);
+		}
+		HBoxContainer *head = memnew(HBoxContainer);
+		head->add_theme_constant_override(SNAME("separation"), int(6 * EDSCALE));
+		block_box->add_child(head);
+		head->add_child(_team_badge(id, name, 14));
+		Label *title = memnew(Label);
+		title->set_text(name);
+		title->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+		head->add_child(title);
+		const String plan = entry.get("plan", "");
+		if (!plan.is_empty()) {
+			Label *plan_label = memnew(Label);
+			plan_label->set_text(plan);
+			plan_label->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
+			head->add_child(plan_label);
+		}
+
+		HFlowContainer *rings_row = memnew(HFlowContainer);
+		rings_row->add_theme_constant_override(SNAME("h_separation"), int(18 * EDSCALE));
+		rings_row->add_theme_constant_override(SNAME("v_separation"), int(10 * EDSCALE));
+		block_box->add_child(rings_row);
+
+		// Un juego de anillos por grupo de modelos (Antigravity tiene varios).
+		const Array windows = entry.get("windows", Array());
+		Vector<String> groups;
+		for (int w = 0; w < windows.size(); w++) {
+			const String g = Dictionary(windows[w]).get("group", "");
+			if (!groups.has(g)) {
+				groups.push_back(g);
+			}
+		}
+		if (groups.is_empty()) {
+			// Sin datos: un anillo vacio; el motivo, al pasar el raton.
+			LagoonicUsageRings *rings = memnew(LagoonicUsageRings);
+			rings->set_custom_minimum_size(Size2(84, 84) * EDSCALE);
+			rings->set_tooltip_text(entry.get("note", String::utf8("Este agente no informa su uso.")));
+			rings_row->add_child(rings);
+			continue;
+		}
+		for (const String &group : groups) {
+			VBoxContainer *block = memnew(VBoxContainer);
+			block->add_theme_constant_override(SNAME("separation"), int(2 * EDSCALE));
+			rings_row->add_child(block);
+			LagoonicUsageRings *rings = memnew(LagoonicUsageRings);
+			rings->set_custom_minimum_size(Size2(84, 84) * EDSCALE);
+			rings->set_h_size_flags(Control::SIZE_SHRINK_CENTER);
+			block->add_child(rings);
+			if (!group.is_empty()) {
+				Label *group_label = memnew(Label);
+				group_label->set_text(group);
+				group_label->set_theme_type_variation(LagoonicVibeTheme::MUTED_LABEL);
+				group_label->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
+				group_label->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+				group_label->set_custom_minimum_size(Size2(96 * EDSCALE, 0));
+				block->add_child(group_label);
+			}
+			String tooltip = group.is_empty() ? name : group;
+			static const char *kind_names[3] = { "Sesión", "Semana", "Mes" };
+			for (int w = 0; w < windows.size(); w++) {
+				const Dictionary window = windows[w];
+				if (String(window.get("group", "")) != group) {
+					continue;
+				}
+				const String kind = window.get("kind", "");
+				const int kk = kind == "weekly" ? 1 : (kind == "monthly" ? 2 : 0);
+				const double left = 100.0 - CLAMP(double(window.get("used_percent", 0)), 0.0, 100.0);
+				rings->set_remaining(kk, left);
+				const String resets = _usage_resets_text(window);
+				tooltip += "\n" + String::utf8(kind_names[kk]) + ": " + itos(int(Math::round(left))) + String::utf8(" % libre") + (resets.is_empty() ? String() : String::utf8(" · ") + resets.to_lower());
+			}
+			rings->set_tooltip_text(tooltip);
+		}
+	}
+}
+
+LagoonicUsagePanel::LagoonicUsagePanel() {
+	add_theme_constant_override(SNAME("separation"), int(10 * EDSCALE));
+	HBoxContainer *top = memnew(HBoxContainer);
+	add_child(top);
+	summary = _bento_muted(String());
+	summary->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	top->add_child(summary);
+	refresh_button = memnew(Button);
+	refresh_button->set_flat(true);
+	refresh_button->set_focus_mode(Control::FOCUS_NONE);
+	refresh_button->set_tooltip_text(String::utf8("Volver a preguntar a cada agente cuánto le queda."));
+	refresh_button->connect(SceneStringName(pressed), callable_mp(this, &LagoonicUsagePanel::_on_refresh_pressed));
+	top->add_child(refresh_button);
+	list = memnew(VBoxContainer);
+	list->add_theme_constant_override(SNAME("separation"), int(10 * EDSCALE));
+	add_child(_bento_scroll(list));
+	timer = memnew(Timer);
+	timer->set_wait_time(1.0);
+	timer->set_autostart(true);
+	timer->connect("timeout", callable_mp(this, &LagoonicUsagePanel::_refresh));
 	add_child(timer);
 }
 

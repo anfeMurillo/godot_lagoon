@@ -58,6 +58,11 @@ class LayerHost final : public Control {
 	HashMap<DisplayServerEnums::CursorShape, CustomCursor> custom_cursors;
 
 	virtual void gui_input(const Ref<InputEvent> &p_event) override;
+	// Lagoonic: while the game holds the mouse (captured / confined), macOS
+	// parks the cursor at the editor window's center; when the game view does
+	// not cover that point (a small card in the Vibe board), the GUI would
+	// route the mouse elsewhere. Forward it here instead.
+	virtual void input(const Ref<InputEvent> &p_event) override;
 
 protected:
 	void _notification(int p_what);

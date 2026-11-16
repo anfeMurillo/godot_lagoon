@@ -108,6 +108,7 @@
 #include "core/object/ref_counted.h"
 #include "core/os/mutex.h"
 #include "core/os/thread.h"
+#include "core/templates/hash_set.h"
 
 #include "lagoonic_crew_server.h" // LagoonicCrewTools.
 
@@ -119,6 +120,8 @@ struct LagoonicCrewTask {
 	String worker_id; // 'opencode' or the coding agent's id.
 	String status = "queued"; // queued|running|succeeded|failed|cancelled.
 	String report;
+	String model; // The model the worker said it runs ("" until it starts).
+	String requested_model; // The model the boss asked for ("" = worker's default).
 	uint64_t started_msec = 0; // Ticks when the worker started; 0 while queued.
 	uint64_t finished_msec = 0; // Ticks when it ended; 0 while it runs.
 };
@@ -137,8 +140,15 @@ public:
 	// One blocking worker turn. Returns the report ("..." when the worker
 	// said nothing); sets r_error when the turn itself failed. Must return
 	// promptly after abort_worker().
-	virtual String crew_run_worker(const String &p_worker_id, const String &p_prompt, const String &p_title, int p_number, const String &p_boss_session_id, String &r_error) = 0;
+	virtual String crew_run_worker(const String &p_worker_id, const String &p_model, const String &p_prompt, const String &p_title, int p_number, const String &p_boss_session_id, String &r_error) = 0;
+	// The models worker p_worker_id offers, as text; may start fetching them
+	// in the background and say so. Main thread.
+	virtual String crew_model_catalog(const String &p_worker_id, const String &p_worker_name) = 0;
 	virtual void crew_abort_worker() = 0;
+	// Stops one running task's worker; returns promptly.
+	virtual void crew_abort_task(int p_number) = 0;
+	// Gives a running task's worker more instructions; false when it is not running.
+	virtual bool crew_message_task(int p_number, const String &p_message) = 0;
 	virtual void crew_adopt_external_since(uint64_t p_since_msec) = 0;
 	virtual void crew_request_editor_reload() = 0;
 	// The wake-up as a normal boss turn; the implementation calls
@@ -179,12 +189,23 @@ private:
 	bool crew_in_progress = false;
 	bool crew_cancelled = false;
 	String fatal_error; // Set by fail(): no new crew may start.
+	HashSet<int> stopped_tasks; // Tasks the user or the boss stopped.
 	String last_error;
 
 	void _join_finished_thread();
 	static void _thread_entry(void *p_userdata);
 	void _run_crew(const String &p_boss_session_id);
-	bool _sleep_gap() const; // False when the round must stop now.
+	// One task of a round, on its own thread (tasks run in parallel).
+	struct TaskJob {
+		LagoonicCrewOrchestrator *self = nullptr;
+		LagoonicCrewTask *task = nullptr;
+		String boss_name;
+		String boss_session;
+		int start_delay_msec = 0;
+	};
+	static void _task_entry(void *p_userdata);
+	void _run_task(TaskJob &p_job);
+	bool _sleep_msec(int p_msec) const; // False when the round must stop now.
 
 	static bool _report_is_failure(const String &p_report);
 	void _mirror_task(const LagoonicCrewTask &p_task); // Call with the mutex held.
@@ -199,11 +220,24 @@ public:
 
 	// LagoonicCrewTools (called by the MCP server on the main thread).
 	virtual Vector<String> crew_worker_names() const override;
-	virtual String crew_start_worker(const String &p_title, const String &p_spec, const String &p_worker, String &r_error) override;
+	virtual String crew_start_worker(const String &p_title, const String &p_spec, const String &p_worker, const String &p_model, bool p_from_boss, String &r_error) override;
+	virtual String crew_list_models(const String &p_worker) override;
 	virtual Vector<Dictionary> crew_list_workers() const override;
+	virtual String crew_stop_worker(int p_number, String &r_error) override;
+	virtual String crew_clear_workers() override { return clear_finished(); }
+	virtual String crew_message_worker(int p_number, const String &p_message, String &r_error) override;
+	// Drops the tasks that ended (succeeded, failed, stopped, cancelled) from the list.
+	String clear_finished();
+	String message_worker(int p_number, const String &p_message); // For scripts and tests.
+	// Stops task p_number, or every running/queued task with 0 (panel button
+	// or the boss's stop_worker). Returns what happened, or "" with
+	// get_last_error().
+	String stop_task(int p_number);
+	// A worker states its model when it starts (any thread).
+	void note_task_model(const String &p_model, int p_number);
 
 	// queue_task returns the message for the boss, or "" and get_last_error().
-	String queue_task(const String &p_title, const String &p_spec, const String &p_worker);
+	String queue_task(const String &p_title, const String &p_spec, const String &p_worker, bool p_from_boss = false, const String &p_model = String());
 
 	// Stops the round: queued tasks are dropped, the running worker is
 	// aborted (finishes silently), no wake-up follows.
@@ -217,8 +251,8 @@ public:
 	void maybe_run(const String &p_boss_session_id);
 	bool is_in_progress() const;
 	// Every task the boss started in this session, oldest first, for the UI:
-	// {number, title, worker_name, worker_id, status, report, started_msec,
-	// finished_msec}. Times are engine ticks.
+	// {number, title, worker_name, worker_id, model, status, report,
+	// started_msec, finished_msec}. Times are engine ticks.
 	Array snapshot() const;
 	String get_boss_id() const;
 	bool is_failed() const;

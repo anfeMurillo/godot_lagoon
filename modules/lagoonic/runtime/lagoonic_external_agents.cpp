@@ -407,6 +407,7 @@ bool LagoonicExternalAgents::can_connect(const LagoonicCodingAgents::AgentInfo &
 		case LagoonicCodingAgents::REG_CLI:
 			return p_has_project;
 		case LagoonicCodingAgents::REG_NONE:
+		case LagoonicCodingAgents::REG_MANUAL:
 			return false;
 	}
 	return false;
@@ -424,6 +425,7 @@ bool LagoonicExternalAgents::has_config(const LagoonicCodingAgents::AgentInfo &p
 			return FileAccess::exists(vibe_config_path());
 		case LagoonicCodingAgents::REG_CLI:
 		case LagoonicCodingAgents::REG_NONE:
+		case LagoonicCodingAgents::REG_MANUAL:
 			return false;
 	}
 	return false;
@@ -502,6 +504,7 @@ bool LagoonicExternalAgents::is_connected(const LagoonicCodingAgents::AgentInfo 
 		}
 		case LagoonicCodingAgents::REG_CLI:
 		case LagoonicCodingAgents::REG_NONE:
+		case LagoonicCodingAgents::REG_MANUAL:
 			// The agent owns its config; Lagoonic cannot read it back.
 			return false;
 	}
@@ -614,6 +617,9 @@ bool LagoonicExternalAgents::connect_agent(const String &p_id, const String &p_p
 		case LagoonicCodingAgents::REG_NONE:
 			r_error = String(agent->name) + " loads lagoonic-mcp on its own; nothing to connect.";
 			return false;
+		case LagoonicCodingAgents::REG_MANUAL:
+			r_error = String(agent->name) + " has no automatic way to add lagoonic-mcp; add it by hand following " + String(agent->docs_url) + ".";
+			return false;
 	}
 	r_error = "Unknown registration for " + p_id;
 	return false;
@@ -702,6 +708,7 @@ bool LagoonicExternalAgents::disconnect_agent(const String &p_id, const String &
 			return true;
 		}
 		case LagoonicCodingAgents::REG_NONE:
+		case LagoonicCodingAgents::REG_MANUAL:
 			return true;
 	}
 	return true;
@@ -723,7 +730,8 @@ LagoonicConnectReport LagoonicExternalAgents::connect_installed(const String &p_
 			continue;
 		}
 		if (agent.registration == LagoonicCodingAgents::REG_CLI ||
-				agent.registration == LagoonicCodingAgents::REG_NONE) {
+				agent.registration == LagoonicCodingAgents::REG_NONE ||
+				agent.registration == LagoonicCodingAgents::REG_MANUAL) {
 			continue;
 		}
 		String error;

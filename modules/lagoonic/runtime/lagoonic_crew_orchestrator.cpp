@@ -34,15 +34,21 @@
 #include "core/os/memory.h"
 #include "core/os/os.h"
 #include "core/os/time.h"
+#include "core/templates/local_vector.h"
 
 void LagoonicCrewOrchestrator::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_project", "path", "boss_id"), &LagoonicCrewOrchestrator::set_project);
 	ClassDB::bind_method(D_METHOD("set_workers", "workers"), &LagoonicCrewOrchestrator::set_workers);
-	ClassDB::bind_method(D_METHOD("queue_task", "title", "spec", "worker"), &LagoonicCrewOrchestrator::queue_task);
+	ClassDB::bind_method(D_METHOD("queue_task", "title", "spec", "worker", "from_boss", "model"), &LagoonicCrewOrchestrator::queue_task, DEFVAL(false), DEFVAL(String()));
 	ClassDB::bind_method(D_METHOD("cancel"), &LagoonicCrewOrchestrator::cancel);
 	ClassDB::bind_method(D_METHOD("fail", "message"), &LagoonicCrewOrchestrator::fail);
 	ClassDB::bind_method(D_METHOD("clear_crew"), &LagoonicCrewOrchestrator::clear_crew);
 	ClassDB::bind_method(D_METHOD("maybe_run", "boss_session_id"), &LagoonicCrewOrchestrator::maybe_run);
+	ClassDB::bind_method(D_METHOD("stop_task", "number"), &LagoonicCrewOrchestrator::stop_task);
+	ClassDB::bind_method(D_METHOD("clear_finished"), &LagoonicCrewOrchestrator::clear_finished);
+	ClassDB::bind_method(D_METHOD("message_worker", "number", "message"), &LagoonicCrewOrchestrator::message_worker);
+	ClassDB::bind_method(D_METHOD("snapshot"), &LagoonicCrewOrchestrator::snapshot);
+	ClassDB::bind_method(D_METHOD("list_models", "worker"), &LagoonicCrewOrchestrator::crew_list_models);
 	ClassDB::bind_method(D_METHOD("is_in_progress"), &LagoonicCrewOrchestrator::is_in_progress);
 	ClassDB::bind_method(D_METHOD("is_failed"), &LagoonicCrewOrchestrator::is_failed);
 	ClassDB::bind_method(D_METHOD("get_rounds"), &LagoonicCrewOrchestrator::get_rounds);
@@ -86,7 +92,10 @@ String LagoonicCrewOrchestrator::boss_instruction(const Vector<String> &p_worker
 			"Delegate implementation work with the lagoonic-crew start_worker tool: one self-contained task per call " +
 			"(target, change, constraints, files it may edit, how to prove it is done); at most " + String::num_int64(p_max_tasks) + " per turn. " +
 			"Start every independent task, then end your turn with one short line to the user; Lagoonic runs the workers " +
-			"one at a time and sends you their reports as your next message. Never wait or poll. Do quick things (answers, " +
+			"in parallel, so never give two tasks the same files, and sends you their reports as your next message. " +
+			"Pick a task's model with start_worker's model argument (list_models shows what each worker offers); without it the " +
+			"worker uses its own default. list_workers and every report show the model each worker really runs; stop_worker stops a task (or all) when " +
+			"the user asks or a task is no longer needed; clear_workers clears the finished tasks from the team panel; message_worker updates a running task's order without stopping it. Never wait or poll. Do quick things (answers, " +
 			"reading a file) yourself. When reports arrive, review them (read the files, run checks), then delegate fixes " +
 			"or answer the user.";
 }
@@ -96,7 +105,9 @@ String LagoonicCrewOrchestrator::worker_prompt(const String &p_boss_name, int p_
 	out += "You are a worker in Lagoonic. Your coordinator, " + p_boss_name + ", gave you the task below.\n";
 	out += "The coordinator cannot see this chat and you cannot ask it questions: make reasonable choices and say which assumptions you made.\n";
 	out += "Do only this task, yourself.\n";
-	out += "End with a short report of three sentences: what you did, what you found, what is left. If you could not finish, start the report with FAILED:.\n";
+	out += "End with a short report of three sentences: what you did, what you found, what is left.\n";
+	out += "Start the report with FAILED: only when you could not do the task itself. Other workers edit the project at the same time: an error in a file outside your task, or a check your tools cannot run, goes in the report as not verified, never as FAILED.\n";
+	out += "If Godot says it cannot find a class you know exists, run project_import once and retry before reporting it.\n";
 	out += "Name every file you created or changed in backticks.\n";
 	out += "\n";
 	out += "=== TASK #" + String::num_int64(p_number) + ": " + p_title + " ===\n";
@@ -110,7 +121,7 @@ String LagoonicCrewOrchestrator::wake_message(const Vector<LagoonicCrewTask> &p_
 		const LagoonicCrewTask &t = p_tasks[i];
 		String title = t.title;
 		title = title.replace("\"", "'");
-		out += "<report task=\"" + String::num_int64(t.number) + "\" worker=\"" + t.worker_name + "\" title=\"" + title + "\" outcome=\"" + t.status + "\">\n";
+		out += "<report task=\"" + String::num_int64(t.number) + "\" worker=\"" + t.worker_name + "\" model=\"" + (t.model.is_empty() ? String("unknown") : t.model.replace("\"", "'")) + "\" title=\"" + title + "\" outcome=\"" + t.status + "\">\n";
 		String report = t.report.strip_edges();
 		out += (report.is_empty() ? String("(no report)") : report) + "\n";
 		out += "</report>\n";
@@ -164,6 +175,8 @@ Vector<Dictionary> LagoonicCrewOrchestrator::crew_list_workers() const {
 		d["number"] = t.number;
 		d["status"] = t.status;
 		d["worker_name"] = t.worker_name;
+		d["model"] = t.model;
+		d["requested_model"] = t.requested_model;
 		d["title"] = t.title;
 		out.push_back(d);
 	}
@@ -179,6 +192,8 @@ Array LagoonicCrewOrchestrator::snapshot() const {
 		d["title"] = t.title;
 		d["worker_name"] = t.worker_name;
 		d["worker_id"] = t.worker_id;
+		d["model"] = t.model;
+		d["requested_model"] = t.requested_model;
 		d["status"] = t.status;
 		d["report"] = t.report;
 		d["started_msec"] = t.started_msec;
@@ -186,6 +201,128 @@ Array LagoonicCrewOrchestrator::snapshot() const {
 		out.push_back(d);
 	}
 	return out;
+}
+
+String LagoonicCrewOrchestrator::crew_message_worker(int p_number, const String &p_message, String &r_error) {
+	LagoonicCrewRunner *r = nullptr;
+	String status;
+	{
+		MutexLock lock(mutex);
+		r = runner;
+		// Not started yet: the new instructions join its order.
+		for (int k = 0; k < crew_queue.size(); k++) {
+			if (crew_queue[k].number == p_number) {
+				crew_queue.write[k].spec += "\n\nUpdate from the coordinator: " + p_message;
+				r_error = "";
+				return "Task #" + String::num_int64(p_number) + " has not started yet: its order now includes the update.";
+			}
+		}
+		for (const LagoonicCrewTask &t : crew_round_tasks) {
+			if (t.number == p_number) {
+				status = t.status;
+			}
+		}
+	}
+	if (status != "running" && status != "queued") {
+		r_error = status.is_empty() ? "There is no task #" + String::num_int64(p_number) + "." : "Task #" + String::num_int64(p_number) + " is " + status + "; start a new task instead.";
+		return "";
+	}
+	if (r == nullptr || !r->crew_message_task(p_number, p_message)) {
+		r_error = "Task #" + String::num_int64(p_number) + " is starting; send the update again in a moment.";
+		return "";
+	}
+	r_error = "";
+	return "Task #" + String::num_int64(p_number) + " got the update; it keeps what it already did. Its report will come with the round as usual.";
+}
+
+String LagoonicCrewOrchestrator::message_worker(int p_number, const String &p_message) {
+	String error;
+	const String msg = crew_message_worker(p_number, p_message, error);
+	return error.is_empty() ? msg : "ERROR: " + error;
+}
+
+String LagoonicCrewOrchestrator::clear_finished() {
+	MutexLock lock(mutex);
+	int removed = 0;
+	for (int k = crew_round_tasks.size() - 1; k >= 0; k--) {
+		const String status = crew_round_tasks[k].status;
+		if (status != "queued" && status != "running") {
+			stopped_tasks.erase(crew_round_tasks[k].number);
+			crew_round_tasks.remove_at(k);
+			removed++;
+		}
+	}
+	return removed == 0 ? String("No finished tasks to clear.") : "Cleared " + String::num_int64(removed) + " finished task(s); running and queued tasks stay.";
+}
+
+String LagoonicCrewOrchestrator::crew_stop_worker(int p_number, String &r_error) {
+	const String msg = stop_task(p_number);
+	if (msg.is_empty()) {
+		MutexLock lock(mutex);
+		r_error = last_error;
+		return "";
+	}
+	r_error = "";
+	return msg;
+}
+
+String LagoonicCrewOrchestrator::stop_task(int p_number) {
+	Vector<int> to_abort;
+	int stopped = 0;
+	LagoonicCrewRunner *r = nullptr;
+	{
+		MutexLock lock(mutex);
+		last_error = "";
+		r = runner;
+		// Tasks not started yet (queued for the next round) just leave the queue.
+		for (int k = crew_queue.size() - 1; k >= 0; k--) {
+			if (p_number <= 0 || crew_queue[k].number == p_number) {
+				crew_queue.remove_at(k);
+			}
+		}
+		for (int k = 0; k < crew_round_tasks.size(); k++) {
+			LagoonicCrewTask &t = crew_round_tasks.write[k];
+			if (p_number > 0 && t.number != p_number) {
+				continue;
+			}
+			if (t.status != "queued" && t.status != "running") {
+				continue;
+			}
+			stopped_tasks.insert(t.number);
+			stopped++;
+			if (t.status == "running") {
+				to_abort.push_back(t.number);
+			} else {
+				// Never started: it ends here. A task already in a round
+				// thread sees stopped_tasks before it starts its worker.
+				t.status = "stopped";
+				t.report = "Stopped before it started.";
+			}
+		}
+		if (stopped == 0) {
+			last_error = p_number > 0 ? "Task #" + String::num_int64(p_number) + " is not running or queued." : String("No worker task is running or queued.");
+			return "";
+		}
+	}
+	if (r != nullptr) {
+		for (int number : to_abort) {
+			r->crew_abort_task(number);
+		}
+	}
+	if (p_number > 0) {
+		return "Stopped task #" + String::num_int64(p_number) + ". Its report will say it was stopped.";
+	}
+	return "Stopped " + String::num_int64(stopped) + " worker task(s).";
+}
+
+void LagoonicCrewOrchestrator::note_task_model(const String &p_model, int p_number) {
+	MutexLock lock(mutex);
+	for (int k = 0; k < crew_round_tasks.size(); k++) {
+		if (crew_round_tasks[k].number == p_number) {
+			crew_round_tasks.write[k].model = p_model;
+			return;
+		}
+	}
 }
 
 String LagoonicCrewOrchestrator::get_boss_id() const {
@@ -205,10 +342,35 @@ void LagoonicCrewOrchestrator::_mirror_task(const LagoonicCrewTask &p_task) {
 	}
 }
 
-String LagoonicCrewOrchestrator::crew_start_worker(const String &p_title, const String &p_spec, const String &p_worker, String &r_error) {
+String LagoonicCrewOrchestrator::crew_list_models(const String &p_worker) {
+	Vector<LagoonicCrewWorkerEntry> wanted;
+	LagoonicCrewRunner *r = nullptr;
+	{
+		MutexLock lock(mutex);
+		r = runner;
+		for (const LagoonicCrewWorkerEntry &e : workers) {
+			if (p_worker.is_empty() || e.name.to_lower() == p_worker.to_lower() || e.id.to_lower() == p_worker.to_lower()) {
+				wanted.push_back(e);
+			}
+		}
+	}
+	if (wanted.is_empty()) {
+		return p_worker.is_empty() ? String("No worker agent is set up.") : "Unknown worker \"" + p_worker + "\".";
+	}
+	if (r == nullptr) {
+		return "The crew runner is gone.";
+	}
+	String out;
+	for (const LagoonicCrewWorkerEntry &e : wanted) {
+		out += (out.is_empty() ? "" : "\n\n") + e.name + ": " + r->crew_model_catalog(e.id, e.name);
+	}
+	return out;
+}
+
+String LagoonicCrewOrchestrator::crew_start_worker(const String &p_title, const String &p_spec, const String &p_worker, const String &p_model, bool p_from_boss, String &r_error) {
 	// Same path as queue_task; refusals surface as r_error so the server can
 	// answer them as a text payload with isError (never as -32603).
-	String msg = queue_task(p_title, p_spec, p_worker);
+	String msg = queue_task(p_title, p_spec, p_worker, p_from_boss, p_model);
 	if (msg.is_empty()) {
 		MutexLock lock(mutex);
 		r_error = last_error;
@@ -218,7 +380,7 @@ String LagoonicCrewOrchestrator::crew_start_worker(const String &p_title, const 
 	return msg;
 }
 
-String LagoonicCrewOrchestrator::queue_task(const String &p_title, const String &p_spec, const String &p_worker) {
+String LagoonicCrewOrchestrator::queue_task(const String &p_title, const String &p_spec, const String &p_worker, bool p_from_boss, const String &p_model) {
 	MutexLock lock(mutex);
 	last_error = "";
 	if (!fatal_error.is_empty()) {
@@ -230,9 +392,10 @@ String LagoonicCrewOrchestrator::queue_task(const String &p_title, const String 
 		return "";
 	}
 	// Workers may share the boss's tools (OpenCode runs both): only the boss
-	// delegates, never a worker in the middle of its task.
+	// delegates, never a worker in the middle of its task. An ACP boss has its
+	// own token, so it may delegate even while a worker runs.
 	for (const LagoonicCrewTask &t : crew_round_tasks) {
-		if (t.status == "running") {
+		if (!p_from_boss && t.status == "running") {
 			last_error = "Workers cannot start other workers. Finish your task and report.";
 			return "";
 		}
@@ -271,11 +434,12 @@ String LagoonicCrewOrchestrator::queue_task(const String &p_title, const String 
 	task.spec = p_spec;
 	task.worker_name = chosen->name;
 	task.worker_id = chosen->id;
+	task.requested_model = p_model.strip_edges();
 	task.status = "queued";
 	crew_queue.push_back(task);
 	crew_round_tasks.push_back(task);
 	return "Queued as task #" + String::num_int64(task.number) + " for " + chosen->name + ". Start any other independent task, then end your turn: " +
-			"Lagoonic runs the workers one at a time after your turn and sends you their reports as your next message. Do not wait or poll.";
+			"Lagoonic runs the workers in parallel after your turn and sends you their reports as your next message. Do not wait or poll.";
 }
 
 // ---------------------------------------------------------------- control
@@ -321,6 +485,7 @@ void LagoonicCrewOrchestrator::clear_crew() {
 	MutexLock lock(mutex);
 	crew_queue.clear();
 	crew_round_tasks.clear();
+	stopped_tasks.clear();
 }
 
 // ---------------------------------------------------------------- rounds
@@ -369,12 +534,11 @@ void LagoonicCrewOrchestrator::_thread_entry(void *p_userdata) {
 	self->_run_crew(session);
 }
 
-// Runs the queued worker tasks one at a time, then wakes the boss with every
-// report. Runs on the round thread; every side effect goes through the
+// Runs the queued worker tasks of a round in parallel (one thread per task),
+// then wakes the boss with every report. Runs on the round thread; every side effect goes through the
 // runner, which marshals back to the main thread as needed. Chained rounds
 // (tasks the boss queues from the reports) run on this SAME thread: the loop
-// re-splices after the wake-up, so workers stay one-at-a-time and no second
-// thread can ever exist. crew_in_progress stays true across the wake-up for
+// re-splices after the wake-up, so no second round thread can ever exist. crew_in_progress stays true across the wake-up for
 // the same reason (unlike the TS async version, real threads need the guard).
 void LagoonicCrewOrchestrator::_run_crew(const String &p_boss_session_id) {
 	uint64_t round_started_at = Time::get_singleton()->get_ticks_msec();
@@ -386,7 +550,9 @@ void LagoonicCrewOrchestrator::_run_crew(const String &p_boss_session_id) {
 	}
 
 	while (true) {
-		Vector<LagoonicCrewTask> round;
+		// LocalVector: each task thread writes its own element; a COW Vector
+		// could copy under them.
+		LocalVector<LagoonicCrewTask> round;
 		{
 			MutexLock lock(mutex);
 			if (crew_cancelled || !fatal_error.is_empty() || crew_queue.is_empty()) {
@@ -395,64 +561,41 @@ void LagoonicCrewOrchestrator::_run_crew(const String &p_boss_session_id) {
 			// A fresh round starts un-cancelled; aborts and user messages
 			// during the round set the latch again.
 			crew_cancelled = false;
-			round = crew_queue; // Splice: the next turn queues into a fresh list.
+			for (const LagoonicCrewTask &t : crew_queue) {
+				round.push_back(t); // Splice: the next turn queues into a fresh list.
+			}
 			crew_queue.clear();
 		}
-		Vector<LagoonicCrewTask> results;
 
-		for (int i = 0; i < round.size(); i++) {
-			{
-				MutexLock lock(mutex);
-				if (crew_cancelled || !fatal_error.is_empty()) {
-					round.write[i].status = "cancelled";
-					_mirror_task(round[i]);
-					continue;
-				}
-				round.write[i].status = "running";
-				round.write[i].started_msec = Time::get_singleton()->get_ticks_msec();
-				_mirror_task(round[i]);
+		// Every task of the round runs at once, each on its own thread. The
+		// starts are staggered a little so the agents do not all boot in the
+		// same instant.
+		LocalVector<TaskJob> jobs;
+		jobs.resize(round.size());
+		LocalVector<Thread *> threads;
+		for (uint32_t i = 0; i < round.size(); i++) {
+			jobs[i].self = this;
+			jobs[i].task = &round[i];
+			jobs[i].boss_name = boss_name;
+			jobs[i].boss_session = p_boss_session_id;
+			jobs[i].start_delay_msec = int(i) * WORKER_GAP_MSEC;
+			Thread *thread = memnew(Thread);
+			if (thread->start(_task_entry, &jobs[i]) == Thread::UNASSIGNED_ID) {
+				memdelete(thread);
+				_run_task(jobs[i]); // Could not get a thread: run it here.
+				continue;
 			}
-			if (r != nullptr) {
-				r->crew_emit_chat(p_boss_session_id, "**" + round[i].worker_name + String::utf8("** · tarea #") + String::num_int64(round[i].number) + ": " + round[i].title);
-			}
-			String report;
-			bool ok = false;
-			if (r != nullptr) {
-				String error;
-				String prompt = worker_prompt(boss_name, round[i].number, round[i].title, round[i].spec);
-				report = r->crew_run_worker(round[i].worker_id, prompt, round[i].title, round[i].number, p_boss_session_id, error);
-				if (error.is_empty()) {
-					ok = !_report_is_failure(report);
-				} else {
-					report = error.substr(0, MAX_CREW_REPORT);
-					ok = false;
-				}
-			} else {
-				report = "The crew runner is gone.";
-				ok = false;
-			}
-			{
-				MutexLock lock(mutex);
-				round.write[i].finished_msec = Time::get_singleton()->get_ticks_msec();
-				if (crew_cancelled || !fatal_error.is_empty()) {
-					round.write[i].status = "cancelled";
-					_mirror_task(round[i]);
-					continue;
-				}
-				round.write[i].status = ok ? "succeeded" : "failed";
-				report = report.strip_edges();
-				round.write[i].report = report.is_empty() ? "(no report)" : report.substr(0, MAX_CREW_REPORT);
-				results.push_back(round[i]);
-				// Mirror the round status back into the visible round list.
-				_mirror_task(round[i]);
-			}
-			if (!_sleep_gap()) {
-				MutexLock lock(mutex);
-				for (int j = i + 1; j < round.size(); j++) {
-					round.write[j].status = "cancelled";
-					_mirror_task(round[j]);
-				}
-				break;
+			threads.push_back(thread);
+		}
+		for (Thread *thread : threads) {
+			thread->wait_to_finish();
+			memdelete(thread);
+		}
+
+		Vector<LagoonicCrewTask> results;
+		for (const LagoonicCrewTask &t : round) {
+			if (t.status == "succeeded" || t.status == "failed" || t.status == "stopped") {
+				results.push_back(t);
 			}
 		}
 
@@ -499,15 +642,86 @@ void LagoonicCrewOrchestrator::_run_crew(const String &p_boss_session_id) {
 	}
 }
 
-bool LagoonicCrewOrchestrator::_report_is_failure(const String &p_report) {
-	return p_report.strip_edges().begins_with("FAILED");
+void LagoonicCrewOrchestrator::_task_entry(void *p_userdata) {
+	TaskJob *job = static_cast<TaskJob *>(p_userdata);
+	job->self->_run_task(*job);
 }
 
-bool LagoonicCrewOrchestrator::_sleep_gap() const {
-	// 300 ms between tasks, interruptible by cancel()/fail().
-	// (OS only offers delay_usec; 50 ms steps keep abort responsive.)
+void LagoonicCrewOrchestrator::_run_task(TaskJob &p_job) {
+	LagoonicCrewTask &task = *p_job.task;
+	LagoonicCrewRunner *r = runner;
+	if (p_job.start_delay_msec > 0 && !_sleep_msec(p_job.start_delay_msec)) {
+		MutexLock lock(mutex);
+		task.status = "cancelled";
+		_mirror_task(task);
+		return;
+	}
+	{
+		MutexLock lock(mutex);
+		if (crew_cancelled || !fatal_error.is_empty()) {
+			task.status = "cancelled";
+			_mirror_task(task);
+			return;
+		}
+		if (stopped_tasks.has(task.number)) {
+			task.status = "stopped";
+			task.report = "Stopped before it started.";
+			_mirror_task(task);
+			return;
+		}
+		task.status = "running";
+		task.started_msec = Time::get_singleton()->get_ticks_msec();
+		_mirror_task(task);
+	}
+	if (r != nullptr) {
+		r->crew_emit_chat(p_job.boss_session, "**" + task.worker_name + String::utf8("** · tarea #") + String::num_int64(task.number) + ": " + task.title);
+	}
+	String report;
+	bool ok = false;
+	if (r != nullptr) {
+		String error;
+		const String prompt = worker_prompt(p_job.boss_name, task.number, task.title, task.spec);
+		report = r->crew_run_worker(task.worker_id, task.requested_model, prompt, task.title, task.number, p_job.boss_session, error);
+		if (error.is_empty()) {
+			ok = !_report_is_failure(report);
+		} else {
+			report = error.substr(0, MAX_CREW_REPORT);
+			ok = false;
+		}
+	} else {
+		report = "The crew runner is gone.";
+	}
+	MutexLock lock(mutex);
+	task.finished_msec = Time::get_singleton()->get_ticks_msec();
+	// The model the worker reported while it ran (note_task_model).
+	for (int k = 0; k < crew_round_tasks.size(); k++) {
+		if (crew_round_tasks[k].number == task.number) {
+			task.model = crew_round_tasks[k].model;
+			break;
+		}
+	}
+	if (crew_cancelled || !fatal_error.is_empty()) {
+		task.status = "cancelled";
+		_mirror_task(task);
+		return;
+	}
+	report = report.strip_edges();
+	if (stopped_tasks.has(task.number)) {
+		// Stopped by the user or the boss: what it wrote stays on disk.
+		task.status = "stopped";
+		task.report = "Stopped before finishing. Check what it already changed in the project.";
+		_mirror_task(task);
+		return;
+	}
+	task.status = ok ? "succeeded" : "failed";
+	task.report = report.is_empty() ? "(no report)" : report.substr(0, MAX_CREW_REPORT);
+	_mirror_task(task);
+}
+
+bool LagoonicCrewOrchestrator::_sleep_msec(int p_msec) const {
+	// Interruptible by cancel()/fail() (50 ms steps keep abort responsive).
 	const int step_usec = 50000;
-	for (int waited = 0; waited < WORKER_GAP_MSEC * 1000; waited += step_usec) {
+	for (int waited = 0; waited < p_msec * 1000; waited += step_usec) {
 		OS::get_singleton()->delay_usec(step_usec);
 		MutexLock lock(mutex);
 		if (crew_cancelled || !fatal_error.is_empty()) {
@@ -515,6 +729,10 @@ bool LagoonicCrewOrchestrator::_sleep_gap() const {
 		}
 	}
 	return true;
+}
+
+bool LagoonicCrewOrchestrator::_report_is_failure(const String &p_report) {
+	return p_report.strip_edges().begins_with("FAILED");
 }
 
 bool LagoonicCrewOrchestrator::is_in_progress() const {

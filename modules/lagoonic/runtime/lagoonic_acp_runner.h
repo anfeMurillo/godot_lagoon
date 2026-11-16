@@ -170,7 +170,7 @@ public:
 	// {name,url,headers[]}] (lagoonic-mcp stdio + lagoonic-crew http).
 	// Returns the ACP session id, or "" on failure (see last_error).
 	String session_new(const String &p_cwd, const Array &p_mcp_servers, int p_timeout_ms = DEFAULT_TIMEOUT_MS);
-	// session/prompt. prompt_blocks defaults to [{type:text,...}].
+	// session/prompt: the text block, then prompt_blocks (images...).
 	// Returns {stop_reason:..., } or {error:...}. stopReason
 	// cancelled/refusal/max_tokens (and max_turn_requests) surface as
 	// bilingual errors, like acp.ts.
@@ -189,6 +189,14 @@ public:
 	// session/prompt -> close (kill). Returns {ok, stop_reason,
 	// text, report, error, log}. Exactly 1 process, always reaped.
 	Dictionary run_turn(const String &p_adapter_bin, const PackedStringArray &p_args, const String &p_cwd, const Dictionary &p_env, const Array &p_mcp_servers, const String &p_prompt, const Array &p_prompt_blocks = Array(), bool p_auto_approve = false, bool p_silent = false, const String &p_session_id = "lagoonic");
+
+	// One silent worker turn through `codex app-server` (Codex's own
+	// JSON-RPC server, like Orca uses) instead of the codex-acp adapter,
+	// which lags behind Codex and fails with newer models. Same process
+	// handling as run_turn: spawn -> initialize -> thread/start ->
+	// turn/start -> wait for turn/completed -> close. MCP servers use the
+	// ACP shape and become config overrides. Returns {ok, text, error, log}.
+	Dictionary run_codex_turn(const String &p_codex_bin, const String &p_cwd, const Dictionary &p_env, const Array &p_mcp_servers, const String &p_prompt, const String &p_session_id = "lagoonic");
 
 	// Options the agent lets the client choose per session (model,
 	// effort, mode...), read from the session/new result: ACP
@@ -214,6 +222,28 @@ public:
 	// session/load: replays the conversation into the agent (its replay
 	// updates are not shown). Returns false (see last_error) on failure.
 	bool session_load(const String &p_acp_session, const String &p_cwd, const Array &p_mcp_servers, int p_timeout_ms = DEFAULT_TIMEOUT_MS);
+
+	// Model the next turn must use ("hydrogen high", "gpt-6-luna"): matched
+	// against the models the agent offers; the turn fails, naming them, when
+	// none fits. "" keeps the agent's default.
+	void set_requested_model(const String &p_model) { requested_model = p_model; }
+	// Adds instructions to the turn in progress (any thread): codex app-server
+	// takes them right away (turn/steer); ACP agents get them as the next prompt
+	// of the same session as soon as their current one ends.
+	void steer(const String &p_text);
+	// Codex's models through `codex app-server` model/list: [{value, name, efforts}].
+	Array probe_codex_models(const String &p_codex_bin, const String &p_cwd, const Dictionary &p_env);
+	// Codex's plan limits: {account, rateLimits} from account/read and account/rateLimits/read.
+	Dictionary probe_codex_rate_limits(const String &p_codex_bin, const String &p_cwd, const Dictionary &p_env);
+	// Called with the model the agent says it uses ("name · effort"), as soon
+	// as the session opens. Crew workers show it live and report it.
+	void set_model_callback(const Callable &p_callback) { model_callback = p_callback; }
+	// The model of the last session (same text), or "" when the agent did not say.
+	String get_model() const { return session_model; }
+	// [{value, name}] the last session offered (model list of the agent).
+	Array get_offered_models() const { return offered_models; }
+	// "Model · effort" from parse_options() entries (category model / thought_level).
+	static String describe_model(const Array &p_options);
 
 	void set_session_id(const String &p_session_id);
 	String get_session_id() const;
@@ -254,6 +284,27 @@ private:
 	String resume_acp_session;
 	String resume_transcript;
 	bool replaying = false; // session/load in progress: updates are history.
+	// codex app-server turn (run_codex_turn): its notifications and
+	// requests differ from ACP.
+	Mutex steer_mutex;
+	Vector<String> steer_queue;
+	String codex_turn_id;
+	String _take_steer();
+	Callable model_callback;
+	String session_model;
+	String requested_model;
+	Array offered_models; // [{value, name}] the last session offered.
+	bool _choose_requested_model(const Array &p_options);
+	Array _codex_model_list();
+	void _set_session_model(const String &p_model);
+	bool codex_dialect = false;
+	bool codex_turn_done = false;
+	String codex_turn_status;
+	String codex_turn_error;
+	String codex_delta_text; // Streamed agent text, the fallback report.
+	String codex_final_text; // Completed agent messages.
+	void _handle_codex_notification(const String &p_method, const Dictionary &p_params);
+	void _handle_codex_request(const Variant &p_id, const String &p_method, const Dictionary &p_params);
 	// Sets the chosen options on the session; returns the options as
 	// they are afterwards.
 	Array _apply_options(const String &p_acp_session_id, const Array &p_options);

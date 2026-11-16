@@ -32,7 +32,7 @@
 
 // Native port of Core/lagoonic-desktop/src/main/coding-agents.ts.
 //
-// Static registry of the 19 coding agents Lagoonic can hand a project to,
+// Static registry of the 45 coding agents (Orca's catalog) Lagoonic can hand a project to,
 // plus host detection (PATH + install dirs + npm global bin, PATHEXT on
 // Windows) and the CLI wrapper-script builders. Mirrors the desktop flow:
 // registration never replaces an agent config, and Lagoonic never reads the
@@ -50,8 +50,8 @@
 
 class LagoonicCodingAgents {
 public:
-	static constexpr int AGENT_COUNT = 19;
-	static constexpr int CHAT_AGENT_COUNT = 6;
+	static constexpr int AGENT_COUNT = 45;
+	static constexpr int CHAT_AGENT_COUNT = 10;
 
 	// How lagoonic-mcp is registered with one agent. Mirrors McpRegistration.
 	enum RegistrationKind {
@@ -61,6 +61,7 @@ public:
 		REG_VIBE_TOML, // Append/remove only the lagoonic block of ~/.vibe/config.toml.
 		REG_CLI, // Register through the agent's own `mcp add` via a wrapper script.
 		REG_NONE, // The run command already loads lagoonic-mcp; nothing to connect.
+		REG_MANUAL, // No safe automatic way: the user adds lagoonic-mcp by hand (docs_url).
 	};
 
 	// Shape of the JSON object written under the agent's key.
@@ -99,9 +100,14 @@ public:
 		JsonEntryKind entry_kind;
 		// REG_CLI only:
 		CliAddStyle cli_style;
+		// Chat command for autonomous turns (crew workers), when the agent
+		// needs a flag to act without asking (Orca's fullAccess args), or nullptr.
+		const char *acp_auto = nullptr;
+		// One NAME=value set for the chat adapter (Orca's spec env), or nullptr.
+		const char *acp_env = nullptr;
 	};
 
-	// Static table of the 19 agents (same order as CODING_AGENTS in coding-agents.ts).
+	// Static table of the agents: Lagoonic's first 19, then the rest of Orca's catalog.
 	static const AgentInfo AGENTS[AGENT_COUNT];
 
 	// Agents whose adapter speaks Agent Client Protocol over stdio in the chat.
