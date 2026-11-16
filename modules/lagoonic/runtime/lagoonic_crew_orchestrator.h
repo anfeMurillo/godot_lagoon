@@ -59,7 +59,7 @@
 // the round thread loops and re-splices after the wake-up, so workers always
 // run one-at-a-time and chained rounds start exactly when the wake ends.
 //
-// Limits: MAX_CREW_TASKS=4 per turn, MAX_CREW_ROUNDS=5, MAX_CREW_REPORT=6000
+// Limits: MAX_CREW_TASKS per turn (0 = none), MAX_CREW_ROUNDS=5, MAX_CREW_REPORT=6000
 // chars, MAX_LINE 1 MiB (enforced by the server).
 //
 // Threads: maybe_run() spawns ONE worker thread that runs the round task by
@@ -161,7 +161,7 @@ class LagoonicCrewOrchestrator : public RefCounted, public LagoonicCrewTools {
 	GDCLASS(LagoonicCrewOrchestrator, RefCounted);
 
 public:
-	static constexpr int MAX_CREW_TASKS = 4;
+	static constexpr int MAX_CREW_TASKS = 0; // Tasks per turn; 0 = no limit (all run at once).
 	static constexpr int MAX_CREW_ROUNDS = 5;
 	static constexpr int MAX_CREW_REPORT = 6000;
 	static constexpr int WORKER_GAP_MSEC = 300;

@@ -90,7 +90,7 @@ String LagoonicCrewOrchestrator::boss_instruction(const Vector<String> &p_worker
 	return "You lead a crew in Lagoonic: you plan and review, and worker agents implement. Your workers: " +
 			names + " (pick one per task with the worker argument). " +
 			"Delegate implementation work with the lagoonic-crew start_worker tool: one self-contained task per call " +
-			"(target, change, constraints, files it may edit, how to prove it is done); at most " + String::num_int64(p_max_tasks) + " per turn. " +
+			"(target, change, constraints, files it may edit, how to prove it is done)" + (p_max_tasks > 0 ? "; at most " + String::num_int64(p_max_tasks) + " per turn. " : String(". ")) +
 			"Start every independent task, then end your turn with one short line to the user; Lagoonic runs the workers " +
 			"in parallel, so never give two tasks the same files, and sends you their reports as your next message. " +
 			"Pick a task's model with start_worker's model argument (list_models shows what each worker offers); without it the " +
@@ -423,7 +423,7 @@ String LagoonicCrewOrchestrator::queue_task(const String &p_title, const String 
 		last_error = "Unknown worker \"" + p_worker + "\". Your workers: " + names + ".";
 		return "";
 	}
-	if (crew_queue.size() >= MAX_CREW_TASKS) {
+	if (MAX_CREW_TASKS > 0 && crew_queue.size() >= MAX_CREW_TASKS) {
 		last_error = "This turn already has " + String::num_int64(MAX_CREW_TASKS) + " worker tasks. End your turn; you can start more when the reports arrive.";
 		return "";
 	}

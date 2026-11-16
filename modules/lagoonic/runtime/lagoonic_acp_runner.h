@@ -304,6 +304,12 @@ private:
 	String codex_delta_text; // Streamed agent text, the fallback report.
 	String codex_final_text; // Completed agent messages.
 	void _handle_codex_notification(const String &p_method, const Dictionary &p_params);
+	void _feed_codex_update(const Dictionary &p_update); // ACP-shaped update into the chat mapper.
+	// One codex app-server turn: silent worker (report only) or chat turn of
+	// the boss (events, options, approvals, resume), like Orca drives Codex.
+	Dictionary _codex_turn(const String &p_codex_bin, const String &p_cwd, const Dictionary &p_env, const Array &p_mcp_servers, const String &p_prompt, const Array &p_prompt_blocks, bool p_auto_approve, bool p_silent, const String &p_session_id);
+	Array _codex_options(const Array &p_models, const String &p_model, const String &p_effort) const;
+	static bool _is_codex_app_server(const String &p_bin, const PackedStringArray &p_args);
 	void _handle_codex_request(const Variant &p_id, const String &p_method, const Dictionary &p_params);
 	// Sets the chosen options on the session; returns the options as
 	// they are afterwards.

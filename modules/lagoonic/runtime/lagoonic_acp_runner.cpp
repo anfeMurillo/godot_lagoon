@@ -1347,6 +1347,13 @@ void LagoonicAcpRunner::resolve_permission(const String &p_approval_id, bool p_a
 	// when approved, reject_once/reject_always otherwise, cancelled
 	// when the agent offered nothing usable.
 	String option = LagoonicAcpMapper::pick_acp_option(params, p_approved);
+	if (codex_dialect) {
+		// codex app-server answers {decision: accept | decline}.
+		Dictionary decision;
+		decision["decision"] = option == "accept" ? String("accept") : String("decline");
+		_reply(id, decision);
+		return;
+	}
 	Dictionary outcome_inner;
 	if (option.is_empty()) {
 		outcome_inner["outcome"] = "cancelled";
@@ -1591,6 +1598,23 @@ Array LagoonicAcpRunner::_apply_options(const String &p_acp_session_id, const Ar
 }
 
 Array LagoonicAcpRunner::probe_options(const String &p_adapter_bin, const PackedStringArray &p_args, const String &p_cwd, const Dictionary &p_env) {
+	if (_is_codex_app_server(p_adapter_bin, p_args)) {
+		// Codex's real models and their efforts, before the first message.
+		const Array models = probe_codex_models(p_adapter_bin, p_cwd, p_env);
+		String model;
+		String effort;
+		for (int i = 0; i < models.size(); i++) {
+			const Dictionary m = models[i];
+			if (bool(m.get("is_default", false))) {
+				model = m.get("value", "");
+				effort = m.get("default_effort", "");
+			}
+		}
+		if (model.is_empty() && !models.is_empty()) {
+			model = Dictionary(models[0]).get("value", "");
+		}
+		return _codex_options(models, model, effort);
+	}
 	Array options;
 	const bool was_silent = silent;
 	silent = true;
@@ -1697,6 +1721,10 @@ void LagoonicAcpRunner::session_cancel(const String &p_acp_session_id) {
 }
 
 Dictionary LagoonicAcpRunner::run_turn(const String &p_adapter_bin, const PackedStringArray &p_args, const String &p_cwd, const Dictionary &p_env, const Array &p_mcp_servers, const String &p_prompt, const Array &p_prompt_blocks, bool p_auto_approve, bool p_silent, const String &p_session_id) {
+	if (_is_codex_app_server(p_adapter_bin, p_args)) {
+		// Codex speaks its own app-server protocol (real model list, newer models).
+		return _codex_turn(p_adapter_bin, p_cwd, p_env, p_mcp_servers, p_prompt, p_prompt_blocks, p_auto_approve, p_silent, p_session_id);
+	}
 	Dictionary out;
 	auto_approve = p_auto_approve;
 	silent = p_silent;
@@ -1930,6 +1958,8 @@ Array LagoonicAcpRunner::_codex_model_list() {
 			}
 		}
 		row["efforts"] = efforts;
+		row["is_default"] = bool(m.get("isDefault", false));
+		row["default_effort"] = _dstr(m, "defaultReasoningEffort");
 		out.push_back(row);
 	}
 	return out;
@@ -2015,11 +2045,106 @@ void LagoonicAcpRunner::_set_session_model(const String &p_model) {
 
 // --- codex app-server ---------------------------------------------------
 
+void LagoonicAcpRunner::_feed_codex_update(const Dictionary &p_update) {
+	if (silent) {
+		return;
+	}
+	const Array events = mapper->feed_update(p_update);
+	for (int i = 0; i < events.size(); i++) {
+		if (events[i].get_type() == Variant::DICTIONARY) {
+			emit_signal("acp_event", events[i]);
+		}
+	}
+}
+
+static Dictionary _codex_tool_update(const Dictionary &p_item, bool p_done) {
+	// A codex item (command, MCP tool, file edit, web search) as an ACP
+	// tool_call / tool_call_update for the chat.
+	const String type = p_item.get("type", "");
+	Dictionary update;
+	update["sessionUpdate"] = p_done ? "tool_call_update" : "tool_call";
+	update["toolCallId"] = String(p_item.get("id", ""));
+	String title;
+	String kind = "other";
+	Dictionary raw;
+	if (type == "commandExecution") {
+		title = String(p_item.get("command", ""));
+		kind = "execute";
+		raw["command"] = title;
+	} else if (type == "mcpToolCall") {
+		title = String(p_item.get("server", "")) + "." + String(p_item.get("tool", ""));
+		raw = p_item.get("arguments", Dictionary()).get_type() == Variant::DICTIONARY ? Dictionary(p_item.get("arguments", Dictionary())) : Dictionary();
+	} else if (type == "fileChange") {
+		title = String::utf8("Editar archivos");
+		kind = "edit";
+		const Array changes = p_item.get("changes", Array());
+		if (!changes.is_empty() && changes[0].get_type() == Variant::DICTIONARY) {
+			raw["path"] = Dictionary(changes[0]).get("path", "");
+			title = String::utf8("Editar ") + String(raw["path"]).get_file();
+		}
+	} else if (type == "webSearch") {
+		title = String::utf8("Buscar: ") + String(p_item.get("query", ""));
+		kind = "fetch";
+	} else {
+		title = type;
+	}
+	update["title"] = title;
+	update["kind"] = kind;
+	update["rawInput"] = raw;
+	const String status = p_item.get("status", "");
+	update["status"] = !p_done ? String("in_progress") : (status == "failed" || status == "declined" ? String("failed") : String("completed"));
+	return update;
+}
+
+static bool _codex_is_tool_item(const Dictionary &p_item) {
+	const String type = p_item.get("type", "");
+	return type == "commandExecution" || type == "mcpToolCall" || type == "fileChange" || type == "webSearch" || type == "dynamicToolCall";
+}
+
 void LagoonicAcpRunner::_handle_codex_notification(const String &p_method, const Dictionary &p_params) {
 	if (p_method == "item/agentMessage/delta") {
 		codex_delta_text += _dstr(p_params, "delta");
+		Dictionary content;
+		content["type"] = "text";
+		content["text"] = _dstr(p_params, "delta");
+		Dictionary update;
+		update["sessionUpdate"] = "agent_message_chunk";
+		update["content"] = content;
+		_feed_codex_update(update);
+	} else if (p_method == "item/reasoning/summaryTextDelta" || p_method == "item/reasoning/textDelta") {
+		Dictionary content;
+		content["type"] = "text";
+		content["text"] = _dstr(p_params, "delta");
+		Dictionary update;
+		update["sessionUpdate"] = "agent_thought_chunk";
+		update["content"] = content;
+		_feed_codex_update(update);
+	} else if (p_method == "item/started") {
+		const Dictionary item = _ddict(p_params, "item");
+		if (_codex_is_tool_item(item)) {
+			_feed_codex_update(_codex_tool_update(item, false));
+		}
+	} else if (p_method == "turn/plan/updated") {
+		Array entries;
+		const Array plan = _darr(p_params, "plan");
+		for (int i = 0; i < plan.size(); i++) {
+			const Dictionary step = plan[i];
+			const String status = _dstr(step, "status");
+			Dictionary entry;
+			entry["content"] = _dstr(step, "step");
+			entry["status"] = status == "inProgress" ? String("in_progress") : (status == "completed" ? String("completed") : String("pending"));
+			entry["priority"] = "medium";
+			entries.push_back(entry);
+		}
+		Dictionary update;
+		update["sessionUpdate"] = "plan";
+		update["entries"] = entries;
+		_feed_codex_update(update);
 	} else if (p_method == "item/completed") {
 		const Dictionary item = _ddict(p_params, "item");
+		if (_codex_is_tool_item(item)) {
+			_feed_codex_update(_codex_tool_update(item, true));
+		}
 		if (_dstr(item, "type") == "agentMessage") {
 			const String text = _dstr(item, "text").strip_edges();
 			if (!text.is_empty()) {
@@ -2069,7 +2194,33 @@ void LagoonicAcpRunner::_handle_codex_request(const Variant &p_id, const String 
 	(void)p_params;
 	// Worker turns run with approvalPolicy "never"; answer any approval
 	// that still arrives like the autonomous mode does.
-	if (p_method.ends_with("/requestApproval")) {
+	if (p_method.ends_with("/requestApproval") && !(auto_approve || silent)) {
+		// Ask mode: the chat's permission card, as for ACP agents.
+		Dictionary tool_call;
+		String title = _dstr(p_params, "command");
+		if (title.is_empty()) {
+			title = p_method.contains("fileChange") ? String::utf8("Codex quiere editar archivos.") : String::utf8("Codex pide permiso para continuar.");
+		}
+		if (!_dstr(p_params, "reason").is_empty()) {
+			title += " (" + _dstr(p_params, "reason") + ")";
+		}
+		tool_call["title"] = title;
+		Array options;
+		Dictionary allow;
+		allow["optionId"] = "accept";
+		allow["name"] = "Allow";
+		allow["kind"] = "allow_once";
+		options.push_back(allow);
+		Dictionary deny;
+		deny["optionId"] = "decline";
+		deny["name"] = "Decline";
+		deny["kind"] = "reject_once";
+		options.push_back(deny);
+		Dictionary params;
+		params["toolCall"] = tool_call;
+		params["options"] = options;
+		_handle_permission(p_id, params);
+	} else if (p_method.ends_with("/requestApproval")) {
 		Dictionary result;
 		result["decision"] = "accept";
 		_reply(p_id, result);
@@ -2083,9 +2234,61 @@ void LagoonicAcpRunner::_handle_codex_request(const Variant &p_id, const String 
 }
 
 Dictionary LagoonicAcpRunner::run_codex_turn(const String &p_codex_bin, const String &p_cwd, const Dictionary &p_env, const Array &p_mcp_servers, const String &p_prompt, const String &p_session_id) {
+	return _codex_turn(p_codex_bin, p_cwd, p_env, p_mcp_servers, p_prompt, Array(), true, true, p_session_id);
+}
+
+bool LagoonicAcpRunner::_is_codex_app_server(const String &p_bin, const PackedStringArray &p_args) {
+	return !p_args.is_empty() && p_args[0] == "app-server" && p_bin.get_file().get_basename() == "codex";
+}
+
+Array LagoonicAcpRunner::_codex_options(const Array &p_models, const String &p_model, const String &p_effort) const {
+	// Same shape as parse_options(): the chat's model and effort pickers.
+	Array options;
+	if (p_models.is_empty()) {
+		return options;
+	}
+	Dictionary model_option;
+	model_option["id"] = "model";
+	model_option["name"] = "Model";
+	model_option["category"] = "model";
+	model_option["current"] = p_model;
+	Array model_values;
+	Array efforts;
+	for (int i = 0; i < p_models.size(); i++) {
+		const Dictionary m = p_models[i];
+		Dictionary v;
+		v["value"] = m.get("value", "");
+		v["name"] = m.get("name", "");
+		model_values.push_back(v);
+		if (String(m.get("value", "")) == p_model) {
+			efforts = m.get("efforts", Array());
+		}
+	}
+	model_option["values"] = model_values;
+	options.push_back(model_option);
+	if (!efforts.is_empty()) {
+		Dictionary effort_option;
+		effort_option["id"] = "effort";
+		effort_option["name"] = "Effort";
+		effort_option["category"] = "thought_level";
+		effort_option["current"] = p_effort;
+		Array effort_values;
+		for (int i = 0; i < efforts.size(); i++) {
+			Dictionary v;
+			v["value"] = efforts[i];
+			v["name"] = String(efforts[i]).capitalize();
+			effort_values.push_back(v);
+		}
+		effort_option["values"] = effort_values;
+		options.push_back(effort_option);
+	}
+	return options;
+}
+
+Dictionary LagoonicAcpRunner::_codex_turn(const String &p_codex_bin, const String &p_cwd, const Dictionary &p_env, const Array &p_mcp_servers, const String &p_prompt, const Array &p_prompt_blocks, bool p_auto_approve, bool p_silent, const String &p_session_id) {
 	Dictionary out;
-	auto_approve = true;
-	silent = true;
+	auto_approve = p_auto_approve;
+	silent = p_silent;
 	codex_dialect = true;
 	codex_turn_done = false;
 	codex_turn_status = String();
@@ -2104,6 +2307,15 @@ Dictionary LagoonicAcpRunner::run_codex_turn(const String &p_codex_bin, const St
 		out["log"] = get_log_tail();
 		return out;
 	}
+	if (!silent) {
+		mapper->begin_turn();
+	}
+	const String resume_thread = resume_acp_session;
+	const String transcript = resume_transcript;
+	resume_acp_session = String();
+	resume_transcript = String();
+	bool resumed = false;
+	String prompt = p_prompt;
 
 	bool ok = false;
 	Dictionary client_info;
@@ -2134,6 +2346,9 @@ Dictionary LagoonicAcpRunner::run_codex_turn(const String &p_codex_bin, const St
 				continue;
 			}
 			const String prefix = "mcp_servers." + name + ".";
+			// Lagoonic's own servers: Codex's auto review must not block them.
+			// The crew is always allowed; the Godot tools ask only in Ask mode.
+			config[prefix + "default_tools_approval_mode"] = (name == "lagoonic-crew" || p_auto_approve || p_silent) ? String("approve") : String("prompt");
 			if (server.has("url")) {
 				config[prefix + "url"] = _dstr(server, "url");
 				Dictionary headers;
@@ -2186,15 +2401,51 @@ Dictionary LagoonicAcpRunner::run_codex_turn(const String &p_codex_bin, const St
 				requested_model_value = value;
 			}
 		}
+		// The chat's own picks (model, effort), among what Codex offers.
+		if (!silent) {
+			if (offered_models.is_empty()) {
+				offered_models = _codex_model_list();
+			}
+			const String chosen_model = chosen_options.get("model", "");
+			for (int i = 0; i < offered_models.size() && requested_model_value.is_empty(); i++) {
+				if (String(Dictionary(offered_models[i]).get("value", "")) == chosen_model) {
+					requested_model_value = chosen_model;
+				}
+			}
+			const String chosen_effort = chosen_options.get("effort", "");
+			if (!chosen_effort.is_empty()) {
+				config["model_reasoning_effort"] = chosen_effort;
+			}
+			if (requested_mode == "plan") {
+				_set_error(String::utf8("Codex has no plan mode here; switch to Automatic or Ask first. / Codex no tiene modo de solo planificar; cambia a Automático o Preguntar antes."));
+				ok = false;
+			}
+		}
 		Dictionary thread_params;
 		thread_params["cwd"] = p_cwd;
 		if (!requested_model_value.is_empty()) {
 			thread_params["model"] = requested_model_value;
 		}
-		thread_params["approvalPolicy"] = "never";
+		// Automatic (and workers): no approvals. Ask: Codex asks before
+		// running commands or editing, and the chat shows the request.
+		thread_params["approvalPolicy"] = auto_approve || silent ? "never" : "on-request";
 		thread_params["sandbox"] = "workspace-write";
 		thread_params["config"] = config;
-		const Dictionary thread_result = ok ? _call("thread/start", thread_params, DEFAULT_TIMEOUT_MS, ok) : Dictionary();
+		Dictionary thread_result;
+		if (ok && !resume_thread.is_empty()) {
+			// The conversation goes on in the same Codex thread.
+			Dictionary resume_params = thread_params.duplicate();
+			resume_params["threadId"] = resume_thread;
+			bool resume_ok = false;
+			thread_result = _call("thread/resume", resume_params, DEFAULT_TIMEOUT_MS, resume_ok);
+			resumed = resume_ok;
+		}
+		if (ok && !resumed) {
+			thread_result = _call("thread/start", thread_params, DEFAULT_TIMEOUT_MS, ok);
+			if (ok && !transcript.is_empty()) {
+				prompt = transcript + "\n\n" + p_prompt;
+			}
+		}
 		if (ok) {
 			thread_id = _dstr(_ddict(thread_result, "thread"), "id");
 			// Codex states the model and effort it will use for this thread.
@@ -2205,6 +2456,17 @@ Dictionary LagoonicAcpRunner::run_codex_turn(const String &p_codex_bin, const St
 			}
 			_set_session_model(model);
 			acp_session_id = thread_id;
+			if (!silent) {
+				// The chat's pickers: Codex's real models (Sol, Astra, Luna...).
+				const Array options = _codex_options(offered_models, _dstr(thread_result, "model"), effort);
+				if (!options.is_empty()) {
+					Dictionary event;
+					event["type"] = "acp_options";
+					event["session_id"] = session_id;
+					event["options"] = options;
+					emit_signal("acp_event", event);
+				}
+			}
 			if (thread_id.is_empty()) {
 				_set_error("Codex did not open a conversation. / Codex no abrió la conversación.");
 				ok = false;
@@ -2215,8 +2477,25 @@ Dictionary LagoonicAcpRunner::run_codex_turn(const String &p_codex_bin, const St
 		Array input;
 		Dictionary block;
 		block["type"] = "text";
-		block["text"] = p_prompt;
+		block["text"] = prompt;
 		input.push_back(block);
+		for (int i = 0; i < p_prompt_blocks.size(); i++) {
+			// ACP image blocks become app-server image inputs (data URL).
+			const Dictionary extra = p_prompt_blocks[i];
+			if (_dstr(extra, "type") == "image") {
+				Dictionary image;
+				image["type"] = "image";
+				image["url"] = "data:" + _dstr(extra, "mimeType") + ";base64," + _dstr(extra, "data");
+				input.push_back(image);
+			}
+		}
+		if (!silent) {
+			Dictionary busy;
+			busy["type"] = "busy";
+			busy["session_id"] = session_id;
+			busy["busy"] = true;
+			emit_signal("acp_event", busy);
+		}
 		Dictionary turn_params;
 		turn_params["threadId"] = thread_id;
 		turn_params["input"] = input;
@@ -2260,13 +2539,24 @@ Dictionary LagoonicAcpRunner::run_codex_turn(const String &p_codex_bin, const St
 			ok = false;
 		}
 	}
-	const String text = codex_final_text.is_empty() ? codex_delta_text.strip_edges() : codex_final_text;
+	if (!silent) {
+		Dictionary idle;
+		idle["type"] = "busy";
+		idle["session_id"] = session_id;
+		idle["busy"] = false;
+		emit_signal("acp_event", idle);
+	}
+	const String text = silent ? (codex_final_text.is_empty() ? codex_delta_text.strip_edges() : codex_final_text) : mapper->get_text();
 	out["ok"] = ok;
 	out["text"] = text;
-	out["report"] = text;
+	out["report"] = silent ? text : mapper->get_worker_report(3);
 	out["model"] = session_model;
 	out["models"] = offered_models;
 	out["acp_session_id"] = thread_id;
+	out["resumed"] = resumed;
+	if (!codex_turn_status.is_empty()) {
+		out["stop_reason"] = codex_turn_status == "completed" ? String("end_turn") : codex_turn_status;
+	}
 	if (!ok) {
 		out["error"] = last_error;
 	}

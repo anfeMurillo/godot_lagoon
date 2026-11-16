@@ -338,6 +338,11 @@ String LagoonicCrewServer::handle_crew_message(const Dictionary &p_message) cons
 		return ""; // Notification or response: HTTP 202.
 	}
 	Variant id = p_message["id"];
+	// Godot's JSON reads every number as a float: answer an integer id as an
+	// integer ("id": 1, not 1.0), or strict clients (Codex's rmcp) reject it.
+	if (id.get_type() == Variant::FLOAT && double(id) == Math::floor(double(id))) {
+		id = int64_t(double(id));
+	}
 	if (!p_message.has("method") || p_message["method"].get_type() != Variant::STRING) {
 		return ""; // Response to our (never sent) request: HTTP 202.
 	}

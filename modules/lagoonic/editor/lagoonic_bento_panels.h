@@ -174,6 +174,8 @@ class LagoonicTeamPanel : public VBoxContainer {
 	Callable stopper; // (number: int) -> detiene esa tarea; 0 = todas; -1 = limpia las terminadas.
 	Label *summary = nullptr;
 	Button *stop_all = nullptr;
+	Control *actions_row = nullptr;
+	void _update_actions_row();
 	Button *clear_done = nullptr;
 	Button *center_button = nullptr;
 	enum View {

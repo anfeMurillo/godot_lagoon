@@ -52,7 +52,7 @@ const LagoonicCodingAgents::AgentInfo LagoonicCodingAgents::AGENTS[AGENT_COUNT] 
 	{ "codex", "Codex CLI", "OpenAI",
 			"npm install -g @openai/codex", "codex",
 			REG_CODEX_TOML, false, "https://developers.openai.com/codex/mcp",
-			"codex-acp", "npm install -g @zed-industries/codex-acp", "npm uninstall -g @openai/codex",
+			"codex app-server", nullptr, "npm uninstall -g @openai/codex",
 			nullptr, nullptr, nullptr, nullptr,
 			ENTRY_STDIO, CLI_ADD_DASHDASH },
 	{ "antigravity", "Antigravity CLI", "Google",

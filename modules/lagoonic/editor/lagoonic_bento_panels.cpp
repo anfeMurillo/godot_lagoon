@@ -895,6 +895,7 @@ void LagoonicTeamPanel::_set_view(int p_view) {
 	graph->set_visible(view == VIEW_GRAPH);
 	orbit->set_visible(view == VIEW_ORBIT);
 	center_button->set_visible(view == VIEW_GRAPH);
+	_update_actions_row();
 	if (view == VIEW_LIST) {
 		details->set_visible(false);
 	}
@@ -1025,7 +1026,7 @@ void LagoonicTeamPanel::_rebuild(const Dictionary &p_team) {
 			parts.push_back(vformat(String::utf8("%d en cola"), queued));
 		}
 		if (done > 0) {
-			parts.push_back(vformat(String::utf8("%d terminadas"), done));
+			parts.push_back(done == 1 ? String::utf8("1 terminada") : vformat(String::utf8("%d terminadas"), done));
 		}
 		summary->set_text(String::utf8(" · ").join(parts));
 	} else {
@@ -1033,6 +1034,7 @@ void LagoonicTeamPanel::_rebuild(const Dictionary &p_team) {
 	}
 	stop_all->set_visible(running + queued > 0 && stopper.is_valid());
 	clear_done->set_visible(done > 0 && stopper.is_valid());
+	_update_actions_row();
 	if (view == VIEW_GRAPH) {
 		_rebuild_graph(p_team);
 	} else if (view == VIEW_ORBIT) {
@@ -1524,15 +1526,24 @@ void LagoonicTeamPanel::_center_graph() {
 	graph->set_scroll_offset((bounds.get_center() * zoom) - view * 0.5f);
 }
 
+void LagoonicTeamPanel::_update_actions_row() {
+	if (actions_row != nullptr && center_button != nullptr && stop_all != nullptr && clear_done != nullptr) {
+		actions_row->set_visible(center_button->is_visible() || stop_all->is_visible() || clear_done->is_visible());
+	}
+}
+
 LagoonicTeamPanel::LagoonicTeamPanel() {
 	add_theme_constant_override(SNAME("separation"), int(8 * EDSCALE));
 
-	HBoxContainer *top = memnew(HBoxContainer);
-	top->add_theme_constant_override(SNAME("separation"), int(6 * EDSCALE));
-	add_child(top);
+	// The summary takes the whole width; the buttons go on their own row
+	// and wrap, so a narrow bento never squeezes the text into one column.
 	summary = _bento_muted(String());
-	summary->set_h_size_flags(Control::SIZE_EXPAND_FILL);
-	top->add_child(summary);
+	add_child(summary);
+	HFlowContainer *top = memnew(HFlowContainer);
+	top->add_theme_constant_override(SNAME("h_separation"), int(6 * EDSCALE));
+	top->add_theme_constant_override(SNAME("v_separation"), int(6 * EDSCALE));
+	add_child(top);
+	actions_row = top;
 	center_button = memnew(Button);
 	center_button->set_text(String::utf8("Centrar"));
 	center_button->set_flat(true);
