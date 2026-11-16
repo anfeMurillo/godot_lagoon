@@ -68,6 +68,7 @@
 #include "lagoonic_bento.h"
 #include "lagoonic_bento_panels.h"
 #include "lagoonic_terminal_panel.h"
+#include "lagoonic_moodboard_panel.h"
 #include "lagoonic_game_clip.h"
 #include "../runtime/lagoonic_coding_agents.h"
 #include "scene/gui/color_rect.h"
@@ -187,6 +188,7 @@ static const LagoonicBentoType LAGOONIC_BENTOS[] = {
 	{ "team", "Equipo", "Groups", "El líder y los ayudantes que lanza, en vivo" },
 	{ "usage", "Uso", "ProgressBar", "Cuánto te queda en cada agente" },
 	{ "terminal", "Terminal", "Script", "Una consola de comandos en la carpeta del proyecto" },
+	{ "references", "Referencias", "ImageTexture", "Tu tablero de inspiración: imágenes, vídeos y notas de estilo" },
 	{ "scene", "Escena", "PackedScene", "Las piezas de la escena abierta, como en el editor" },
 	{ "inspector", "Propiedades", "Tools", "Cambia a mano los valores del elemento elegido" },
 	{ "game", "Juego", "Play", "Tu juego en marcha, aquí mismo" },
@@ -706,6 +708,11 @@ void LagoonicVibeWorkspace::_open_bento(const String &p_id, bool p_save) {
 		LagoonicUsagePanel *panel = memnew(LagoonicUsagePanel);
 		panel->setup(callable_mp(this, &LagoonicVibeWorkspace::_get_usage), callable_mp(this, &LagoonicVibeWorkspace::_refresh_usage));
 		bento->set_content(panel);
+	} else if (p_id == "references") {
+		LagoonicMoodboardPanel *board = memnew(LagoonicMoodboardPanel);
+		board->setup(chat);
+		bento->set_content(board);
+		bento->set_content_margins(0, 0);
 	} else if (p_id == "terminal") {
 		bento->set_content(memnew(LagoonicTerminalPanel));
 		bento->set_content_margins(8, 8);

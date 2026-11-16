@@ -52,6 +52,7 @@
 #include "editor/lagoonic_crew_view.h"
 #include "editor/lagoonic_bento_panels.h"
 #include "editor/lagoonic_terminal_panel.h"
+#include "editor/lagoonic_moodboard_panel.h"
 #include "editor/lagoonic_dock.h"
 #include "editor/lagoonic_lily_veil.h"
 #include "editor/lagoonic_settings_panel.h"
@@ -185,6 +186,8 @@ void initialize_lagoonic_module(ModuleInitializationLevel p_level) {
 		GDREGISTER_CLASS(LagoonicTeamOrbit);
 		GDREGISTER_CLASS(LagoonicUsagePanel);
 		GDREGISTER_CLASS(LagoonicTerminalPanel);
+		GDREGISTER_CLASS(LagoonicMoodboardCanvas);
+		GDREGISTER_CLASS(LagoonicMoodboardPanel);
 		GDREGISTER_CLASS(LagoonicContextCube);
 		GDREGISTER_CLASS(LagoonicContextPanel);
 		GDREGISTER_CLASS(LagoonicUsageRings);

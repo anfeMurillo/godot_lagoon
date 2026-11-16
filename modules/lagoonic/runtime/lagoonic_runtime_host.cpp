@@ -2361,22 +2361,73 @@ Array LagoonicRuntimeHost::_acp_mcp_servers(const String &dir, const String &pat
 	return mcp_servers;
 }
 
+// The game's style from the references board (res://referencias): the cards
+// the user pinned, as notes and image paths for the leader to follow.
+String LagoonicRuntimeHost::_style_instruction() const {
+	state_mutex.lock();
+	const String dir = project_dir;
+	state_mutex.unlock();
+	if (dir.is_empty()) {
+		return String();
+	}
+	const String board = dir.path_join("referencias");
+	const String json_path = board.path_join("tablero.json");
+	if (!FileAccess::exists(json_path)) {
+		return String();
+	}
+	const Dictionary d = JSON::parse_string(FileAccess::get_file_as_string(json_path));
+	const Array items = d.get("items", Array());
+	PackedStringArray notes;
+	PackedStringArray files;
+	for (int i = 0; i < items.size(); i++) {
+		const Dictionary it = items[i];
+		if (!bool(it.get("pinned", false))) {
+			continue;
+		}
+		if (String(it.get("kind", "")) == "note") {
+			notes.push_back("- " + String(it.get("text", "")).strip_edges().replace("\n", " "));
+		} else if (!String(it.get("file", "")).is_empty()) {
+			files.push_back("- res://referencias/" + String(it.get("file", "")));
+		}
+	}
+	if (notes.is_empty() && files.is_empty()) {
+		return String();
+	}
+	String out = "The user pinned the game's visual style on the references board (res://referencias/, tablero.json). Follow it in everything visual you make or ask the team to make (art, sprites, UI, generated images).";
+	if (!notes.is_empty()) {
+		out += "\nStyle notes:\n" + String("\n").join(notes);
+	}
+	if (!files.is_empty()) {
+		out += "\nReference images (read them when the look matters; pass them as references to image generation):\n" + String("\n").join(files);
+	}
+	return out;
+}
+
 String LagoonicRuntimeHost::_boss_prompt(const String &p_text) const {
 	// With workers, the boss learns how to delegate (prepended like the
-	// desktop bridge did for ACP bosses).
+	// desktop bridge did for ACP bosses); the pinned style goes first.
+	String prefix = _style_instruction();
 	const Vector<String> names = crew->crew_worker_names();
 	state_mutex.lock();
 	const bool has_crew = !crew_url_cache.is_empty();
 	state_mutex.unlock();
-	if (names.is_empty() || !has_crew) {
-		return p_text;
+	if (!names.is_empty() && has_crew) {
+		prefix += (prefix.is_empty() ? "" : "\n\n") + LagoonicCrewOrchestrator::boss_instruction(names, LagoonicCrewOrchestrator::MAX_CREW_TASKS);
 	}
-	return LagoonicCrewOrchestrator::boss_instruction(names, LagoonicCrewOrchestrator::MAX_CREW_TASKS) + "\n\n" + p_text;
+	return prefix.is_empty() ? p_text : prefix + "\n\n" + p_text;
 }
 
 void LagoonicRuntimeHost::_append_boss_instruction(Array &r_parts) const {
 	// OpenCode boss: hidden from the chat history (synthetic), so only the
 	// boss reads it; workers run in their own sessions without it.
+	const String style = _style_instruction();
+	if (!style.is_empty()) {
+		Dictionary part;
+		part["type"] = String("text");
+		part["text"] = style;
+		part["synthetic"] = true;
+		r_parts.push_back(part);
+	}
 	const Vector<String> names = crew->crew_worker_names();
 	state_mutex.lock();
 	const bool has_crew = !crew_url_cache.is_empty();

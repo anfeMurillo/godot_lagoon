@@ -182,6 +182,7 @@ class LagoonicRuntimeHost : public RefCounted {
 	static Array _attachment_images(const PackedStringArray &p_files);
 	Array _acp_mcp_servers(const String &p_dir, const String &p_path_value, bool p_with_crew) const;
 	String _boss_prompt(const String &p_text) const;
+	String _style_instruction() const;
 	void _append_boss_instruction(Array &r_parts) const;
 	void _ensure_crew_server();
 	void _poll_crew_server();
