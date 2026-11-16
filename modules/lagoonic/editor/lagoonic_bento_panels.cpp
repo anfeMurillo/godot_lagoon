@@ -686,12 +686,7 @@ void LagoonicContextPanel::_refresh() {
 	note->add_theme_color_override(SceneStringName(font_color), note_color);
 	note->set_visible(!note_text.is_empty());
 
-	PackedStringArray foot;
-	if (!String(d.get("model", "")).is_empty()) {
-		foot.push_back(d.get("model", ""));
-	}
-	foot.push_back(d.get("title", ""));
-	footer->set_text(String::utf8(" · ").join(foot));
+	footer->set_text(d.get("title", ""));
 
 	// The rest of the chat's data, on hover.
 	String tip = String(d.get("title", "")) + "\n";
