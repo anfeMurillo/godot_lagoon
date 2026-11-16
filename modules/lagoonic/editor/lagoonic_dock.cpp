@@ -125,7 +125,9 @@ void LagoonicDock::_refresh_status_ui() {
 	}
 	const bool can_command = (connection_state == STATE_CONNECTED);
 	if (status_row != nullptr) {
-		status_row->set_visible(!can_command); // Solo avisa si algo falla.
+		// The bridge only drives Play/Stop/Photo (hidden: the editor has
+		// them); the chat talks to the runtime host and never needs it.
+		status_row->set_visible(false);
 	}
 	if (play_button != nullptr) {
 		play_button->set_disabled(!can_command);
@@ -135,9 +137,6 @@ void LagoonicDock::_refresh_status_ui() {
 	}
 	if (snapshot_button != nullptr) {
 		snapshot_button->set_disabled(!can_command);
-	}
-	if (agent_dock != nullptr) {
-		agent_dock->hook_set_connection(can_command);
 	}
 }
 
@@ -228,8 +227,9 @@ void LagoonicDock::_on_runtime_status(const String &p_status) {
 		agent_dock->get_chat_view()->set_current_session(p_status.substr(8));
 	}
 	if (agent_dock != nullptr) {
-		const bool up = runtime_host.is_valid() && runtime_host->is_server_up();
-		agent_dock->hook_set_connection(up);
+		// Like the vibe workspace: the input stays enabled so the first
+		// message (or a retry after a crash) starts the agent lazily.
+		agent_dock->hook_set_connection(runtime_host.is_valid());
 	}
 	if (!p_status.begins_with("adopt:") && p_status != "reload-requested") {
 		log_activity("runtime:" + p_status);
@@ -241,6 +241,8 @@ void LagoonicDock::_on_agent_event(const StringName &p_event, const Variant &p_a
 	LagoonicChatView *chat = (agent_dock != nullptr) ? agent_dock->get_chat_view() : nullptr;
 	const String cwd = ProjectSettings::get_singleton()->globalize_path("res://");
 	if (p_event == SNAME("send_requested")) {
+		// Files dropped on the chat go with this message.
+		runtime_host->set_next_attachments(p_b.get_type() == Variant::PACKED_STRING_ARRAY ? PackedStringArray(p_b) : PackedStringArray());
 		const String session = (chat != nullptr) ? chat->get_current_session() : String();
 		const int mode = (chat != nullptr) ? chat->get_mode() : 0;
 		String model = (chat != nullptr) ? chat->get_current_model() : String();
@@ -490,6 +492,7 @@ LagoonicDock::LagoonicDock() {
 		}
 	}
 	_ensure_runtime_host();
+	agent_dock->hook_set_connection(true);
 
 	// Sondeo periodico del puente (solo actualiza UI si el dock es visible).
 	poll_timer = memnew(Timer);
